@@ -1,0 +1,27 @@
+# Third-party reference material (redistributed freeware; not for remote)
+CatMemoNote/
+
+# Node / Electron
+node_modules/
+dist/
+dist-electron/
+out/
+build/
+release/
+
+# Env / secrets
+.env
+.env.*
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor
+.vscode/*
+!.vscode/extensions.json
