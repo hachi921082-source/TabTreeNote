@@ -4,6 +4,7 @@ import { useTheme } from './theme/useTheme';
 import { createOpenMemoState, withUpdatedHash, type OpenMemoState } from './editor/eolKeeper';
 import { DEFAULT_EDITOR_SETTINGS, type EditorSettings, type EditorStats } from './editor/codeMirrorSetup';
 import { CodeMirrorEditor, type RevealTarget } from './components/Editor/CodeMirrorEditor';
+import type { DetectedLink } from './editor/links';
 import { TabBar } from './components/TabBar/TabBar';
 import { Tree } from './components/Tree/Tree';
 import { NameInputDialog } from './components/dialogs/NameInputDialog';
@@ -29,7 +30,7 @@ import type {
   OpErrorPayload,
   TrashFallbackPayload
 } from '@shared/ipc-contract';
-import type { MetaTreeNode, SearchHit, TabInfo, TreeNode } from '@shared/models';
+import type { AppSettings, MetaTreeNode, SearchHit, TabInfo, TreeNode } from '@shared/models';
 
 const MIN_TREE_WIDTH = 160;
 const MAX_TREE_WIDTH = 600;
@@ -45,6 +46,9 @@ const FONT_SIZE_PERSIST_DEBOUNCE_MS = 500;
 function clampFontSize(size: number): number {
   return Math.min(MAX_FONT_SIZE, Math.max(MIN_FONT_SIZE, size));
 }
+
+// リンク機能（M5, DESIGN §2.8）の既定値。settings:get 応答（AppSettings.links）で上書きされる。
+const DEFAULT_LINK_SETTINGS: AppSettings['links'] = { openTrigger: 'ctrlClick', confirmBeforeOpen: true };
 
 interface NameDialogRequest {
   title: string;
@@ -79,6 +83,8 @@ export function App() {
   const [dirty, setDirty] = useState(false);
   const [editorSettings, setEditorSettings] = useState<EditorSettings>(DEFAULT_EDITOR_SETTINGS);
   const [editorStats, setEditorStats] = useState<EditorStats | null>(null);
+  // リンク機能設定（M5, DESIGN §2.8）。settings:get 応答で上書きされる。
+  const [linkSettings, setLinkSettings] = useState<AppSettings['links']>(DEFAULT_LINK_SETTINGS);
   const fontSizePersistTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const editorWheelCleanup = useRef<(() => void) | null>(null);
   // reviewer 指摘 M2-R1-01: selectTab/openMemoByName の未保存確認ガードは deps に dirty を
@@ -135,6 +141,7 @@ export function App() {
           setTheme(res.value.theme);
           setTreeWidth(res.value.window.treeWidth);
           setEditorSettings((prev) => ({ ...prev, ...res.value.editorDefaults }));
+          setLinkSettings(res.value.links);
         }
       })
       .catch((e: unknown) => console.error('settings:get failed', e));
@@ -398,6 +405,96 @@ export function App() {
       }
     },
     [selectTab, reportActiveMemo]
+  );
+
+  // --- リンク機能（M5, DESIGN §2.8）: memo: 遷移 / URL・mailto・ファイルパスの外部起動 ---
+
+  // `memo:` リンクの解決先を開く（暗号化メモは M6 未実装のため名前のみ表示に留める。
+  // handleJumpToHit と似た「タブ切替→本文読込」処理だが、`hit.encrypted` のような事前情報が
+  // 無い（link:resolveMemo はメモ名/tabIdのみ返す, PLAN §2.5）ため、暗号化判定は
+  // memo:read の結果から行う独立実装にしている）。
+  const openMemoDirect = useCallback(
+    async (tabId: string, memoName: string) => {
+      const res = await ipc.readMemo({ tabId, memoName });
+      if (!res.ok) {
+        setStatusMessage(`メモ読込エラー: ${res.error.message}`);
+        return;
+      }
+      if (res.value.encrypted) {
+        setStatusMessage(`「${memoName}」は暗号化メモのため、開くには M6 の対応が必要です。`);
+        return;
+      }
+      setOpenMemo(createOpenMemoState(tabId, memoName, res.value));
+      setContentLF(res.value.contentLF);
+      setDirty(false);
+      setEditorStats(null);
+      setStatusMessage(null);
+      setRevealTarget(null);
+      setConflictInfo(null);
+      setReloadGeneration(0);
+      reportActiveMemo({ tabId, memoName, dirty: false });
+    },
+    [reportActiveMemo]
+  );
+
+  // 本文中のリンク（CodeMirrorEditor.tsx の buildLinkExtension 経由）をクリックした際のハンドラ。
+  const handleLinkClick = useCallback(
+    (link: DetectedLink) => {
+      if (link.kind === 'memo') {
+        if (!selectedTabId) return;
+        const memoRef = link.raw.slice('memo:'.length);
+        void (async () => {
+          const res = await ipc.resolveMemoLink({ currentTabId: selectedTabId, memoRef });
+          // 解決不能はエラーダイアログを出さず何もしない（DESIGN §2.8）。
+          if (!res.ok || !res.value) return;
+          const { tabId, memoName } = res.value;
+          if (tabId !== selectedTabId) {
+            await selectTab(tabId); // 未保存確認は selectTab 内部で行う（M2-R1-01 と同様のガード）。
+            if (selectedTabIdRef.current !== tabId) return; // ユーザーがキャンセルし切替されなかった。
+          } else if (
+            memoName &&
+            dirtyRef.current &&
+            !window.confirm('未保存の変更があります。破棄して別のメモを開きますか？')
+          ) {
+            return;
+          }
+          if (memoName) await openMemoDirect(tabId, memoName);
+        })();
+        return;
+      }
+
+      // url / mailto / path: 外部起動（設定で確認ダイアログを挟む, 既定 ON）。
+      // `kind`/`raw` を分割代入で束縛し直す（narrowing 済みの `link.kind` を後続の nested
+      // closure からもそのまま参照できるようにするため。TS は nested closure 内で
+      // パラメータの型ガードによる narrowing を保持しないことがあるための回避）。
+      const { kind, raw } = link;
+      const performOpen = (): void => {
+        void (async () => {
+          const res = await ipc.openExternalLink({
+            kind,
+            raw,
+            baseTabId: selectedTabId ?? undefined
+          });
+          if (!res.ok) setStatusMessage(`外部起動エラー[${res.error.code}]: ${res.error.message}`);
+        })();
+      };
+
+      if (linkSettings.confirmBeforeOpen) {
+        const kindLabel = kind === 'url' ? 'URL' : kind === 'mailto' ? 'メールアドレス' : 'パス';
+        setConfirmDialog({
+          title: '外部を開く確認',
+          message: `次の${kindLabel}を外部アプリで開きます。よろしいですか？\n${raw}`,
+          confirmLabel: '開く',
+          onConfirm: () => {
+            setConfirmDialog(null);
+            performOpen();
+          }
+        });
+      } else {
+        performOpen();
+      }
+    },
+    [selectedTabId, linkSettings, selectTab, openMemoDirect]
   );
 
   // 全文検索パネルのショートカット（Ctrl+Shift+F）。CodeMirror 側の Ctrl+F（現在メモ内検索,
@@ -956,6 +1053,8 @@ export function App() {
                 settings={editorSettings}
                 revealTarget={revealTarget}
                 readOnly={conflictInfo !== null && conflictInfo.tabId === openMemo.tabId && conflictInfo.memoName === openMemo.memoName}
+                linkOpenTrigger={linkSettings.openTrigger}
+                onLinkClick={handleLinkClick}
               />
             </div>
           ) : (
