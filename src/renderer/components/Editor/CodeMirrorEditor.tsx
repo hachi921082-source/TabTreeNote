@@ -13,11 +13,13 @@ import { EditorSelection, EditorState } from '@codemirror/state';
 import { EditorView } from '@codemirror/view';
 import {
   INITIAL_SELECTION,
+  buildReadOnlyExtension,
   buildStaticExtensions,
   computeEditorStats,
   createCompartments,
   initialCompartmentExtensions,
   reconfigureEditorSettings,
+  reconfigureReadOnly,
   type EditorCompartments,
   type EditorSettings,
   type EditorStats
@@ -89,8 +91,7 @@ export function CodeMirrorEditor({
           () => onSaveRef.current()
         ),
         ...initialCompartmentExtensions(compartments, settings),
-        EditorView.editable.of(!readOnly),
-        EditorState.readOnly.of(readOnly)
+        compartments.readOnly.of(buildReadOnlyExtension(readOnly))
       ]
     });
 
@@ -119,6 +120,16 @@ export function CodeMirrorEditor({
     if (!view || !compartments) return;
     reconfigureEditorSettings(view, compartments, settings);
   }, [settings]);
+
+  // readOnly の変更を既存 EditorView へ反映する（M4: 外部変更競合ダイアログ表示中のロック,
+  // DESIGN §3.3）。マウント時のみ適用される初期 EditorState 生成とは独立に、以後の変更を
+  // 都度 Compartment 経由で反映する（アンマウント/再マウントさせず入力ロックのみ切り替える）。
+  useEffect(() => {
+    const view = viewRef.current;
+    const compartments = compartmentsRef.current;
+    if (!view || !compartments) return;
+    reconfigureReadOnly(view, compartments, readOnly);
+  }, [readOnly]);
 
   // 全文検索結果からのジャンプ（M3-②）。マウント用 effect より後に宣言しているため、
   // 同一コミット内で viewRef.current が確実に設定済みの状態で参照できる。
