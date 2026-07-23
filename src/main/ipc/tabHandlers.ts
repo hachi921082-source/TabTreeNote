@@ -8,8 +8,9 @@ import { ipcMain, type IpcMainInvokeEvent } from 'electron';
 import { IpcChannels, IpcEvents, type IndexUpdatedPayload, type MetaRecoveredPayload, type TabRemoveArgs, type TabRenameArgs, type TabReorderArgs } from '@shared/ipc-contract';
 import type { Result, TabInfo, TreeSnapshot } from '@shared/models';
 import { ok, wrapHandler } from '../util/result';
-import { createTab, listTabs, openTabTree, registerTab, removeTab, renameTab, reorderTabs } from '../fs/tabService';
+import { createTab, getTabFolderPath, listTabs, openTabTree, registerTab, removeTab, renameTab, reorderTabs } from '../fs/tabService';
 import { indexTab, removeTabFromIndex } from '../search/searchIndex';
+import { addWatchedTab, removeWatchedTab, renameWatchedTab } from '../watch/watcher';
 
 export function registerTabHandlers(): void {
   ipcMain.handle(
@@ -26,6 +27,8 @@ export function registerTabHandlers(): void {
         await indexTab(result.value.id, result.value.folderPath);
         const payload: IndexUpdatedPayload = { tabId: result.value.id };
         event.sender.send(IpcEvents.indexUpdated, payload);
+        // ファイル監視対象へ追加する（M4）。
+        addWatchedTab(result.value.id, result.value.folderPath);
       }
       return result;
     })
@@ -41,6 +44,8 @@ export function registerTabHandlers(): void {
           await indexTab(result.value.id, result.value.folderPath);
           const payload: IndexUpdatedPayload = { tabId: result.value.id };
           event.sender.send(IpcEvents.indexUpdated, payload);
+          // ファイル監視対象へ追加する（M4）。
+          addWatchedTab(result.value.id, result.value.folderPath);
         }
         return result;
       }
@@ -59,9 +64,15 @@ export function registerTabHandlers(): void {
 
   ipcMain.handle(
     IpcChannels.tab.rename,
-    wrapHandler(
-      (_event: IpcMainInvokeEvent, args: TabRenameArgs): Promise<Result<void>> => renameTab(args.tabId, args.newName)
-    )
+    wrapHandler(async (_event: IpcMainInvokeEvent, args: TabRenameArgs): Promise<Result<void>> => {
+      const result = await renameTab(args.tabId, args.newName);
+      if (result.ok) {
+        // フォルダの物理パスが変わったため、監視対象も新パスへ切り替える（M4）。
+        const folder = getTabFolderPath(args.tabId);
+        if (folder.ok) renameWatchedTab(args.tabId, folder.value);
+      }
+      return result;
+    })
   );
 
   ipcMain.handle(
@@ -72,6 +83,8 @@ export function registerTabHandlers(): void {
         // タブ登録解除に伴い、インデックスからも当該タブ分を除去する（indexUpdated 通知は
         // 対象タブが UI から既に切り離されるため不要。renderer 側は tab:list 再取得で追従する）。
         removeTabFromIndex(args.tabId);
+        // ファイル監視対象からも除去する（M4）。
+        removeWatchedTab(args.tabId);
       }
       return result;
     })
