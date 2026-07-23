@@ -8,6 +8,7 @@ import { initAppSettings } from './settings/appSettings';
 import { listTabs } from './fs/tabService';
 import { loadTabMeta } from './fs/metaStore';
 import { buildIndex } from './search/searchIndex';
+import { startWatching, stopWatching } from './watch/watcher';
 import { IpcEvents, type MetaRecoveredPayload } from '@shared/ipc-contract';
 
 /** 外部起動を許可する URL スキーム（reviewer 指摘 M0-R1-02）。それ以外は無視して開かない。 */
@@ -102,6 +103,8 @@ function createMainWindow(windowState: WindowBounds): BrowserWindow {
  * 3. ウィンドウ復元（位置/サイズ/最大化。テーマ/ツリー幅はレンダラが settings:get で取得する）。
  * 4. 登録タブ一覧を取得し、各タブフォルダについて metaStore.load を先行実行して
  *    メタ破損があれば早期に `evt:metaRecovered` で通知する（実際の表示は tab:openTree 時にも取得）。
+ * 5. ファイル監視を開始する（`watcher.startWatching`。登録タブフォルダを対象, PLAN §5.1 step5 /
+ *    docs/milestones/M4-watch.md）。
  */
 async function bootstrap(): Promise<void> {
   const { settings } = await initAppSettings();
@@ -109,6 +112,10 @@ async function bootstrap(): Promise<void> {
   registerIpc();
   await buildIndex(listTabs());
   const win = createMainWindow(settings.window);
+  startWatching(
+    win.webContents,
+    listTabs().map((tab) => ({ tabId: tab.id, folderPath: tab.folderPath }))
+  );
 
   win.webContents.once('did-finish-load', () => {
     void Promise.all(
@@ -124,7 +131,11 @@ async function bootstrap(): Promise<void> {
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
-      createMainWindow(settings.window);
+      const reactivatedWin = createMainWindow(settings.window);
+      startWatching(
+        reactivatedWin.webContents,
+        listTabs().map((tab) => ({ tabId: tab.id, folderPath: tab.folderPath }))
+      );
     }
   });
 }
@@ -135,4 +146,8 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
     app.quit();
   }
+});
+
+app.on('before-quit', () => {
+  void stopWatching();
 });
