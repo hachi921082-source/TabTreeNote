@@ -12,6 +12,9 @@ import {
   type EditorReportActiveArgs,
   type ExternalChangePayload,
   type IndexUpdatedPayload,
+  type LinkOpenExternalArgs,
+  type LinkResolveMemoArgs,
+  type LinkResolveMemoResult,
   type MemoCreateArgs,
   type MemoDeleteArgs,
   type MemoDuplicateArgs,
@@ -89,6 +92,12 @@ const api: PreloadApi = {
   editor: {
     reportActive: (args: EditorReportActiveArgs): Promise<Result<void>> =>
       ipcRenderer.invoke(IpcChannels.editor.reportActive, args)
+  },
+  link: {
+    openExternal: (args: LinkOpenExternalArgs): Promise<Result<void>> =>
+      ipcRenderer.invoke(IpcChannels.link.openExternal, args),
+    resolveMemo: (args: LinkResolveMemoArgs): Promise<Result<LinkResolveMemoResult | null>> =>
+      ipcRenderer.invoke(IpcChannels.link.resolveMemo, args)
   },
   events: {
     onMetaRecovered: (handler: (payload: MetaRecoveredPayload) => void): (() => void) => {
