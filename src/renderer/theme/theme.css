@@ -1,0 +1,51 @@
+/* src/renderer/theme/theme.css
+   CSS ベースのライト/ダークテーマ（DESIGN §2.5）。
+   将来的にユーザー定義テーマ（JSON/CSS変数）へ拡張可能なよう、配色は CSS カスタムプロパティに集約する。
+   [data-theme] 属性は App 側で document.documentElement に設定する。 */
+
+:root,
+[data-theme='light'] {
+  --color-bg: #ffffff;
+  --color-bg-pane: #f5f5f5;
+  --color-bg-elevated: #ffffff;
+  --color-border: #d9d9d9;
+  --color-text: #1a1a1a;
+  --color-text-muted: #666666;
+  --color-accent: #2f6fed;
+  --color-accent-soft: #e3ecfd;
+  --color-splitter-hover: #2f6fed;
+}
+
+[data-theme='dark'] {
+  --color-bg: #1e1e1e;
+  --color-bg-pane: #252526;
+  --color-bg-elevated: #2d2d2d;
+  --color-border: #3c3c3c;
+  --color-text: #e0e0e0;
+  --color-text-muted: #a0a0a0;
+  --color-accent: #5b9bff;
+  --color-accent-soft: #223554;
+  --color-splitter-hover: #5b9bff;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background-color: var(--color-bg);
+  color: var(--color-text);
+  font-family:
+    'Segoe UI',
+    system-ui,
+    -apple-system,
+    sans-serif;
+  font-size: 14px;
+}
