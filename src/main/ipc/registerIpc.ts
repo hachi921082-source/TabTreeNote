@@ -9,6 +9,7 @@ import { registerTabHandlers } from './tabHandlers';
 import { registerMemoHandlers } from './memoHandlers';
 import { registerSearchHandlers } from './searchHandlers';
 import { registerSettingsHandlers } from './settingsHandlers';
+import { registerEditorHandlers } from './editorHandlers';
 
 export function registerIpc(): void {
   ipcMain.handle(IpcChannels.app.getInfo, (): AppInfo => {
@@ -19,4 +20,5 @@ export function registerIpc(): void {
   registerMemoHandlers();
   registerSearchHandlers();
   registerSettingsHandlers();
+  registerEditorHandlers();
 }
