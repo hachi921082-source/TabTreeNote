@@ -10,6 +10,7 @@ import { Tree } from './components/Tree/Tree';
 import { NameInputDialog } from './components/dialogs/NameInputDialog';
 import { ConfirmDialog } from './components/dialogs/ConfirmDialog';
 import { ConflictDialog } from './components/dialogs/ConflictDialog';
+import { PasswordDialog, type PasswordDialogMode, type PasswordDialogSubmitValues } from './components/dialogs/PasswordDialog';
 import { SearchPanel } from './components/Search/SearchPanel';
 import { EMPTY_SELECTION, type SelectionState } from './store/selection';
 import {
@@ -49,6 +50,16 @@ function clampFontSize(size: number): number {
 
 // リンク機能（M5, DESIGN §2.8）の既定値。settings:get 応答（AppSettings.links）で上書きされる。
 const DEFAULT_LINK_SETTINGS: AppSettings['links'] = { openTrigger: 'ctrlClick', confirmBeforeOpen: true };
+
+// 暗号化メモの低頻度自動保存デバウンス既定値（M6, DESIGN §2.6「編集停止から一定時間のデバウンス」）。
+// settings:get 応答（AppSettings.autosave.encryptedDebounceMs）で上書きされる。
+const DEFAULT_ENCRYPTED_AUTOSAVE_MS = 5000;
+
+interface CryptoDialogRequest {
+  mode: PasswordDialogMode;
+  tabId: string;
+  memoName: string;
+}
 
 interface NameDialogRequest {
   title: string;
@@ -109,6 +120,12 @@ export function App() {
   useEffect(() => {
     openMemoRef.current = openMemo;
   }, [openMemo]);
+  // 暗号化メモの低頻度自動保存（M6）が、非同期タイマー発火時点の最新本文を読むための ref
+  // （dirtyRef/openMemoRef と同じ理由）。
+  const contentLFRef = useRef(contentLF);
+  useEffect(() => {
+    contentLFRef.current = contentLF;
+  }, [contentLF]);
 
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [nameDialog, setNameDialog] = useState<NameDialogRequest | null>(null);
@@ -116,6 +133,16 @@ export function App() {
   const [trashFallback, setTrashFallback] = useState<TrashFallbackPayload | null>(null);
   // 外部変更との競合（M4, DESIGN §3.3）。表示中はエディタ入力・保存をロックする。
   const [conflictInfo, setConflictInfo] = useState<{ tabId: string; memoName: string } | null>(null);
+  const conflictInfoRef = useRef(conflictInfo);
+  useEffect(() => {
+    conflictInfoRef.current = conflictInfo;
+  }, [conflictInfo]);
+  // パスワード入力ダイアログ（設定/解除/開封/変更, M6）。
+  const [cryptoDialog, setCryptoDialog] = useState<CryptoDialogRequest | null>(null);
+  const [cryptoDialogError, setCryptoDialogError] = useState<string | null>(null);
+  // 暗号化メモの低頻度自動保存デバウンス（既定値。settings:get 応答で上書き, DESIGN §2.6）。
+  const encryptedAutosaveMsRef = useRef(DEFAULT_ENCRYPTED_AUTOSAVE_MS);
+  const autosaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // 同一メモのまま本文を強制的に再読込させるための世代カウンタ（M4）。CodeMirrorEditor は
   // 非制御コンポーネントで `initialContentLF` はマウント時のみ使用するため、外部変更の
   // 静かな反映・競合解決で本文を書き換える際は key に含めてこの値を進め、明示的に
@@ -142,6 +169,7 @@ export function App() {
           setTreeWidth(res.value.window.treeWidth);
           setEditorSettings((prev) => ({ ...prev, ...res.value.editorDefaults }));
           setLinkSettings(res.value.links);
+          encryptedAutosaveMsRef.current = res.value.autosave.encryptedDebounceMs;
         }
       })
       .catch((e: unknown) => console.error('settings:get failed', e));
@@ -193,6 +221,94 @@ export function App() {
     void ipc.reportActiveMemo(active).catch((e: unknown) => console.error('editor:reportActive failed', e));
   }, []);
 
+  // --- 暗号化メモ（M6, DESIGN §2.9）: ロック前/切替前の自動保存+セッション鍵破棄、低頻度自動保存 ---
+
+  const clearEncryptedAutosaveTimer = useCallback((): void => {
+    if (autosaveTimerRef.current) {
+      clearTimeout(autosaveTimerRef.current);
+      autosaveTimerRef.current = null;
+    }
+  }, []);
+
+  /**
+   * 現在開いているメモを安全に閉じてよいかを判定し、必要な後始末を行う。
+   * - 平文メモ: dirty なら window.confirm で破棄確認する（既存 M2 の挙動を維持）。
+   * - 暗号化メモ: 無確認で破棄しない（DESIGN §2.9）。dirty なら crypto:saveEncrypted で
+   *   自動保存してから crypto:lock でセッション鍵を破棄する（既定は自動保存を優先,
+   *   PLAN §5.5 ロック手順1-2）。保存が失敗した場合（競合等）は中断し、呼び出し元は
+   *   メモ切り替えを行わない。
+   * refs 経由で最新値を読むため、deps を空にできる（selectTab 等と同じ理由, M2-R1-01）。
+   */
+  const requestCloseCurrentMemo = useCallback(async (): Promise<boolean> => {
+    const om = openMemoRef.current;
+    if (!om) return true;
+
+    if (!om.encrypted) {
+      if (dirtyRef.current && !window.confirm('未保存の変更があります。破棄して別のメモを開きますか？')) {
+        return false;
+      }
+      return true;
+    }
+
+    clearEncryptedAutosaveTimer();
+    if (dirtyRef.current) {
+      const res = await ipc.saveEncryptedMemo({
+        tabId: om.tabId,
+        memoName: om.memoName,
+        contentLF: contentLFRef.current,
+        eol: om.eol,
+        expectedHash: om.lastKnownHash
+      });
+      if (!res.ok) {
+        setStatusMessage(`暗号化メモの自動保存に失敗しました[${res.error.code}]: ${res.error.message}`);
+        return false;
+      }
+    }
+    const lockRes = await ipc.lockMemo({ tabId: om.tabId, memoName: om.memoName });
+    if (!lockRes.ok) {
+      // ロック解除（セッション鍵破棄）自体の失敗は致命的ではない（次回開封時にパスワード
+      // 入力すれば足りる）ため、内部ログのみでメモ切り替え自体はブロックしない。
+      console.error('crypto:lock failed', lockRes.error);
+    }
+    return true;
+  }, [clearEncryptedAutosaveTimer]);
+
+  const performEncryptedAutosave = useCallback(async (): Promise<void> => {
+    const om = openMemoRef.current;
+    if (!om || !om.encrypted || !dirtyRef.current) return;
+    const conflict = conflictInfoRef.current;
+    if (conflict && conflict.tabId === om.tabId && conflict.memoName === om.memoName) return; // 解決中ロック。
+
+    const res = await ipc.saveEncryptedMemo({
+      tabId: om.tabId,
+      memoName: om.memoName,
+      contentLF: contentLFRef.current,
+      eol: om.eol,
+      expectedHash: om.lastKnownHash
+    });
+    if (res.ok) {
+      setOpenMemo((prev) =>
+        prev && prev.tabId === om.tabId && prev.memoName === om.memoName ? withUpdatedHash(prev, res.value.savedHash) : prev
+      );
+      setDirty(false);
+      reportActiveMemo({ tabId: om.tabId, memoName: om.memoName, dirty: false });
+      setStatusMessage(`自動保存しました（${om.memoName}）`);
+    } else if (res.error.code !== 'CONFLICT') {
+      // CONFLICT は evt:conflict 経由の競合ダイアログに解決を委ねる（ここでは静かに諦める）。
+      setStatusMessage(`自動保存エラー[${res.error.code}]: ${res.error.message}`);
+    }
+  }, [reportActiveMemo]);
+
+  const scheduleEncryptedAutosave = useCallback((): void => {
+    clearEncryptedAutosaveTimer();
+    autosaveTimerRef.current = setTimeout(() => {
+      autosaveTimerRef.current = null;
+      void performEncryptedAutosave();
+    }, encryptedAutosaveMsRef.current);
+  }, [clearEncryptedAutosaveTimer, performEncryptedAutosave]);
+
+  useEffect(() => clearEncryptedAutosaveTimer, [clearEncryptedAutosaveTimer]);
+
   // evt:conflict / evt:externalChange 購読（M4, DESIGN §3.3 / docs/milestones/M4-watch.md）。
   // 経路の分離厳守: 本 effect はツリー再取得・「編集中でない」開いているメモの静かな反映
   // （または競合ダイアログ表示）のみを行う。全文検索インデックスの反映はメイン側
@@ -232,6 +348,20 @@ export function App() {
       }
 
       void (async () => {
+        if (om.encrypted) {
+          // 暗号化メモは memo:read で本文を取得できない（contentLF:'' が返る仕様）ため、
+          // handleConflictAdoptExternal と同様にセッション鍵を破棄して閉じ、再度パスワード
+          // 入力での開き直しを促す（空文字での静かな上書きによるデータ消失を防ぐ, レビュー指摘対応）。
+          await ipc.lockMemo({ tabId: om.tabId, memoName: om.memoName });
+          clearEncryptedAutosaveTimer();
+          setOpenMemo(null);
+          setContentLF('');
+          setDirty(false);
+          setEditorStats(null);
+          reportActiveMemo(null);
+          setStatusMessage(`「${om.memoName}」は外部で変更されました。開き直してください。`);
+          return;
+        }
         const res = await ipc.readMemo({ tabId: om.tabId, memoName: om.memoName });
         if (!res.ok) return;
         setOpenMemo(createOpenMemoState(om.tabId, om.memoName, res.value));
@@ -248,7 +378,7 @@ export function App() {
       unsubscribeConflict();
       unsubscribeExternalChange();
     };
-  }, [refreshTree, reportActiveMemo]);
+  }, [refreshTree, reportActiveMemo, clearEncryptedAutosaveTimer]);
 
   // 競合ダイアログの解決アクション（M4）。
   const handleConflictKeepMine = useCallback(() => {
@@ -259,15 +389,24 @@ export function App() {
     void (async () => {
       // expectedHash を渡さず（=競合チェックを迂回して）強制上書きする。ユーザーが競合
       // ダイアログで明示的に選んだ意図的な上書きであり、既存の memo:save 競合チェックの
-      // バイパスは本ケースに限定される（DESIGN §3.3）。
-      const res = await ipc.saveMemo({
-        tabId: openMemo.tabId,
-        memoName: openMemo.memoName,
-        contentLF,
-        eol: openMemo.eol,
-        encoding: openMemo.encoding,
-        expectedHash: undefined
-      });
+      // バイパスは本ケースに限定される（DESIGN §3.3）。暗号化メモは crypto:saveEncrypted を使う
+      // （M6。セッション鍵は開封時のまま維持されているため引き続き保存できる）。
+      const res = openMemo.encrypted
+        ? await ipc.saveEncryptedMemo({
+            tabId: openMemo.tabId,
+            memoName: openMemo.memoName,
+            contentLF,
+            eol: openMemo.eol,
+            expectedHash: undefined
+          })
+        : await ipc.saveMemo({
+            tabId: openMemo.tabId,
+            memoName: openMemo.memoName,
+            contentLF,
+            eol: openMemo.eol,
+            encoding: openMemo.encoding,
+            expectedHash: undefined
+          });
       if (res.ok) {
         setOpenMemo(withUpdatedHash(openMemo, res.value.savedHash));
         setDirty(false);
@@ -284,6 +423,22 @@ export function App() {
     if (!conflictInfo) return;
     const { tabId, memoName } = conflictInfo;
     void (async () => {
+      if (openMemo?.encrypted) {
+        // 暗号化メモは memo:read で本文を取得できない（M1 スコープの仕様通り本文非対応）ため、
+        // 外部変更を採用する場合はセッション鍵を破棄して一旦閉じ、ユーザーに再度パスワード入力
+        // での開き直しを求める（古い鍵のまま自動復号を試みて誤った結果を出さないための安全策,
+        // developer 判断）。
+        await ipc.lockMemo({ tabId, memoName });
+        clearEncryptedAutosaveTimer();
+        setOpenMemo(null);
+        setContentLF('');
+        setDirty(false);
+        setEditorStats(null);
+        reportActiveMemo(null);
+        setStatusMessage(`「${memoName}」は外部で変更されました。開き直してください。`);
+        setConflictInfo(null);
+        return;
+      }
       const res = await ipc.readMemo({ tabId, memoName });
       if (res.ok) {
         setOpenMemo(createOpenMemoState(tabId, memoName, res.value));
@@ -304,7 +459,7 @@ export function App() {
       }
       setConflictInfo(null);
     })();
-  }, [conflictInfo, reportActiveMemo]);
+  }, [conflictInfo, openMemo, reportActiveMemo, clearEncryptedAutosaveTimer]);
 
   const handleToggleTheme = useCallback(() => {
     const next = theme === 'light' ? 'dark' : 'light';
@@ -313,9 +468,9 @@ export function App() {
   }, [theme, setTheme]);
 
   const selectTab = useCallback(async (tabId: string) => {
-    // dirtyRef.current で常に最新値を参照する（M2-R1-01 対応。useCallback の deps には
-    // 含めない＝コールバック identity は refreshTree のみに依存させたまま最新 dirty を読める）。
-    if (dirtyRef.current && !window.confirm('未保存の変更があります。破棄して別のタブを開きますか？')) {
+    // requestCloseCurrentMemo が平文/暗号化それぞれの適切なガード・後始末（平文=破棄確認,
+    // 暗号化=自動保存+セッション鍵破棄, M6）を行う（refs 経由で最新値を読むため deps 不要）。
+    if (!(await requestCloseCurrentMemo())) {
       return;
     }
     setSelectedTabId(tabId);
@@ -328,17 +483,18 @@ export function App() {
     setConflictInfo(null);
     reportActiveMemo(null);
     await refreshTree(tabId);
-  }, [refreshTree, reportActiveMemo]);
+  }, [refreshTree, reportActiveMemo, requestCloseCurrentMemo]);
 
   const openMemoByName = useCallback(
     async (memoName: string, encrypted: boolean) => {
       if (!selectedTabId) return;
-      // dirtyRef.current で常に最新値を参照する（M2-R1-01 対応、上記 selectTab と同様）。
-      if (dirtyRef.current && !window.confirm('未保存の変更があります。破棄して別のメモを開きますか？')) {
+      if (!(await requestCloseCurrentMemo())) {
         return;
       }
       if (encrypted) {
-        setStatusMessage('暗号化メモの復号は M6 で対応予定です（現時点では名前のみ表示）。');
+        // 暗号化メモは開封にパスワードが必要（M6, crypto:open）。
+        setCryptoDialog({ mode: 'unlockToOpen', tabId: selectedTabId, memoName });
+        setCryptoDialogError(null);
         return;
       }
       const res = await ipc.readMemo({ tabId: selectedTabId, memoName });
@@ -358,7 +514,7 @@ export function App() {
         setStatusMessage(`メモ読込エラー: ${res.error.message}`);
       }
     },
-    [selectedTabId, reportActiveMemo]
+    [selectedTabId, reportActiveMemo, requestCloseCurrentMemo]
   );
 
   // 全文検索の結果一覧からのジャンプ（M3-②）。ヒットしたタブ/メモへ切り替えてから、
@@ -375,13 +531,16 @@ export function App() {
           // 未保存確認をユーザーがキャンセルした等でタブ切替が行われなかった。ジャンプ中断。
           return;
         }
-      } else if (dirtyRef.current && !window.confirm('未保存の変更があります。破棄して別のメモを開きますか？')) {
-        // 同一タブ内で別メモへジャンプする場合は openMemoByName と同様の未保存確認ガード。
+      } else if (!(await requestCloseCurrentMemo())) {
+        // 同一タブ内で別メモへジャンプする場合は openMemoByName と同様のガード（M6）。
         return;
       }
 
       if (hit.encrypted) {
-        setStatusMessage(`「${hit.memoName}」は暗号化メモのため、本文プレビュー・ジャンプは非対応です（M6で対応予定）。`);
+        // 暗号化メモは本文がインデックス対象外のため常に matchField==='name'（本文ジャンプ不可）。
+        // パスワード入力での開封は求められるので unlockToOpen ダイアログへ委ねる。
+        setCryptoDialog({ mode: 'unlockToOpen', tabId: hit.tabId, memoName: hit.memoName });
+        setCryptoDialogError(null);
         return;
       }
 
@@ -404,12 +563,12 @@ export function App() {
         setRevealTarget({ from: hit.matchStart, to: hit.matchEnd, token: revealTokenRef.current });
       }
     },
-    [selectTab, reportActiveMemo]
+    [selectTab, reportActiveMemo, requestCloseCurrentMemo]
   );
 
   // --- リンク機能（M5, DESIGN §2.8）: memo: 遷移 / URL・mailto・ファイルパスの外部起動 ---
 
-  // `memo:` リンクの解決先を開く（暗号化メモは M6 未実装のため名前のみ表示に留める。
+  // `memo:` リンクの解決先を開く（暗号化メモはパスワード入力ダイアログへ委ねる, M6。
   // handleJumpToHit と似た「タブ切替→本文読込」処理だが、`hit.encrypted` のような事前情報が
   // 無い（link:resolveMemo はメモ名/tabIdのみ返す, PLAN §2.5）ため、暗号化判定は
   // memo:read の結果から行う独立実装にしている）。
@@ -421,7 +580,8 @@ export function App() {
         return;
       }
       if (res.value.encrypted) {
-        setStatusMessage(`「${memoName}」は暗号化メモのため、開くには M6 の対応が必要です。`);
+        setCryptoDialog({ mode: 'unlockToOpen', tabId, memoName });
+        setCryptoDialogError(null);
         return;
       }
       setOpenMemo(createOpenMemoState(tabId, memoName, res.value));
@@ -449,13 +609,9 @@ export function App() {
           if (!res.ok || !res.value) return;
           const { tabId, memoName } = res.value;
           if (tabId !== selectedTabId) {
-            await selectTab(tabId); // 未保存確認は selectTab 内部で行う（M2-R1-01 と同様のガード）。
+            await selectTab(tabId); // 未保存確認/暗号化メモの後始末は selectTab 内部で行う（M6）。
             if (selectedTabIdRef.current !== tabId) return; // ユーザーがキャンセルし切替されなかった。
-          } else if (
-            memoName &&
-            dirtyRef.current &&
-            !window.confirm('未保存の変更があります。破棄して別のメモを開きますか？')
-          ) {
+          } else if (memoName && !(await requestCloseCurrentMemo())) {
             return;
           }
           if (memoName) await openMemoDirect(tabId, memoName);
@@ -494,7 +650,7 @@ export function App() {
         performOpen();
       }
     },
-    [selectedTabId, linkSettings, selectTab, openMemoDirect]
+    [selectedTabId, linkSettings, selectTab, openMemoDirect, requestCloseCurrentMemo]
   );
 
   // 全文検索パネルのショートカット（Ctrl+Shift+F）。CodeMirror 側の Ctrl+F（現在メモ内検索,
@@ -516,9 +672,13 @@ export function App() {
       setContentLF(content);
       setDirty(true);
       const om = openMemoRef.current;
-      if (om) reportActiveMemo({ tabId: om.tabId, memoName: om.memoName, dirty: true });
+      if (om) {
+        reportActiveMemo({ tabId: om.tabId, memoName: om.memoName, dirty: true });
+        // 暗号化メモの低頻度自動保存（DESIGN §2.6「編集停止から一定時間のデバウンス」, M6）。
+        if (om.encrypted) scheduleEncryptedAutosave();
+      }
     },
-    [reportActiveMemo]
+    [reportActiveMemo, scheduleEncryptedAutosave]
   );
 
   const handleEditorStats = useCallback((stats: EditorStats) => {
@@ -531,14 +691,24 @@ export function App() {
     if (!openMemo || !dirty || (conflictInfo && conflictInfo.tabId === openMemo.tabId && conflictInfo.memoName === openMemo.memoName)) {
       return;
     }
-    const res = await ipc.saveMemo({
-      tabId: openMemo.tabId,
-      memoName: openMemo.memoName,
-      contentLF,
-      eol: openMemo.eol,
-      encoding: openMemo.encoding,
-      expectedHash: openMemo.lastKnownHash
-    });
+    // 手動保存は保留中の暗号化メモ自動保存タイマーを無効化する（二重保存を避ける, M6）。
+    clearEncryptedAutosaveTimer();
+    const res = openMemo.encrypted
+      ? await ipc.saveEncryptedMemo({
+          tabId: openMemo.tabId,
+          memoName: openMemo.memoName,
+          contentLF,
+          eol: openMemo.eol,
+          expectedHash: openMemo.lastKnownHash
+        })
+      : await ipc.saveMemo({
+          tabId: openMemo.tabId,
+          memoName: openMemo.memoName,
+          contentLF,
+          eol: openMemo.eol,
+          encoding: openMemo.encoding,
+          expectedHash: openMemo.lastKnownHash
+        });
     if (res.ok) {
       setOpenMemo(withUpdatedHash(openMemo, res.value.savedHash));
       setDirty(false);
@@ -547,7 +717,177 @@ export function App() {
     } else {
       setStatusMessage(`保存エラー[${res.error.code}]: ${res.error.message}`);
     }
-  }, [openMemo, contentLF, dirty, conflictInfo, reportActiveMemo]);
+  }, [openMemo, contentLF, dirty, conflictInfo, reportActiveMemo, clearEncryptedAutosaveTimer]);
+
+  // 「ロック」ボタン（暗号化メモを開封中のみ表示）: dirty なら自動保存してからセッション鍵を破棄し、
+  // レンダラ側の CodeMirror ドキュメント/Undo 履歴も破棄する（厳格な履歴破棄, DESIGN §2.9）。
+  const handleLockMemo = useCallback(async () => {
+    if (!openMemo || !openMemo.encrypted) return;
+    const memoName = openMemo.memoName;
+    if (!(await requestCloseCurrentMemo())) return;
+    setOpenMemo(null);
+    setContentLF('');
+    setDirty(false);
+    setEditorStats(null);
+    setConflictInfo(null);
+    reportActiveMemo(null);
+    setStatusMessage(`「${memoName}」をロックしました。`);
+  }, [openMemo, requestCloseCurrentMemo, reportActiveMemo]);
+
+  // --- パスワード設定/解除/変更ダイアログ（M6, DESIGN §2.9） ---
+  // 対象メモが「現在開封中かつ未保存」の場合は、保存前の平文が失われる/保存後ハッシュとの
+  // 不整合が生じるあいまいな状態を避けるため、先に保存してから操作するよう案内する
+  // （developer 判断。無確認でのデータ破棄/不整合を避ける）。
+  const isOpenAndDirty = useCallback(
+    (memoName: string): boolean =>
+      !!openMemo && !!selectedTabId && openMemo.tabId === selectedTabId && openMemo.memoName === memoName && dirty,
+    [openMemo, selectedTabId, dirty]
+  );
+
+  const handleRequestEncrypt = useCallback(
+    (memoName: string) => {
+      if (!selectedTabId) return;
+      if (isOpenAndDirty(memoName)) {
+        setStatusMessage('未保存の変更を保存してから暗号化してください。');
+        return;
+      }
+      setCryptoDialog({ mode: 'setup', tabId: selectedTabId, memoName });
+      setCryptoDialogError(null);
+    },
+    [selectedTabId, isOpenAndDirty]
+  );
+
+  const handleRequestDecrypt = useCallback(
+    (memoName: string) => {
+      if (!selectedTabId) return;
+      if (isOpenAndDirty(memoName)) {
+        setStatusMessage('未保存の変更を保存してから暗号化を解除してください。');
+        return;
+      }
+      setCryptoDialog({ mode: 'unlockToDecrypt', tabId: selectedTabId, memoName });
+      setCryptoDialogError(null);
+    },
+    [selectedTabId, isOpenAndDirty]
+  );
+
+  const handleRequestChangePassword = useCallback(
+    (memoName: string) => {
+      if (!selectedTabId) return;
+      if (isOpenAndDirty(memoName)) {
+        setStatusMessage('未保存の変更を保存してからパスワードを変更してください。');
+        return;
+      }
+      setCryptoDialog({ mode: 'changePassword', tabId: selectedTabId, memoName });
+      setCryptoDialogError(null);
+    },
+    [selectedTabId, isOpenAndDirty]
+  );
+
+  const handleCryptoDialogCancel = useCallback(() => {
+    setCryptoDialog(null);
+    setCryptoDialogError(null);
+  }, []);
+
+  /**
+   * 構造的な暗号操作（暗号化/暗号化解除/パスワード変更）の成功直後、対象メモが現在開いていれば
+   * 表示状態を最新化する。操作前に isOpenAndDirty で dirty をブロック済みなので、ここでの
+   * 対象は未編集（保存済み）の表示状態のみ。
+   * - 暗号化/パスワード変更後（`newEncrypted=true`）: `.txtenc` の本文は `memo:read` では
+   *   取得できないため hash のみ更新する（表示中の内容は未編集のまま変わらない。セッション鍵は
+   *   main 側の各ハンドラが既に更新/設定済み）。
+   * - 暗号化解除後（`newEncrypted=false`）: 平文として通常どおり読み直す。
+   * 想定外に読み直しが失敗した場合（直後に外部で削除された等）は安全側でメモを閉じる。
+   */
+  const refreshOpenMemoAfterCryptoOp = useCallback(
+    async (tabId: string, memoName: string, newEncrypted: boolean): Promise<void> => {
+      if (!openMemo || openMemo.tabId !== tabId || openMemo.memoName !== memoName) return;
+      const res = await ipc.readMemo({ tabId, memoName });
+      if (!res.ok) {
+        clearEncryptedAutosaveTimer();
+        setOpenMemo(null);
+        setContentLF('');
+        setDirty(false);
+        setEditorStats(null);
+        setConflictInfo(null);
+        reportActiveMemo(null);
+        return;
+      }
+      if (newEncrypted) {
+        setOpenMemo((prev) => (prev ? { ...prev, encrypted: true, lastKnownHash: res.value.hash } : prev));
+      } else {
+        setOpenMemo(createOpenMemoState(tabId, memoName, res.value));
+        setContentLF(res.value.contentLF);
+      }
+    },
+    [openMemo, reportActiveMemo, clearEncryptedAutosaveTimer]
+  );
+
+  const handleCryptoDialogSubmit = useCallback(
+    (values: PasswordDialogSubmitValues) => {
+      if (!cryptoDialog) return;
+      const { mode, tabId, memoName } = cryptoDialog;
+      void (async () => {
+        if (mode === 'setup') {
+          const res = await ipc.encryptMemo({ tabId, memoName, password: values.password ?? '', hint: values.hint });
+          if (res.ok) {
+            setCryptoDialog(null);
+            setStatusMessage(`「${memoName}」を暗号化しました。`);
+            await refreshOpenMemoAfterCryptoOp(tabId, memoName, true);
+            await refreshTree(tabId);
+          } else {
+            setCryptoDialogError(res.error.message);
+          }
+          return;
+        }
+        if (mode === 'unlockToOpen') {
+          const res = await ipc.openEncryptedMemo({ tabId, memoName, password: values.password ?? '' });
+          if (res.ok) {
+            setCryptoDialog(null);
+            setCryptoDialogError(null);
+            setOpenMemo({ tabId, memoName, eol: res.value.eol, encoding: 'utf-8', lastKnownHash: res.value.hash, encrypted: true });
+            setContentLF(res.value.contentLF);
+            setDirty(false);
+            setEditorStats(null);
+            setStatusMessage(null);
+            setRevealTarget(null);
+            setConflictInfo(null);
+            setReloadGeneration((g) => g + 1);
+            reportActiveMemo({ tabId, memoName, dirty: false });
+          } else {
+            setCryptoDialogError(res.error.message);
+          }
+          return;
+        }
+        if (mode === 'unlockToDecrypt') {
+          const res = await ipc.decryptMemoToPlain({ tabId, memoName, password: values.password ?? '' });
+          if (res.ok) {
+            setCryptoDialog(null);
+            setStatusMessage(`「${memoName}」の暗号化を解除しました。`);
+            await refreshOpenMemoAfterCryptoOp(tabId, memoName, false);
+            await refreshTree(tabId);
+          } else {
+            setCryptoDialogError(res.error.message);
+          }
+          return;
+        }
+        // mode === 'changePassword'
+        const res = await ipc.changeMemoPassword({
+          tabId,
+          memoName,
+          oldPassword: values.oldPassword ?? '',
+          newPassword: values.newPassword ?? ''
+        });
+        if (res.ok) {
+          setCryptoDialog(null);
+          setStatusMessage(`「${memoName}」のパスワードを変更しました。`);
+          await refreshOpenMemoAfterCryptoOp(tabId, memoName, true);
+        } else {
+          setCryptoDialogError(res.error.message);
+        }
+      })();
+    },
+    [cryptoDialog, refreshTree, refreshOpenMemoAfterCryptoOp]
+  );
 
   // --- ツリー開閉/ラベル（tree:updateStructure, メタのみ更新） ---
 
@@ -744,6 +1084,7 @@ export function App() {
             if (res.ok) {
               setStatusMessage('削除しました。');
               if (openMemo && memoNames.includes(openMemo.memoName)) {
+                clearEncryptedAutosaveTimer();
                 setOpenMemo(null);
                 setContentLF('');
                 setDirty(false);
@@ -761,7 +1102,7 @@ export function App() {
         }
       });
     },
-    [selectedTabId, openMemo, refreshTree, reportActiveMemo]
+    [selectedTabId, openMemo, refreshTree, reportActiveMemo, clearEncryptedAutosaveTimer]
   );
 
   const handleTrashFallbackConfirm = useCallback(() => {
@@ -773,6 +1114,7 @@ export function App() {
       if (res.ok) {
         setStatusMessage('直接削除しました。');
         if (openMemo && payload.memoNames.includes(openMemo.memoName)) {
+          clearEncryptedAutosaveTimer();
           setOpenMemo(null);
           setContentLF('');
           setDirty(false);
@@ -785,7 +1127,7 @@ export function App() {
       }
       if (selectedTabId === payload.tabId) await refreshTree(payload.tabId);
     })();
-  }, [trashFallback, selectedTabId, openMemo, refreshTree, reportActiveMemo]);
+  }, [trashFallback, selectedTabId, openMemo, refreshTree, reportActiveMemo, clearEncryptedAutosaveTimer]);
 
   // --- タブ操作（PLAN §2.1） ---
 
@@ -882,6 +1224,7 @@ export function App() {
             if (res.ok) {
               setStatusMessage(deleteFolder ? 'タブとフォルダを削除しました。' : 'タブの登録を解除しました。');
               if (selectedTabId === tabId) {
+                clearEncryptedAutosaveTimer();
                 setSelectedTabId(null);
                 setTree([]);
                 setOpenMemo(null);
@@ -899,7 +1242,7 @@ export function App() {
         }
       });
     },
-    [tabs, selectedTabId, refreshTabs, reportActiveMemo]
+    [tabs, selectedTabId, refreshTabs, reportActiveMemo, clearEncryptedAutosaveTimer]
   );
 
   const handleReorderTabs = useCallback(
@@ -1018,6 +1361,9 @@ export function App() {
               onRequestDuplicate={handleRequestDuplicate}
               onRequestDelete={handleRequestDelete}
               onRequestSetLabel={handleRequestSetLabel}
+              onRequestEncrypt={handleRequestEncrypt}
+              onRequestDecrypt={handleRequestDecrypt}
+              onRequestChangePassword={handleRequestChangePassword}
               onLocalMove={(names, anchor, zone) => void handleLocalMove(names, anchor, zone)}
               onLocalCopy={(names, anchor, zone) => void handleLocalCopy(names, anchor, zone)}
             />
@@ -1038,11 +1384,16 @@ export function App() {
                   {dirty ? ' *' : ''}
                 </span>
                 <span className="app__editor-meta">
-                  encoding: {openMemo.encoding} / eol: {openMemo.eol}
+                  {openMemo.encrypted ? '🔒 暗号化' : `encoding: ${openMemo.encoding}`} / eol: {openMemo.eol}
                 </span>
                 <button type="button" onClick={() => void handleSave()} disabled={!dirty}>
                   保存
                 </button>
+                {openMemo.encrypted && (
+                  <button type="button" onClick={() => void handleLockMemo()}>
+                    ロック
+                  </button>
+                )}
               </div>
               <CodeMirrorEditor
                 key={`${openMemo.tabId}:${openMemo.memoName}:${reloadGeneration}`}
@@ -1052,7 +1403,10 @@ export function App() {
                 onSave={() => void handleSave()}
                 settings={editorSettings}
                 revealTarget={revealTarget}
-                readOnly={conflictInfo !== null && conflictInfo.tabId === openMemo.tabId && conflictInfo.memoName === openMemo.memoName}
+                readOnly={
+                  (conflictInfo !== null && conflictInfo.tabId === openMemo.tabId && conflictInfo.memoName === openMemo.memoName) ||
+                  (cryptoDialog !== null && cryptoDialog.tabId === openMemo.tabId && cryptoDialog.memoName === openMemo.memoName)
+                }
                 linkOpenTrigger={linkSettings.openTrigger}
                 onLinkClick={handleLinkClick}
               />
@@ -1115,6 +1469,15 @@ export function App() {
           memoName={conflictInfo.memoName}
           onKeepMine={handleConflictKeepMine}
           onAdoptExternal={handleConflictAdoptExternal}
+        />
+      )}
+      {cryptoDialog && (
+        <PasswordDialog
+          mode={cryptoDialog.mode}
+          memoName={cryptoDialog.memoName}
+          errorMessage={cryptoDialogError}
+          onCancel={handleCryptoDialogCancel}
+          onSubmit={handleCryptoDialogSubmit}
         />
       )}
       {showSearchPanel && (
