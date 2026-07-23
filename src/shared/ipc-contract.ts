@@ -312,6 +312,42 @@ export interface OpErrorPayload {
   path?: string;
 }
 
+// ---------------------------------------------------------------------------
+// M5: リンク機能（link:openExternal / link:resolveMemo）の引数/返却型（PLAN §2.5、
+// docs/milestones/M5-links.md、DESIGN §2.8）。
+// ---------------------------------------------------------------------------
+
+/**
+ * `link:openExternal` の対象種別。`memo:` 記法はアプリ内遷移のため対象外で
+ * `link:resolveMemo` 側の専用チャネルを使う（DESIGN §2.8「memo: は外部起動を伴わない」）。
+ */
+export type LinkKind = 'url' | 'mailto' | 'path';
+
+export interface LinkOpenExternalArgs {
+  kind: LinkKind;
+  /** レンダラで検出した元テキスト（例: `https://...`, `foo@example.com`, `C:\notes\a.txt`）。 */
+  raw: string;
+  /** 相対パス（`kind==='path'`）を解決する基準タブ（PLAN §2.5「baseTab の絶対パス基準で path.resolve」）。 */
+  baseTabId?: string;
+}
+
+export interface LinkResolveMemoArgs {
+  currentTabId: string;
+  /** `memo:` プレフィックスを除いた本体（例: `メモ名` / `タブ名/メモ名` / `タブ名/`）。 */
+  memoRef: string;
+}
+
+/**
+ * `link:resolveMemo` の解決結果（data-model.md/PLAN §2.5 の表記は `{ tabId, memoName }`）。
+ * `memoName` を省略可とした点は developer 判断（reviewer 確認事項）: DESIGN §2.8 の
+ * `memo:タブ名/`（メモ指定なしでタブを開くだけ）記法を表現するため、メモ指定が無い解決結果は
+ * `memoName` を省略する。メモ名まで指定された通常ケースでは必ず設定される。
+ */
+export interface LinkResolveMemoResult {
+  tabId: string;
+  memoName?: string;
+}
+
 /**
  * preload が `contextBridge.exposeInMainWorld('api', ...)` で公開する API の型。
  * M0 では `app:getInfo` のみだったが、M1 で tab/memo の基本チャネルと settings:get/set、
@@ -358,6 +394,12 @@ export interface PreloadApi {
   editor: {
     /** 現在開いている(かつ未保存の変更があるか)状態をメインへ通知する（M4 新設）。 */
     reportActive(args: EditorReportActiveArgs): Promise<Result<void>>;
+  };
+  link: {
+    /** URL/mailto/ファイルパスの外部起動（M5 新設, PLAN §2.5）。 */
+    openExternal(args: LinkOpenExternalArgs): Promise<Result<void>>;
+    /** `memo:` 記法の解決。解決不能時は `null`（エラーにしない, DESIGN §2.8）。 */
+    resolveMemo(args: LinkResolveMemoArgs): Promise<Result<LinkResolveMemoResult | null>>;
   };
   events: {
     /** `evt:metaRecovered` を購読する。返り値の関数を呼ぶと購読解除する。 */
