@@ -40,6 +40,7 @@ import {
 import { findNode, insertNode, loadTabMeta, removeNode, renameNodeInTree, saveTabMeta } from '../fs/metaStore';
 import type { DetectedEncoding } from '../fs/encoding';
 import { moveMemoInIndex, removeMemo as removeMemoFromIndex, renameMemoInIndex, updateMemo as updateMemoIndex } from '../search/searchIndex';
+import { deleteSessionKey, renameSessionKey } from '../crypto/sessionKeyStore';
 
 /** `evt:indexUpdated` を発火する（全文検索インデックス更新, PLAN §2.7）。 */
 function emitIndexUpdated(event: IpcMainInvokeEvent, tabId: string): void {
@@ -240,6 +241,9 @@ export function registerMemoHandlers(): void {
 
         // インデックス経路①（PLAN §5.3 step4）: メモ名キーを更新する。
         renameMemoInIndex(args.tabId, args.oldName, args.newName);
+        // 開封中の暗号化メモがリネームされてもセッション鍵を失わないよう引き継ぐ（M6, developer
+        // 判断）。対象キーが無ければ何もしない（平文メモ/未開封メモのリネーム）。
+        renameSessionKey(args.tabId, args.oldName, args.newName);
         emitIndexUpdated(event, args.tabId);
 
         return ok(undefined);
@@ -284,7 +288,12 @@ export function registerMemoHandlers(): void {
       if (succeeded.length > 0) {
         await saveTabMeta(folderPath, loaded.metaTree);
         // インデックス経路①: 削除成功分をインデックスからも除去する。
-        for (const name of succeeded) removeMemoFromIndex(args.tabId, name);
+        for (const name of succeeded) {
+          removeMemoFromIndex(args.tabId, name);
+          // 削除された暗号化メモのセッション鍵が残らないよう破棄する（M6, developer 判断。
+          // 実体が無くなった鍵をメモリに残さないための衛生上の後始末）。
+          deleteSessionKey(args.tabId, name);
+        }
         emitIndexUpdated(event, args.tabId);
       }
 
