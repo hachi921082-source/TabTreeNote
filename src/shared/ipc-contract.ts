@@ -348,11 +348,67 @@ export interface LinkResolveMemoResult {
   memoName?: string;
 }
 
+// ---------------------------------------------------------------------------
+// M6: パスワード暗号化（crypto:encryptMemo / decryptMemoToPlain / open / saveEncrypted /
+// changePassword / lock）の引数/返却型（PLAN §2.4、docs/milestones/M6-crypto.md、DESIGN §2.9）。
+// ---------------------------------------------------------------------------
+
+export interface CryptoEncryptMemoArgs {
+  tabId: string;
+  memoName: string;
+  password: string;
+  /** 任意のパスワードヒント（`.txtenc` ヘッダに平文保存。UI 側で警告表示すること）。 */
+  hint?: string;
+}
+
+export interface CryptoDecryptToPlainArgs {
+  tabId: string;
+  memoName: string;
+  password: string;
+}
+
+export interface CryptoOpenArgs {
+  tabId: string;
+  memoName: string;
+  password: string;
+}
+
+/**
+ * `crypto:open` の返却型（`hash` は `.txtenc` ファイル全体のバイト列のハッシュ。次回保存の
+ * 競合判定用, 00-core-principles.md §6）。
+ */
+export interface CryptoOpenResult {
+  contentLF: string;
+  eol: Eol;
+  hash: string;
+}
+
+export interface CryptoSaveEncryptedArgs {
+  tabId: string;
+  memoName: string;
+  contentLF: string;
+  eol: Eol;
+  expectedHash?: string;
+}
+
+export interface CryptoChangePasswordArgs {
+  tabId: string;
+  memoName: string;
+  oldPassword: string;
+  newPassword: string;
+}
+
+export interface CryptoLockArgs {
+  tabId: string;
+  memoName: string;
+}
+
 /**
  * preload が `contextBridge.exposeInMainWorld('api', ...)` で公開する API の型。
  * M0 では `app:getInfo` のみだったが、M1 で tab/memo の基本チャネルと settings:get/set、
  * `evt:metaRecovered` 購読を追加した。M2 で tab.rename/remove/reorder、
  * memo.delete/duplicate/move、tree.updateStructure、`evt:trashFallback` 購読を追加した。
+ * M6 で crypto.* 6 チャネルを追加した。
  * 以降の M でチャネル追加のたびにここへメソッドを追加し、preload 実装とレンダラ双方の型を
  * 同時に更新すること。
  */
@@ -400,6 +456,20 @@ export interface PreloadApi {
     openExternal(args: LinkOpenExternalArgs): Promise<Result<void>>;
     /** `memo:` 記法の解決。解決不能時は `null`（エラーにしない, DESIGN §2.8）。 */
     resolveMemo(args: LinkResolveMemoArgs): Promise<Result<LinkResolveMemoResult | null>>;
+  };
+  crypto: {
+    /** 平文 `.txt`→`.txtenc` 変換（M6 新設, DESIGN §2.9）。平文原本は直接削除。 */
+    encryptMemo(args: CryptoEncryptMemoArgs): Promise<Result<MemoInfo>>;
+    /** 明示的な暗号化解除。`.txtenc`→`.txt`（平文は通常扱い）。 */
+    decryptMemoToPlain(args: CryptoDecryptToPlainArgs): Promise<Result<MemoInfo>>;
+    /** 開封（復号）。成功時セッション鍵をメイン保持、本文平文をレンダラへ返す。 */
+    open(args: CryptoOpenArgs): Promise<Result<CryptoOpenResult>>;
+    /** 開封中メモの保存（`expectedHash` で外部変更競合検出、新 IV で再暗号化）。 */
+    saveEncrypted(args: CryptoSaveEncryptedArgs): Promise<Result<SaveResult>>;
+    /** 新 salt+新 IV で再暗号化する。 */
+    changePassword(args: CryptoChangePasswordArgs): Promise<Result<void>>;
+    /** セッション鍵破棄（再ロック）。 */
+    lock(args: CryptoLockArgs): Promise<Result<void>>;
   };
   events: {
     /** `evt:metaRecovered` を購読する。返り値の関数を呼ぶと購読解除する。 */
