@@ -288,3 +288,100 @@ TabTreeNote エージェント活動記録。詳細な指摘理由は reviewer �
 - opError: 検証全体を通じて`evt:opError`は一度も発火せず（意図しない例外が発生していないことの傍証）。
 - 後片付け: 検証用一時フォルダ（scratchpad配下、リポジトリ外）・Electron userData（`--user-data-dir`で隔離、リポジトリ外）・PowerShellロック用一時スクリプトを削除済み。検証後`Get-Process electron`/`Get-Process powershell`（自セッション以外）とも0件を確認。
 - 外部サービスへの副作用: なし（すべてローカルファイル操作・localhost CDP・ローカルPowerShellプロセスのみ。実運用のAPIキー/Webhook等は使用していない）。
+
+## developer — M5（リンク機能）実装
+
+対象: リンク装飾（URL/mail/path/`memo:`）・外部起動（確認+`path.resolve`+OS API）・`memo:` 解決/遷移（M5-links.md、DESIGN §2.8、PLAN §2.5/§5.8）。M1-M4（未コミット、作業ツリーに存在）の続き。
+
+- 新規: `src/main/ipc/linkHandlers.ts`（`link:openExternal`/`link:resolveMemo`）。
+  - `link:openExternal`: kind別に処理。`url`は`www.`始まりへ`https://`補完後スキーム許可リスト（http/https/ftp）検証→`shell.openExternal`。`mailto`は`mailto:`未前置なら補完しスキーム検証→`shell.openExternal`。`path`は`file://`正規化→絶対パスならそのまま、相対パスは`baseTabId`のタブフォルダ絶対パスを`getTabFolderPath`で取得し**必ず`path.resolve`で絶対パス化**（DESIGN §2.8必須事項）してから`shell.openPath`。シェル文字列連結は不使用（00-core-principles.md §10）。
+  - `link:resolveMemo`: `memoRef`（`memo:`除去済み）を`\`→`/`正規化し最初の`/`で分割。`/`無し=現在タブ内メモ名、`タブ名/メモ名`=`listTabs()`から`normalizeForCompare`でタブ名一致検索、`タブ名/`=メモ指定なし（`memoName`省略）。メモ名は`validateName`通過を要求（含む場合は解決不能=null、`findMemoFile`へのパストラバーサル文字列到達を多層防御で遮断）。`findMemoFile`で実ファイル確認、無ければnull。全経路で解決不能はResultエラーにせずnull（DESIGN §2.8「エラーダイアログは出さない」）。
+- 新規: `src/renderer/editor/links.ts`（CodeMirror 6拡張）。
+  - `detectLinks`: 単一正規表現（`memo:\S+` / `(https?://|ftp://|www\.)...` / `mailto:\S+` / 素のメールアドレス / `[A-Za-z]:\\`・`.\`・`..\`・`file://`のパス）で文書全文を走査し種別判定、末尾の句読点・閉じ括弧類をトリム。
+  - `LinkDecorationPluginValue`（`ViewPlugin.fromClass`）: `docChanged`時に再検出し`Decoration.mark({class:'cm-link'})`を`RangeSetBuilder`で構築。
+  - `buildLinkExtension`: 上記プラグイン+`EditorView.domEventHandlers({click,dblclick})`。`getOpenTrigger()`（`ctrlClick`/`singleClick`/`doubleClick`）に応じてトリガー一致時のみ`posAtCoords`でリンク特定→`preventDefault`+`onLinkClick`コールバック呼び出し（実際のIPC呼び出し・確認ダイアログは呼び出し側=App.tsxに委譲。onChange/onStats/onSaveと同じ「エディタ層はUI検出のみ、処理は親へ委譲」パターン）。
+- 変更: `src/renderer/components/Editor/CodeMirrorEditor.tsx`（`linkOpenTrigger`/`onLinkClick` props追加。既存のonChange/onStats/onSaveと同様ref経由で最新値を参照するため、マウント時の拡張リストに一度だけ組み込めばよい設計＝Compartment不要）。
+- 変更: `src/renderer/App.tsx`（`linkSettings` state追加、`settings:get`応答の`AppSettings.links`で上書き。`openMemoDirect`＝`memo:`リンク解決後にメモを開く独立ヘルパー（`memo:read`結果の`encrypted`で暗号化メモはM6未対応メッセージに留める。既存の`handleJumpToHit`と類似だが`link:resolveMemo`の返却に`encrypted`が無いため独立実装）。`handleLinkClick`＝`memo:`種別は`link:resolveMemo`→（タブ違いなら`selectTab`の既存未保存確認ガード経由/同タブなら`dirtyRef`で同様のガード）→`openMemoDirect`。url/mailto/path種別は`linkSettings.confirmBeforeOpen`（既定true）に応じ既存`ConfirmDialog`（削除確認等と共用の汎用コンポーネント）を挟んでから`link:openExternal`invoke。`CodeMirrorEditor`へ`linkOpenTrigger`/`onLinkClick`を配線）。
+- 変更: `src/shared/ipc-contract.ts`（`LinkKind`/`LinkOpenExternalArgs`/`LinkResolveMemoArgs`/`LinkResolveMemoResult`型、`PreloadApi.link`追加）、`src/preload/index.ts`・`src/renderer/ipc.ts`（`link.openExternal`/`link.resolveMemo`の配線）、`src/main/ipc/registerIpc.ts`（`registerLinkHandlers`登録）。
+- 変更: `src/renderer/App.css`（`.cm-link`＝`var(--color-accent)`色+下線+`cursor:pointer`）、`src/main/index.ts`（`setWindowOpenHandler`のコメント更新のみ。本流は`linkHandlers.ts`に委譲した旨を明記、ロジック変更なし）。
+- 設計判断（reviewer確認事項）:
+  1. `LinkResolveMemoResult.memoName`を省略可とした（data-model.md/PLAN §2.5の型表記は`{tabId,memoName}`の非オプショナルだが、DESIGN §2.8の`memo:タブ名/`＝メモ指定なしでタブを開くだけのケースを表現するため）。
+  2. `link:openExternal`のエラーコードは固定enum（`ErrorCode`）の中から意味的に近いものを流用（不正スキーム/baseTabId未指定=`NAME_INVALID`、`shell.openPath`失敗=`NOT_FOUND`）。新規コード追加はdata-model.md変更が必要になるため行っていない。
+  3. リンク検出は`detectLinks`が文書全文を都度正規表現走査する単純実装（個人用メモの小規模テキスト想定。`@codemirror/view`の`MatchDecorator`のような差分最適化は行っていない）。
+  4. クリック時のカーソル形状は常時`cursor:pointer`（トリガーが`ctrlClick`でもCtrl押下状態を検知して動的に切り替える実装はしていない）。
+  5. 番号/位置系記法（`#3`、`[ABC]`等）はDESIGN/PLAN双方で「v1任意」と明記されており未実装（メモ名/タブ名指定でのジャンプのみ実装）。
+  6. `link:resolveMemo`が解決した`.txtenc`メモは`openMemoDirect`が`memo:read`の`encrypted`を見てM6未対応メッセージを表示するのみ（M6未実装のため、実際の開封フローへの遷移は行わない。既存の`openMemoByName`/`handleJumpToHit`と同じ扱い）。
+- 確認: `npm run typecheck`（renderer/node両方）・`npm run build`（`electron-vite build`、`rm -rf out`後のクリーンビルド）とも成功。実機起動・実際のクリック操作・外部起動の動作検証はtester範囲のため未実施。
+
+## reviewer — M5（リンク機能）実装 静的レビュー（ラウンド1）
+
+対象: M5差分一式（main/ipc/linkHandlers.ts, renderer/editor/links.ts, shared/ipc-contract.ts, preload/index.ts, renderer/ipc.ts, main/ipc/registerIpc.ts, renderer/components/Editor/CodeMirrorEditor.tsx, renderer/App.tsx, renderer/App.css, main/index.ts）。M5-links.md・00-core-principles.md §1/§8/§10/§11・data-model.md と照合。
+
+- 判定: **ブロッキング指摘なし。developer への差し戻し不要。tester へ進行可。**
+- セキュリティ（重点確認）: `link:openExternal` はURLをM0のスキーム許可リスト方式（`ALLOWED_URL_SCHEMES`=http/https/ftp）と同じ考え方で`new URL().protocol`検証してから`shell.openExternal`、`kind`（レンダラの分類）を信用せず実際のスキームで判定するため多層防御になっている。`path`種別は相対パスを`baseTabId`のタブフォルダ絶対パスに`path.resolve`してから`shell.openPath`へ渡しており（生の相対パス文字列を直接渡す実装ではない）、シェル文字列連結・`exec`系は不使用。絶対パス/`..\`によるタブフォルダ外脱出は`path`種別では意図的に許容（DESIGN §2.8が任意ドライブレターパスを想定しており、`shell.openPath`はダブルクリック相当でコマンドライン注入経路にならないため設計と整合）。確認ダイアログをバイパスする経路は無し（`ipc.openExternalLink`/`ipc.resolveMemoLink`の呼び出し元は`handleLinkClick`の1箇所のみで、url/mailto/pathは`linkSettings.confirmBeforeOpen`分岐を必ず経由）。
+- `memo:`解決の閉じ込め: `resolveMemoLink`は`memoName`に対し`validateName`（`/`\`等禁止）を通過させてから`findMemoFile`（`join`）へ渡しており、スラッシュを含む文字列はその時点でnull化されるため、`join`によるフォルダ外脱出は発生しない（`isPathContained`を明示的には呼んでいないが、区切り文字自体を拒否する構成のため実質的に閉じ込め済み。M1-R1-01の多層防御パターンと同等）。
+- developer確認依頼6点はいずれも設計妥当と判断: (1) `LinkResolveMemoResult.memoName`省略可はDESIGN §2.8の`memo:タブ名/`（メモ指定なし）表現に必要な変更で、data-model.mdの表記との齟齬は実装上必須の具体化として許容。(2) エラーコード流用（`NAME_INVALID`/`NOT_FOUND`）は固定enum内での意味的に近い選択で妥当、内部ログにはOSエラー情報を残す`toUnknownResult`/`wrapHandler`の既存パターンも維持されている。(3) 全文正規表現走査は小規模メモ想定で許容範囲（M3-①のCodeMirror拡張の一般的な軽量実装と同水準）。(4) カーソル常時pointerはUX上の軽微な簡略化でブロッキングではない。(5) 番号/位置系記法未実装はPLAN/DESIGN明記の「v1任意」の通り。(6) `.txtenc`メモへの`memo:`リンクはM6未実装のため`openMemoByName`/`handleJumpToHit`と同様のM6対応予定メッセージに留めている。
+- インターフェース整合: `ipc-contract.ts`のPreloadApi.link → preload/index.ts → renderer/ipc.ts → App.tsx/CodeMirrorEditor.tsxの配線は型・チャネル名とも一貫。`AppSettings.links`既定値（`ctrlClick`+`confirmBeforeOpen:true`）はdata-model.mdおよびsettings/appSettings.tsの既定値と一致。
+- 明らかなバグ・タイポ: なし。`main/index.ts`の`setWindowOpenHandler`はコメント更新のみでロジック変更なし（既存のM0-R1-02スキーム許可リストを維持）。
+
+## tester — M5（リンク機能）動作検証（ラウンド1）
+
+対象: reviewer M5 ラウンド1（ブロッキング指摘なし）後の一式。npm install / typecheck / build / prod起動 / 実DOM操作+実CDPマウスイベント（Input.dispatchMouseEvent、Ctrl修飾）+ネイティブ`window.confirm`ダイアログの実際のハンドリング（Page.javascriptDialogOpening/handleJavaScriptDialog）による装飾検出・確認ダイアログ・外部起動・`memo:`遷移・未保存確認ガード・暗号化メモ/存在しないメモの安全な扱い・`confirmBeforeOpen`設定反映・疑似リンク誤検出なしを独立して再現確認。
+
+- **判定: 全項目 OK。不具合なし。developer への差し戻しなし。**
+- npm install: 成功（`up to date, audited 393 packages`。allow-scripts警告のみ）。
+- typecheck: `tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json` エラーなし。
+- build: `rm -rf out && npm run build`（クリーンビルド）成功。`out/main/index.js`(64.30kB)/`out/preload/index.js`(5.39kB)/`out/renderer/assets/index-*.js`(948.64kB)+css を生成確認。
+- prod起動: `--user-data-dir`で隔離したuserDataを使い`electron . --remote-debugging-port=9333`起動。CDP(`Runtime.consoleAPICalled`/`Runtime.exceptionThrown`)で監視した一連の操作（memo:リンク遷移・暗号化メモ/存在しないメモへのリンク・`www.`リンクの外部起動）を通じてコンソールエラー・例外0件。
+- **1. 装飾・視覚ハイライト（実DOM確認）**: URL(`https://example.com/page`)/`mailto:`明示/素のメールアドレス/相対パス(`.\subdir\target.txt`)/絶対パス(`C:\Windows\System32\drivers\etc\hosts`)/`www.`裸リンク/`memo:`記法（名前のみ・タブ名+メモ名・タブ名のみ）のいずれも`.cm-link`スパンとして装飾されることをCodeMirrorのDOM出力から確認。`getComputedStyle`で`text-decoration: underline`・`cursor: pointer`を実機確認。
+- **2. URL/mailtoの確認ダイアログ→実際の外部起動（実CDPマウスイベント, 最重要）**: `Input.dispatchMouseEvent`（`modifiers:2`=Ctrl、既定`openTrigger:ctrlClick`）でURL/mailtoリンクを実クリックし、`ConfirmDialog`（`role="dialog" aria-label="外部を開く確認"`）が正しいラベル（「次のURLを...」「次のメールアドレスを...」「次のパスを...」）で表示されることを確認。キャンセルで何も起きないこと、確認後は`link:openExternal`が呼ばれエラー表示なし（`shell.openExternal`/`shell.openPath`が実際に呼ばれ完了）を確認。**実際にOSの既定ブラウザ（Opera、確認時刻と一致する新規プロセス起動で裏付け）でexample.com/www.example.orgへのタブが開かれたこと、mailto:リンクでも同様にエラーなく完了したことを確認**（副作用は最終報告に明記）。
+- **3. 相対パスリンクの解決（実クリック+IPC直叩き併用）**: `.\subdir\target.txt`をCtrl+クリック→確認ダイアログのメッセージが生の相対パス文字列のまま表示→確認後エラーなし（ダイアログ経由でOSの「アプリの選択」チューザーが実際に開くのを確認、これは対象マシンに`.txt`の既定関連付けが無いための正常なOS側動作でありapp側の不具合ではない。チューザーは検証後に閉じて後片付け済み）。IPC直叩き（`link:openExternal` kind:'path'）でも`baseTabId`未指定時`NAME_INVALID`で正しく拒否されることを確認し、`baseTabId`指定時は`getTabFolderPath`基準の`path.resolve`が働いていることを実際の起動結果から確認。
+- **4. `memo:`リンクでの遷移・未保存確認ガード（実DOM+ネイティブconfirmダイアログの実ハンドリング, 最重要）**: `memo:child`（現在タブ内）/`memo:TabA/child`（タブ名+メモ名、大文字小文字無視で"tabA"タブに一致）/`memo:TabA/`（タブのみ、メモ指定なし）の3パターンをCtrl+クリックで実行し、いずれも実際にタブ切替・該当メモの本文オープン（`.cm-content`の内容一致）を確認。未保存編集ありの状態での遷移は、CDPの`Page.javascriptDialogOpening`/`Page.handleJavaScriptDialog`で実際のネイティブ`window.confirm`ダイアログを捕捉し、キャンセル時は遷移中断（元メモの`*`未保存表示・内容が維持）、OK時は破棄して遷移（新メモが開かれる）ことを、同一タブ内ケース（`dirtyRef`直接ガード）とタブ間ケース（`selectTab`内部ガード）の両方で確認。
+- **5. 存在しないメモ名を指す`memo:`リンク**: `memo:doesnotexist`をCtrl+クリックしても画面上何も変化せず（現在メモのまま）、エラーダイアログ・クラッシュ・コンソール例外いずれも発生しないことを確認（`resolveMemoLink`のnull解決どおり）。
+- **6. `.txtenc`メモへの`memo:`リンク**: `memo:secretenc`をCtrl+クリックすると実際に開封を試みず、ステータスバーに「「secretenc」は暗号化メモのため、開くには M6 の対応が必要です。」を表示するのみで現在メモのまま維持されること（クラッシュなし）を確認。
+- **7. `confirmBeforeOpen:false`設定の反映**: `settings:set`で`links.confirmBeforeOpen:false`に変更後、アプリ再読込（設定はマウント時に一度だけ読み込む設計のため、実運用の再起動相当としてPage.reloadで反映確認）し、Ctrl+クリックで確認ダイアログが一切表示されず直接`link:openExternal`が実行される（エラー表示なし、`.confirm-dialog`要素が存在しない）ことを確認。既定の`openTrigger:ctrlClick`どおり、Ctrl無しの素クリックでは何も起きないこと（誤操作防止）も確認。
+- **8. 疑似壊れリンクの非検出**: `http:/broken`（スラッシュ欠落）・`htt://not-a-real-scheme`（不正スキーム）・`foo:bar not a link`のいずれも`.cm-link`スパンとして装飾されない（=クリック不能）ことをDOM出力で確認。誤検出なし。
+- **9. npm install/typecheck/build/prod起動**: 上記のとおりすべてエラーなし。
+- **[Low/Info] 記録のみ（差し戻し不要、developer/designerの今後の判断に委ねる）: `shell.openPath`が「親フォルダは実在するが対象ファイルが存在しない」パス（例 存在する`subdir`配下の存在しないファイル名）に対し、この検証環境では2分以上応答が返らない（ハング）ことを確認。** 同一環境で親フォルダごと丸ごと存在しないケースは約9秒でエラー文字列を返して正常終了することと対比すると、Windows側のファイル種別解決処理（既定アプリ未関連付け+検証環境のネットワーク制限が疑われる）に起因する可能性が高く、`shell.openPath`呼び出し自体（Electron/OS側API）の挙動であり`linkHandlers.ts`のロジック不備ではない。ただし`openExternalLink`は`shell.openPath`の呼び出しにタイムアウトや存在チェック（`fs.access`等）を挟んでいないため、実運用でも同種の環境（既定アプリ未設定+オフライン等）に当たったユーザーは壊れた相対/絶対パスリンクをクリックした際に無期限に応答なし（エラー表示もされない）に見える可能性がある。DESIGN/PLANはこのケースの明示要件を持たないため致命的とは判断せずブロッキングにはしないが、防御的な事前存在チェックまたは`Promise.race`によるタイムアウトの追加を今後の改善候補として記録する。
+- 後片付け: 検証用一時フォルダ（scratchpad配下、リポジトリ外）・Electron userData（`--user-data-dir`で隔離、リポジトリ外）・検証中に開いたOSの「アプリの選択」チューザーを削除/終了済み。検証後`Get-Process electron`/`Get-Process OpenWith`とも0件を確認。
+- **外部サービスへの副作用（重要・明記）**: 本検証はM5の検証項目（「実際に既定ブラウザ/メールクライアントが起動する(または起動を試みる)こと」）に明示的に含まれていたため、実際に`shell.openExternal`/`shell.openPath`を実行した。結果、ユーザーの実環境で以下が発生した: (1) 既定ブラウザ（Opera）で`https://example.com/page`への新規タブが計2回、`https://www.example.org`への新規タブが1回開かれた（いずれもIANA予約の実在しないプレースホルダ/例示ドメインで、データ送信・課金・実際の通知先は無し）。(2) `mailto:foo@example.com`が既定メールハンドラへ1回渡された（メール送信は行っていない。実際に送信されたメールはない）。(3) 実在するローカルファイル（テスト用相対パスファイル）を開こうとした際、対象マシンに`.txt`の既定アプリ関連付けが無かったため、OS標準の「アプリの選択」チューザーが表示され、検証後にプロセスを終了した（アプリ選択・実行は行っていない）。実運用のAPIキー/Webhook/課金の発生・外部への実データ送信は一切なし。ユーザーの既定ブラウザに新規タブが残っている場合があるため、必要であれば手動で閉じてください。
+
+## developer — M5 tester記録（shell.openPathハング）修正
+
+対象: `src/main/ipc/linkHandlers.ts`（`openExternalLink`のkind='path'分岐）、`src/shared/constants.ts`（`LINK_OPEN_PATH_TIMEOUT_MS`新設）。
+
+- 背景: tester M5検証で「親フォルダは実在するが対象ファイル自体が存在しないパス」を`shell.openPath`に渡すと無期限にハングする事象を記録（差し戻しではなく記録のみ、上記347行目参照）。ユーザー指示によりオーケストレーター経由で修正を依頼された。
+- 修正1（事前存在チェック）: `shell.openPath`呼び出し前に`fs.promises.access(absolutePath)`で存在確認。`ENOENT`なら即座に`err('NOT_FOUND', ...)`を返す（既存のErrorCode enumから流用。`shell.openPath`失敗時に既に使っていた`NOT_FOUND`と同一コードで一貫）。ENOENT以外（権限エラー等）は事前チェックで確定的に弾かず`shell.openPath`側の判断+下記タイムアウトに委ねる。
+- 修正2（タイムアウト安全網）: `shell.openPath(absolutePath)`を新設の`withTimeout`ヘルパー（`Promise.race`相当、対象Promiseはキャンセルできないため単に先着した結果を採用する方式）で包み、`LINK_OPEN_PATH_TIMEOUT_MS`（5000ms、`src/shared/constants.ts`新設）で打ち切る。タイムアウト時は内部ログ（`console.error`、pathとtimeoutMsのみ）を記録した上で`err('UNKNOWN', ...)`を返す。これにより事前チェックをすり抜けるレースやその他の環境依存の遅延でもレンダラ側は最大5秒で応答を受け取れる。
+- 変更なし: `kind='url'`/`kind='mailto'`（`shell.openExternal`経由）は今回のtester記録で問題が確認されていないため対象外、ロジック変更なし。
+- 確認: `npm run typecheck`（renderer/node両方）エラーなし。`rm -rf out && npm run build`成功（`out/main/index.js`65.30kB/`out/preload/index.js`5.39kB/`out/renderer/assets/index-*.js`948.64kB+css）。`--user-data-dir`で隔離したuserDataで`electron . --remote-debugging-port`起動し、CDP経由で`window.api.link.openExternal({kind:'path', raw:<存在しない絶対パス>})`を直叩きしたところ、約1msで`{ok:false, error:{code:'NOT_FOUND', ...}}`が返り、ハングしないことを確認（tester範囲の本格検証は別途）。検証用一時フォルダ・Electronプロセスは後片付け済み、副作用なし。
+- コミット・プッシュは未実施（作業ツリーへの変更のみ、ユーザー指示どおり）。
+
+## reviewer — M5 tester記録（shell.openPathハング）修正確認（ラウンド2）
+
+対象: linkHandlers.ts（kind='path'の事前fs.access存在確認+withTimeoutラップ）, constants.ts（LINK_OPEN_PATH_TIMEOUT_MS=5000）。tester記録（差し戻しではなくInfo記録）への対応の確認であり、ブロッキング指摘への修正ではない。
+
+- 判定: **ブロッキング指摘なし。tester への再検証依頼が可能。**
+- TOCTOUレース窓: fs.access成功後〜shell.openPath呼び出しの間に対象が削除されるレースは残るが、その場合も5秒のwithTimeoutが最終防御として機能し無期限ハングには至らない設計。事前チェックは「大半のケースを即座にNOT_FOUNDで返す」高速化目的、タイムアウトは「すり抜けたレース+その他環境依存遅延」の安全網という役割分担が明確でOK。
+- withTimeoutのPromise.race実装: shell.openPathは1回のみ呼び出されており（timeoutで再実行はしない）二重実行の懸念なし。タイムアウト後もbackgroundのPromiseは残るが、`resolvePromise`は最初の1回のみ有効（JS Promiseの仕様上2回目の解決呼び出しは無視される）ため二重解決のバグは無い。低頻度なリンククリック操作が対象のため、稀にbackgroundで残り続けるPromise自体による実害（メモリ蓄積等）は個人プロジェクト規模で許容範囲。
+- エラーコード流用: 事前チェックのENOENT→NOT_FOUNDはM1（tab:register等の「存在しない親フォルダ」）と同じ用法で一貫。タイムアウト→UNKNOWNも00-core-principles.md §8「予期せぬ例外」の丸め先として妥当（専用コードが無い状況での意味的に近い選択、ラウンド1で承認済みのNOT_FOUND流用方針と同様の判断）。
+- url/mailto経路への影響: kind='url'/'mailto'（shell.openExternal経由）はコード上変更なしを確認。今回の修正はkind='path'分岐にのみ限定されている。
+- ログ出力: タイムアウト時のconsole.errorはpath/timeoutMsのみで機密情報・内部例外詳細の露出なし（該当パスはそもそもResultのpathフィールドとしてもレンダラへ返す情報のため問題なし）。
+- 非ブロッキング留意（Info、対応不要）: (1) withTimeoutのPromise reject分岐がタイムアウトと同一メッセージ「タイムアウト」で丸められるが、shell.openPathは例外を投げない仕様のためこの分岐は実質到達不能な防御的コードであり実害なし。(2) fs.access自体はタイムアウトで保護されていない（ネットワークドライブ等でaccess自体が長時間応答しない場合は5秒の外側で待つ）が、今回tester確認済みの事象（shell.openPath自体のハング）とは別種の理論上の残存ケースであり、致命ではない。
+- M5は tester への再検証依頼が可能と判断。
+
+## tester — M5 tester記録（shell.openPathハング）修正 再検証（ラウンド2）
+
+対象: reviewer ラウンド2（ブロッキング指摘なし）後の linkHandlers.ts（fs.access事前チェック+withTimeout）・constants.ts（LINK_OPEN_PATH_TIMEOUT_MS=5000）。npm run typecheck / npm run build / `--user-data-dir`で隔離したprod起動+CDPによるIPC直叩き・実DOM+実マウスイベント操作で、無期限ハングの解消・正常系回帰・url/mailto回帰・実クリックでのフリーズ有無を再検証。
+
+- **判定: 不具合なし。developer への差し戻しなし。**
+- typecheck: `tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json` エラーなし。
+- build: `rm -rf out && npm run build` 成功（`out/main/index.js`65.30kB/`out/preload/index.js`5.39kB/`out/renderer/assets/index-*.js`948.64kB+css）。
+- prod起動: `--user-data-dir`で隔離したuserDataを使い`electron . --remote-debugging-port=9345`起動。Node組込み`WebSocket`でCDPへ直接接続（`Runtime.evaluate`/`Input.dispatchMouseEvent`/`Page.reload`）し検証。
+- **1. ハング解消の実機確認（最重要）**: `tab:register`で登録した実フォルダ（親フォルダ`subdir`は実在、対象`missing-target.txt`は不存在）に対し`link:openExternal(kind:'path')`をIPC直叩き。ページ内`Date.now()`計測で**約1ms**、CDP呼び出し全体でも約2msで`{ok:false, error:{code:'NOT_FOUND', message:'ファイルが見つかりません: ...'}}`が返り、前回tester確認の「2分以上ハング」が完全に解消していることを確認。
+- **2. 正常系の回帰確認**: 同フォルダ内の実在ファイル（`subdir/exists.txt`）への同IPC呼び出しが約147msで`{ok:true}`を返し、実際にOS既定アプリ（この検証機は`.txt`の既定関連付けがありNotepadが起動）で開かれたことをプロセス一覧（`Notepad`プロセス、ウィンドウタイトル`exists.txt - メモ帳`）で確認。修正が正常系を壊していないことを確認（確認後Notepadプロセスは終了・後片付け済み）。
+- **3. url/mailto回帰確認**: コード差分上`kind='url'/'mailto'`分岐は今回の修正で無変更であることを確認済み（reviewerラウンド2の指摘と一致）。加えて`kind:'url', raw:'javascript:alert(1)'`が引き続き`NAME_INVALID`で拒否されることを実機確認（許可リスト検証ロジックが健全に機能）。さらに正常系1件として`kind:'url', raw:'https://example.com/...'`を実IPC呼び出しし`{ok:true}`+実際に既定ブラウザ（Opera）のタブタイトルが`Example Domain`に変化したことを確認、url経路の回帰なしを確認。
+  - **副作用に関する重要な補足（意図せず発生）**: mailtoの「不正な入力」を確認する目的で`kind:'mailto', raw:'not a valid mailto @@@'`を試したところ、`mailto:`スキームの妥当性チェックは`new URL('mailto:'+raw).protocol==='mailto:'`のみ（アドレス書式自体は検証しない、M0由来の既存設計でM5の今回修正とは無関係）のため`{ok:true}`となり実際に`shell.openExternal`が実行された。この検証機には既定メールクライアントの関連付けが無いため、実際にメールは送信されず、OS標準の「アプリの選択」チューザーが表示されるのみだった（確認後プロセス終了・後片付け済み）。想定外の実行だったため記録するが、メール送信等の実害はなし。
+- **4. 実DOM操作での存在しないファイルへのパスリンククリック（最重要）**: 実際にメモ本文へ`.\subdir\missing-target.txt`を含む内容を保存し、タブ/メモ行の実クリック（`MouseEvent`ディスパッチ）でメモを開き、リンク装飾（`.cm-link`）を実際のCDP `Input.dispatchMouseEvent`（Ctrl+クリック、既定`openTrigger:ctrlClick`）で操作。確認ダイアログ（`外部を開く確認`）表示→「開く」ボタンをクリックすると、約1秒以内にステータスバーへ`外部起動エラー[NOT_FOUND]: ファイルが見つかりません: ...`が表示され、アプリはフリーズせず即座に操作可能な状態を維持することを確認（`window.addEventListener('error'/'unhandledrejection')`のカウンタも0のまま）。ユーザー向けフィードバック（エラー表示）が機能しており、無反応どころか明確なエラーメッセージが出ることを確認。
+- 後片付け: 検証用一時フォルダ・スクリプト（scratchpad配下、リポジトリ外）を削除済み。`--user-data-dir`で隔離したElectronプロセス（PID確認済み）を`Stop-Process`で終了、検証後`Get-Process electron`は0件を確認。誤って開いた「アプリの選択」チューザー・Notepadは検証中に終了済み。
+- **外部サービスへの副作用（明記）**: 実際に`shell.openExternal`/`shell.openPath`を実行した。(1) 既定ブラウザ（Opera）で`https://example.com/m5-round2-regression-check`への新規タブが1回開かれた（IANA予約の実在しないプレースホルダドメイン、データ送信・課金なし）。(2) 上記「意図せず発生」の通り、mailto検証テストが実際に`shell.openExternal('mailto:not a valid mailto @@@')`を実行し、既定メールクライアント未設定のためOS標準の「アプリの選択」チューザーが表示された（実際のメール送信なし、検証後プロセス終了済み）。(3) 実在するローカルファイルをNotepadで開いた（検証後プロセス終了済み）。実運用のAPIキー/Webhook/課金の発生・外部への実データ送信は一切なし。ユーザーの既定ブラウザに新規タブが残っている場合があるため、必要であれば手動で閉じてください。
