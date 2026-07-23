@@ -44,6 +44,19 @@ export const SCRYPT_SALT_MIN_LENGTH = 16;
 /** 自己書き込み予約テーブル（selfWriteRegistry）の TTL フォールバック既定値（ms, 00-core-principles.md §4）。 */
 export const SELF_WRITE_TTL_MS = 2500;
 
+/**
+ * ファイル監視（chokidar）のデバウンス既定値（ms, 00-core-principles.md §4 / PLAN §5.6）。
+ * 同一パスへの連続イベントを集約する。selfWriteRegistry の TTL（2500ms）より十分短く、
+ * Windows の I/O バッファリング遅延に余裕を持たせるため 100-300ms の範囲を採る。
+ */
+export const WATCH_DEBOUNCE_MS = 200;
+
+/**
+ * chokidar の `ignored` 判定で除外する Windows OS 生成ファイル名（小文字比較, Fix10）。
+ * 一時ファイルプレフィックス（TEMP_FILE_PREFIX）・`.bak` サフィックスとあわせて監視除外する。
+ */
+export const OS_JUNK_FILE_NAMES = new Set(['desktop.ini', 'thumbs.db']);
+
 /** Windows ロックエラー（EBUSY/EPERM 等）リトライの既定値（00-core-principles.md §7）。 */
 export const IO_RETRY_COUNT = 5;
 export const IO_RETRY_BASE_DELAY_MS = 50;
