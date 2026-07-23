@@ -22,7 +22,7 @@ import { deletePathDirect, trashPath } from './trash';
  * `validateName` は `\ / : * ? " < > |` を禁止しているため通常はこの時点でトラバーサル文字列を
  * 弾けるが、`isPathContained` による構築後の閉じ込め確認を防御的に併用する（多層防御）。
  */
-function validateMemoNameForPath(folderPath: string, memoName: string): Result<void> {
+export function validateMemoNameForPath(folderPath: string, memoName: string): Result<void> {
   const nameCheck = validateName(memoName);
   if (!nameCheck.ok) return nameCheck;
 
@@ -116,7 +116,9 @@ export async function readMemo(folderPath: string, memoName: string): Promise<Re
   const hash = hashBytes(buf);
 
   if (found.encrypted) {
-    // 復号は M6 スコープ。M1 では本文を返さず暗号化フラグのみ返す。
+    // 復号は `crypto:open`（M6, ipc/cryptoHandlers.ts）の専用チャネルが担う。`memo:read` は
+    // 暗号化メモに対しては本文を返さず、暗号化フラグ+ハッシュのみ返す（意図的な非対称,
+    // PLAN §1.4「鍵/パスワードはメインに閉じる」の一環として本チャネル経由では平文を渡さない）。
     return ok({ contentLF: '', encoding: 'utf-8', eol: 'lf', encrypted: true, hash });
   }
 
