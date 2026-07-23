@@ -58,6 +58,8 @@ export interface EditorCompartments {
   lineNumbers: Compartment;
   whitespace: Compartment;
   font: Compartment;
+  /** 外部変更競合ダイアログ表示中のエディタ入力ロック用（M4, DESIGN §3.3「解決中ロック」）。 */
+  readOnly: Compartment;
 }
 
 export function createCompartments(): EditorCompartments {
@@ -66,7 +68,8 @@ export function createCompartments(): EditorCompartments {
     indent: new Compartment(),
     lineNumbers: new Compartment(),
     whitespace: new Compartment(),
-    font: new Compartment()
+    font: new Compartment(),
+    readOnly: new Compartment()
   };
 }
 
@@ -120,6 +123,19 @@ export function reconfigureEditorSettings(view: EditorView, compartments: Editor
       compartments.font.reconfigure(buildFontExtension(settings.fontSize))
     ]
   });
+}
+
+/** 読み取り専用切替の拡張（M4: 外部変更競合ダイアログ表示中のエディタ入力ロック, DESIGN §3.3）。 */
+export function buildReadOnlyExtension(readOnly: boolean): Extension {
+  return [EditorView.editable.of(!readOnly), EditorState.readOnly.of(readOnly)];
+}
+
+/**
+ * `readOnly` のみを既存 EditorView へ反映する（M4）。`reconfigureEditorSettings` とは独立した
+ * Compartment のため、他設定の reconfigure と競合しない。
+ */
+export function reconfigureReadOnly(view: EditorView, compartments: EditorCompartments, readOnly: boolean): void {
+  view.dispatch({ effects: compartments.readOnly.reconfigure(buildReadOnlyExtension(readOnly)) });
 }
 
 /** カーソル位置/選択範囲から文字数・行数・カーソル行列を計算する（ステータスバー表示用, DESIGN §2.3）。 */
