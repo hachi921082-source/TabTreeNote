@@ -631,6 +631,13 @@
   border-radius: 3px;
 }
 
+/* リンク装飾（M5, editor/links.ts の cm-link クラス, DESIGN §2.8）。 */
+.cm-editor-host .cm-link {
+  color: var(--color-accent);
+  text-decoration: underline;
+  cursor: pointer;
+}
+
 .app__editor-placeholder {
   margin: auto;
   color: var(--color-text-muted);
