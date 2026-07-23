@@ -15,6 +15,7 @@ import type {
   AppSettings,
   AppSettingsPatch,
   Eol,
+  ErrorCode,
   MemoInfo,
   MemoReadResult,
   MetaTreeNode,
@@ -69,6 +70,17 @@ export const IpcChannels = {
   settings: {
     get: 'settings:get',
     set: 'settings:set'
+  },
+  editor: {
+    /**
+     * レンダラが「現在開いている(かつ未保存の変更があるか)」状態をメインへ通知する
+     * （M4 新設。PLAN §2 の IPC チャネル一覧には明記が無いが、DESIGN §3.3「編集中(未保存の
+     * 変更がある)メモに対して外部からの変更を検知した場合」の判定にはメイン側が dirty 状態を
+     * 知る必要があり、その手段として追加した最小限の一方向通知。developer 判断、reviewer
+     * 確認事項）。main/watch/activeMemoState.ts が保持し、watch/watcher.ts の
+     * `evt:conflict`/`evt:externalChange` 振り分けに使う。
+     */
+    reportActive: 'editor:reportActive'
   },
   app: {
     getInfo: 'app:getInfo'
@@ -253,6 +265,53 @@ export interface IndexUpdatedPayload {
   tabId?: string;
 }
 
+// ---------------------------------------------------------------------------
+// M4: ファイル監視（watch/watcher.ts）関連の型（PLAN §2.7、docs/milestones/M4-watch.md）。
+// ---------------------------------------------------------------------------
+
+/** `evt:externalChange` 1件分の変更内容（M4-watch.md「主に…」の表を実装レベルへ具体化）。 */
+export interface ExternalChangeEntry {
+  memoName: string;
+  kind: 'add' | 'change' | 'unlink';
+}
+
+/**
+ * `evt:externalChange` のペイロード（PLAN §2.7「外部変更を検知しツリー/本文に反映が必要」）。
+ * `changes` はメタ JSON 自体の外部変更（ツリー再取得のみ促す）の場合は空配列になり得る。
+ */
+export interface ExternalChangePayload {
+  tabId: string;
+  changes: ExternalChangeEntry[];
+}
+
+/**
+ * `evt:conflict` のペイロード（PLAN §2.7「編集中メモに外部変更（競合ダイアログを開く）」）。
+ * 「編集中（未保存の変更がある）」対象メモに限定して発火する（DESIGN §3.3、
+ * `editor:reportActive` で通知された dirty 状態を基に main/watch/watcher.ts が判定する）。
+ */
+export interface ConflictPayload {
+  tabId: string;
+  memoName: string;
+}
+
+/** `editor:reportActive` の引数（M4 新設、上記 `IpcChannels.editor.reportActive` の説明を参照）。 */
+export interface EditorReportActiveArgs {
+  active: { tabId: string; memoName: string; dirty: boolean } | null;
+}
+
+/**
+ * `evt:opError` のペイロード（PLAN §2.7「リトライ後も失敗した I/O エラー等」）。M0 でチャネル名
+ * のみ定義されていたが、ファイル監視（watch/watcher.ts）で初めてリクエスト/レスポンス型の
+ * IPC 呼び出し元を持たないバックグラウンド I/O（chokidar イベント処理中の読込・インデックス
+ * 更新）が発生するため、本 M4 で実装する。`Result` のエラー形と同じ `code`/`message`/`path?`
+ * のみを運ぶ（00-core-principles.md §10 Fix8。内部情報はレンダラへ露出しない）。
+ */
+export interface OpErrorPayload {
+  code: ErrorCode;
+  message: string;
+  path?: string;
+}
+
 /**
  * preload が `contextBridge.exposeInMainWorld('api', ...)` で公開する API の型。
  * M0 では `app:getInfo` のみだったが、M1 で tab/memo の基本チャネルと settings:get/set、
@@ -296,6 +355,10 @@ export interface PreloadApi {
     get(): Promise<Result<AppSettings>>;
     set(patch: AppSettingsPatch): Promise<Result<AppSettings>>;
   };
+  editor: {
+    /** 現在開いている(かつ未保存の変更があるか)状態をメインへ通知する（M4 新設）。 */
+    reportActive(args: EditorReportActiveArgs): Promise<Result<void>>;
+  };
   events: {
     /** `evt:metaRecovered` を購読する。返り値の関数を呼ぶと購読解除する。 */
     onMetaRecovered(handler: (payload: MetaRecoveredPayload) => void): () => void;
@@ -303,5 +366,11 @@ export interface PreloadApi {
     onTrashFallback(handler: (payload: TrashFallbackPayload) => void): () => void;
     /** `evt:indexUpdated` を購読する。返り値の関数を呼ぶと購読解除する。 */
     onIndexUpdated(handler: (payload: IndexUpdatedPayload) => void): () => void;
+    /** `evt:externalChange` を購読する（M4）。返り値の関数を呼ぶと購読解除する。 */
+    onExternalChange(handler: (payload: ExternalChangePayload) => void): () => void;
+    /** `evt:conflict` を購読する（M4）。返り値の関数を呼ぶと購読解除する。 */
+    onConflict(handler: (payload: ConflictPayload) => void): () => void;
+    /** `evt:opError` を購読する（M4 で初実装）。返り値の関数を呼ぶと購読解除する。 */
+    onOpError(handler: (payload: OpErrorPayload) => void): () => void;
   };
 }
