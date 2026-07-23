@@ -1,0 +1,143 @@
+// src/renderer/components/Editor/CodeMirrorEditor.tsx
+// CodeMirror 6 ラッパコンポーネント（M3-①、DESIGN §2.3/§2.4/§6）。
+//
+// 非制御コンポーネントとして実装する: `initialContentLF` は EditorView 生成時にのみ使用し、
+// 以後の入力は `onChange` で親（App.tsx）へ通知するのみで、親からの再レンダーで doc を
+// 上書きしない（カーソル位置の消失・意図しない再構築を避けるため）。
+//
+// メモ切り替え（`instanceKey` の変更）のたびに親側で React の `key` を変え、本コンポーネントを
+// アンマウント/再マウントさせる運用を前提とする（DESIGN §2.3「Undo履歴はメモ切り替えで破棄」を
+// EditorView の作り直しでそのまま満たす、実装をシンプルに保つ方針）。
+import { useEffect, useRef } from 'react';
+import { EditorSelection, EditorState } from '@codemirror/state';
+import { EditorView } from '@codemirror/view';
+import {
+  INITIAL_SELECTION,
+  buildStaticExtensions,
+  computeEditorStats,
+  createCompartments,
+  initialCompartmentExtensions,
+  reconfigureEditorSettings,
+  type EditorCompartments,
+  type EditorSettings,
+  type EditorStats
+} from '../../editor/codeMirrorSetup';
+
+/**
+ * 全文検索の結果ジャンプ（M3-②, docs/milestones/M3-search.md「結果一覧からのジャンプ」）用の
+ * 選択・スクロール要求。`token` はクリックのたびに呼び出し側でインクリメントすること
+ * （同一位置への再クリックでも `useEffect` の依存差分で確実に再スクロールさせるため）。
+ */
+export interface RevealTarget {
+  from: number;
+  to: number;
+  token: number;
+}
+
+export interface CodeMirrorEditorProps {
+  /** 初期表示内容（LF正規化済み, memo:read/readWithEncoding の contentLF）。以後の再レンダーでは無視する。 */
+  initialContentLF: string;
+  onChange: (contentLF: string) => void;
+  onStats: (stats: EditorStats) => void;
+  onSave: () => void;
+  settings: EditorSettings;
+  readOnly?: boolean;
+  autoFocus?: boolean;
+  /** 全文検索結果からのジャンプ要求（`contentLF` 中の文字オフセット）。 */
+  revealTarget?: RevealTarget | null;
+}
+
+export function CodeMirrorEditor({
+  initialContentLF,
+  onChange,
+  onStats,
+  onSave,
+  settings,
+  readOnly = false,
+  autoFocus = true,
+  revealTarget = null
+}: CodeMirrorEditorProps) {
+  const hostRef = useRef<HTMLDivElement | null>(null);
+  const viewRef = useRef<EditorView | null>(null);
+  const compartmentsRef = useRef<EditorCompartments | null>(null);
+
+  // 最新のコールバック/読み取り専用フラグを ref で保持し、EditorView 生成用 effect の
+  // 依存配列を「マウント時のみ」に保つ（identity が毎レンダー変わっても再マウントしない）。
+  const onChangeRef = useRef(onChange);
+  const onStatsRef = useRef(onStats);
+  const onSaveRef = useRef(onSave);
+  useEffect(() => {
+    onChangeRef.current = onChange;
+    onStatsRef.current = onStats;
+    onSaveRef.current = onSave;
+  }, [onChange, onStats, onSave]);
+
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host) return;
+
+    const compartments = createCompartments();
+    compartmentsRef.current = compartments;
+
+    const state = EditorState.create({
+      doc: initialContentLF,
+      selection: INITIAL_SELECTION,
+      extensions: [
+        ...buildStaticExtensions(
+          (content) => onChangeRef.current(content),
+          (stats) => onStatsRef.current(stats),
+          () => onSaveRef.current()
+        ),
+        ...initialCompartmentExtensions(compartments, settings),
+        EditorView.editable.of(!readOnly),
+        EditorState.readOnly.of(readOnly)
+      ]
+    });
+
+    const view = new EditorView({ state, parent: host });
+    viewRef.current = view;
+    if (autoFocus) view.focus();
+    // EditorView.updateListener は dispatch されたトランザクションにのみ発火し、生成直後の
+    // 初期状態では呼ばれないため、マウント直後の文字数/行数/カーソル位置を明示的に通知する
+    // （ステータスバーがメモを開いた直後から表示されるように, DESIGN §2.3）。
+    onStatsRef.current(computeEditorStats(state));
+
+    return () => {
+      view.destroy();
+      viewRef.current = null;
+      compartmentsRef.current = null;
+    };
+    // 初期内容/読み取り専用フラグはマウント時のみ適用（非制御）。メモ切り替えは親が key で
+    // 再マウントさせる。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 設定変更（editorDefaults/フォントサイズ等）は既存 EditorView へ Compartment 経由で反映する。
+  useEffect(() => {
+    const view = viewRef.current;
+    const compartments = compartmentsRef.current;
+    if (!view || !compartments) return;
+    reconfigureEditorSettings(view, compartments, settings);
+  }, [settings]);
+
+  // 全文検索結果からのジャンプ（M3-②）。マウント用 effect より後に宣言しているため、
+  // 同一コミット内で viewRef.current が確実に設定済みの状態で参照できる。
+  const lastRevealTokenRef = useRef<number | null>(null);
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view || !revealTarget) return;
+    if (lastRevealTokenRef.current === revealTarget.token) return;
+    lastRevealTokenRef.current = revealTarget.token;
+
+    const docLength = view.state.doc.length;
+    const from = Math.max(0, Math.min(revealTarget.from, docLength));
+    const to = Math.max(from, Math.min(revealTarget.to, docLength));
+    view.dispatch({
+      selection: EditorSelection.single(from, to),
+      effects: EditorView.scrollIntoView(from, { y: 'center' })
+    });
+    view.focus();
+  }, [revealTarget]);
+
+  return <div className="cm-editor-host" ref={hostRef} />;
+}
