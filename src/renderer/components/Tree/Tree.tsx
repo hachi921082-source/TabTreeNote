@@ -42,6 +42,12 @@ export interface TreeProps {
   onRequestDuplicate: (memoName: string) => void;
   onRequestDelete: (memoNames: string[]) => void;
   onRequestSetLabel: (memoName: string, color: string | null) => void;
+  /** パスワードを設定して暗号化する（平文メモのみ, M6）。 */
+  onRequestEncrypt: (memoName: string) => void;
+  /** 暗号化を解除して平文へ戻す（暗号化メモのみ, M6）。 */
+  onRequestDecrypt: (memoName: string) => void;
+  /** パスワードを変更する（暗号化メモのみ, M6）。 */
+  onRequestChangePassword: (memoName: string) => void;
   /** 同一タブ内の並べ替え・階層変更（ファイル移動不要, tree:updateStructure）。 */
   onLocalMove: (draggedNames: string[], destAnchorMemoName: string, zone: DropZone) => void;
   /** 同一タブ内コピー（実ファイル複製が必要, memo:move copy:true）。 */
@@ -67,6 +73,9 @@ export function Tree({
   onRequestDuplicate,
   onRequestDelete,
   onRequestSetLabel,
+  onRequestEncrypt,
+  onRequestDecrypt,
+  onRequestChangePassword,
   onLocalMove,
   onLocalCopy
 }: TreeProps) {
@@ -160,6 +169,8 @@ export function Tree({
   const buildContextMenuItems = useCallback(
     (memoName: string): ContextMenuItem[] => {
       const multi = selection.selected.size > 1 && selection.selected.has(memoName);
+      // M6: 暗号化/暗号化解除/パスワード変更は単一選択時のみ（rename/duplicate と同様の制約）。
+      const rowEncrypted = flatRows.find((r) => r.memoName === memoName)?.encrypted ?? false;
       const items: ContextMenuItem[] = [
         { label: '前に追加', onSelect: () => onRequestCreate('before', memoName) },
         { label: '後に追加', onSelect: () => onRequestCreate('after', memoName) },
@@ -170,6 +181,18 @@ export function Tree({
           { label: '名前変更', onSelect: () => onRequestRename(memoName), separatorBefore: true },
           { label: '複製', onSelect: () => onRequestDuplicate(memoName) }
         );
+        if (rowEncrypted) {
+          items.push(
+            { label: '暗号化を解除', onSelect: () => onRequestDecrypt(memoName), separatorBefore: true },
+            { label: 'パスワードを変更', onSelect: () => onRequestChangePassword(memoName) }
+          );
+        } else {
+          items.push({
+            label: 'パスワードを設定して暗号化',
+            separatorBefore: true,
+            onSelect: () => onRequestEncrypt(memoName)
+          });
+        }
       }
       items.push({
         label: '削除',
@@ -188,7 +211,18 @@ export function Tree({
       }
       return items;
     },
-    [selection, onRequestCreate, onRequestRename, onRequestDuplicate, onRequestDelete, onRequestSetLabel]
+    [
+      selection,
+      flatRows,
+      onRequestCreate,
+      onRequestRename,
+      onRequestDuplicate,
+      onRequestDelete,
+      onRequestSetLabel,
+      onRequestEncrypt,
+      onRequestDecrypt,
+      onRequestChangePassword
+    ]
   );
 
   return (
