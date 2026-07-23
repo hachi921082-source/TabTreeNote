@@ -11,7 +11,7 @@ import { decodeBuffer, decodeBufferAs, encodeText, type DetectedEncoding } from 
 import { detectEol, normalizeToLf, restoreEol } from './eol';
 import { hashBytes } from '../util/hash';
 import { isLongPath, isPathContained, normalizeForCompare, validateName } from './pathSafety';
-import { registerSelfWrite } from '../watch/selfWriteRegistry';
+import { consumeSelfWrite, refineSelfWriteExpectation, registerSelfWrite } from '../watch/selfWriteRegistry';
 import { withRetry } from './retry';
 import { deletePathDirect, trashPath } from './trash';
 
@@ -81,6 +81,18 @@ export async function findMemoFile(
   if (plainExists) return { path: plainPath, encrypted: false };
   if (encExists) return { path: encPath, encrypted: true };
   return null;
+}
+
+/**
+ * 実ファイル操作（rename/copy）完了直後に、書き込まれた内容を読み直して自己書き込み予約の
+ * 期待値（サイズ+ハッシュ）を補完する（M4）。対象は常に小容量の個人用メモ想定のため、
+ * 補完専用の読み直しコストは許容する（developer 判断）。読み直しに失敗しても（極めて稀）
+ * 期待値が未確定のまま残るだけで、watch/conflict.ts 側は安全側（自己発火扱い）に倒れる。
+ */
+async function refineUpsertFromDisk(path: string): Promise<void> {
+  const buf = await fs.readFile(path).catch(() => null);
+  if (!buf) return;
+  refineSelfWriteExpectation(path, { kind: 'upsert', size: buf.length, hash: hashBytes(buf) });
 }
 
 async function pathExists(path: string): Promise<boolean> {
@@ -204,9 +216,21 @@ export async function renameMemoFile(folderPath: string, oldName: string, newNam
   const ext = found.encrypted ? MEMO_EXT_ENCRYPTED : MEMO_EXT_PLAIN;
   const newPath = join(folderPath, `${newName}${ext}`);
 
-  registerSelfWrite(found.path);
+  registerSelfWrite(found.path, { kind: 'delete' });
   registerSelfWrite(newPath);
-  await withRetry(() => fs.rename(found.path, newPath));
+  try {
+    await withRetry(() => fs.rename(found.path, newPath));
+  } catch (e) {
+    // rename 失敗時は事前登録した予約を解放する（reviewer 指摘 M4-R1-01、atomicWrite.ts の
+    // 既存パターンに合わせる）。解放しないと TTL 満了まで登録が残り、その間の真の外部変更を
+    // 自己発火と誤判定して握りつぶし得る。
+    consumeSelfWrite(found.path);
+    consumeSelfWrite(newPath);
+    throw e;
+  }
+  // リネームは内容を変えないが、旧パスの内容を保持していないため新パスを読み直して
+  // 期待ハッシュを補完する（M4、自己発火判定の精度確保）。
+  await refineUpsertFromDisk(newPath);
   return ok(undefined);
 }
 
@@ -265,7 +289,14 @@ export async function duplicateMemoFile(
   const destPath = join(folderPath, `${newName}${ext}`);
 
   registerSelfWrite(destPath);
-  await withRetry(() => fs.copyFile(found.value.path, destPath));
+  try {
+    await withRetry(() => fs.copyFile(found.value.path, destPath));
+  } catch (e) {
+    // reviewer 指摘 M4-R1-01: copy 失敗時も予約を解放する（atomicWrite.ts と同一パターン）。
+    consumeSelfWrite(destPath);
+    throw e;
+  }
+  await refineUpsertFromDisk(destPath);
   return ok({ newName, encrypted: found.value.encrypted });
 }
 
@@ -287,20 +318,29 @@ export async function moveMemoFileToFolder(
   const ext = found.value.encrypted ? MEMO_EXT_ENCRYPTED : MEMO_EXT_PLAIN;
   const destPath = join(destFolderPath, `${memoName}${ext}`);
 
-  registerSelfWrite(found.value.path);
+  registerSelfWrite(found.value.path, { kind: 'delete' });
   registerSelfWrite(destPath);
-  await withRetry(async () => {
-    try {
-      await fs.rename(found.value.path, destPath);
-    } catch (e) {
-      if ((e as NodeJS.ErrnoException).code === 'EXDEV') {
-        await fs.copyFile(found.value.path, destPath);
-        await fs.unlink(found.value.path);
-        return;
+  try {
+    await withRetry(async () => {
+      try {
+        await fs.rename(found.value.path, destPath);
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code === 'EXDEV') {
+          await fs.copyFile(found.value.path, destPath);
+          await fs.unlink(found.value.path);
+          return;
+        }
+        throw e;
       }
-      throw e;
-    }
-  });
+    });
+  } catch (e) {
+    // reviewer 指摘 M4-R1-01: rename/EXDEV フォールバック双方が全リトライ失敗した場合も
+    // 予約を解放する（atomicWrite.ts と同一パターン）。
+    consumeSelfWrite(found.value.path);
+    consumeSelfWrite(destPath);
+    throw e;
+  }
+  await refineUpsertFromDisk(destPath);
   return ok(undefined);
 }
 
@@ -320,7 +360,14 @@ export async function copyMemoFileToFolder(
   const destPath = join(destFolderPath, `${destMemoName}${ext}`);
 
   registerSelfWrite(destPath);
-  await withRetry(() => fs.copyFile(found.value.path, destPath));
+  try {
+    await withRetry(() => fs.copyFile(found.value.path, destPath));
+  } catch (e) {
+    // reviewer 指摘 M4-R1-01: copy 失敗時も予約を解放する（atomicWrite.ts と同一パターン）。
+    consumeSelfWrite(destPath);
+    throw e;
+  }
+  await refineUpsertFromDisk(destPath);
   return ok(undefined);
 }
 
