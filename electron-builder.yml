@@ -1,0 +1,13 @@
+# electron-builder configuration (portable Windows distribution).
+# Full packaging/signing setup is finalized in M7 (仕上げ); this is the M0 scaffold baseline.
+appId: com.tabtreenote.app
+productName: TabTreeNote
+directories:
+  output: release
+files:
+  - out/**/*
+  - package.json
+win:
+  target: portable
+  artifactName: ${productName}-${version}-portable.${ext}
+asar: true
