@@ -19,6 +19,7 @@
     "@codemirror/search": "^6.7.1",
     "@codemirror/state": "^6.7.1",
     "@codemirror/view": "^6.43.6",
+    "chokidar": "^4.0.3",
     "iconv-lite": "^0.6.3",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
