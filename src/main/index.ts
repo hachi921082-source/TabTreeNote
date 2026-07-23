@@ -71,8 +71,12 @@ function createMainWindow(windowState: WindowBounds): BrowserWindow {
   });
 
   // 外部リンクは既定ブラウザで開く。BrowserWindow 内でナビゲートさせない。
-  // スキーム許可リストで検証してから shell.openExternal へ委譲する（reviewer 指摘 M0-R1-02。
-  // 本格的なリンク確認ダイアログ・path.resolve 等の安全化は M5 で実装, DESIGN §2.8）。
+  // スキーム許可リストで検証してから shell.openExternal へ委譲する（reviewer 指摘 M0-R1-02）。
+  // 本文中のリンク（URL/mail/path/memo:）のクリック→確認ダイアログ→外部起動/遷移は
+  // ipc/linkHandlers.ts（link:openExternal/link:resolveMemo）が本流を担う（M5, DESIGN §2.8）。
+  // 本ハンドラは `window.open()`/`target=_blank` 等の一般的なナビゲーション要求に対する
+  // 最終防御（保険）として引き続き残す（本アプリの CodeMirror リンク装飾は実アンカー要素を
+  // 生成しないため、通常はこの経路を通らない）。
   win.webContents.setWindowOpenHandler(({ url }) => {
     const scheme = safeUrlScheme(url);
     if (scheme && ALLOWED_EXTERNAL_URL_SCHEMES.has(scheme)) {
