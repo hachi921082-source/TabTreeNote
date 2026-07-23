@@ -8,6 +8,9 @@ import {
   IpcChannels,
   IpcEvents,
   type AppInfo,
+  type ConflictPayload,
+  type EditorReportActiveArgs,
+  type ExternalChangePayload,
   type IndexUpdatedPayload,
   type MemoCreateArgs,
   type MemoDeleteArgs,
@@ -18,6 +21,7 @@ import {
   type MemoRenameArgs,
   type MemoSaveArgs,
   type MetaRecoveredPayload,
+  type OpErrorPayload,
   type PreloadApi,
   type SearchGlobalArgs,
   type SearchHistoryAddArgs,
@@ -82,6 +86,10 @@ const api: PreloadApi = {
     get: (): Promise<Result<AppSettings>> => ipcRenderer.invoke(IpcChannels.settings.get),
     set: (patch: AppSettingsPatch): Promise<Result<AppSettings>> => ipcRenderer.invoke(IpcChannels.settings.set, patch)
   },
+  editor: {
+    reportActive: (args: EditorReportActiveArgs): Promise<Result<void>> =>
+      ipcRenderer.invoke(IpcChannels.editor.reportActive, args)
+  },
   events: {
     onMetaRecovered: (handler: (payload: MetaRecoveredPayload) => void): (() => void) => {
       const listener = (_event: Electron.IpcRendererEvent, payload: MetaRecoveredPayload): void => handler(payload);
@@ -97,6 +105,21 @@ const api: PreloadApi = {
       const listener = (_event: Electron.IpcRendererEvent, payload: IndexUpdatedPayload): void => handler(payload);
       ipcRenderer.on(IpcEvents.indexUpdated, listener);
       return () => ipcRenderer.removeListener(IpcEvents.indexUpdated, listener);
+    },
+    onExternalChange: (handler: (payload: ExternalChangePayload) => void): (() => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, payload: ExternalChangePayload): void => handler(payload);
+      ipcRenderer.on(IpcEvents.externalChange, listener);
+      return () => ipcRenderer.removeListener(IpcEvents.externalChange, listener);
+    },
+    onConflict: (handler: (payload: ConflictPayload) => void): (() => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, payload: ConflictPayload): void => handler(payload);
+      ipcRenderer.on(IpcEvents.conflict, listener);
+      return () => ipcRenderer.removeListener(IpcEvents.conflict, listener);
+    },
+    onOpError: (handler: (payload: OpErrorPayload) => void): (() => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, payload: OpErrorPayload): void => handler(payload);
+      ipcRenderer.on(IpcEvents.opError, listener);
+      return () => ipcRenderer.removeListener(IpcEvents.opError, listener);
     }
   }
 };
