@@ -3,6 +3,9 @@
 // この層を経由する（IPC 呼び出しをテスト/差し替え可能にするため）。
 import type {
   AppInfo,
+  ConflictPayload,
+  EditorReportActiveArgs,
+  ExternalChangePayload,
   IndexUpdatedPayload,
   MemoCreateArgs,
   MemoDeleteArgs,
@@ -13,6 +16,7 @@ import type {
   MemoRenameArgs,
   MemoSaveArgs,
   MetaRecoveredPayload,
+  OpErrorPayload,
   SearchGlobalArgs,
   SearchHistoryAddArgs,
   TabCreateArgs,
@@ -66,10 +70,17 @@ export const ipc = {
   getSettings: (): Promise<Result<AppSettings>> => window.api.settings.get(),
   setSettings: (patch: AppSettingsPatch): Promise<Result<AppSettings>> => window.api.settings.set(patch),
 
+  reportActiveMemo: (active: EditorReportActiveArgs['active']): Promise<Result<void>> =>
+    window.api.editor.reportActive({ active }),
+
   onMetaRecovered: (handler: (payload: MetaRecoveredPayload) => void): (() => void) =>
     window.api.events.onMetaRecovered(handler),
   onTrashFallback: (handler: (payload: TrashFallbackPayload) => void): (() => void) =>
     window.api.events.onTrashFallback(handler),
   onIndexUpdated: (handler: (payload: IndexUpdatedPayload) => void): (() => void) =>
-    window.api.events.onIndexUpdated(handler)
+    window.api.events.onIndexUpdated(handler),
+  onExternalChange: (handler: (payload: ExternalChangePayload) => void): (() => void) =>
+    window.api.events.onExternalChange(handler),
+  onConflict: (handler: (payload: ConflictPayload) => void): (() => void) => window.api.events.onConflict(handler),
+  onOpError: (handler: (payload: OpErrorPayload) => void): (() => void) => window.api.events.onOpError(handler)
 };
