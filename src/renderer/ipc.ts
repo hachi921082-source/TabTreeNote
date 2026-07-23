@@ -7,6 +7,9 @@ import type {
   EditorReportActiveArgs,
   ExternalChangePayload,
   IndexUpdatedPayload,
+  LinkOpenExternalArgs,
+  LinkResolveMemoArgs,
+  LinkResolveMemoResult,
   MemoCreateArgs,
   MemoDeleteArgs,
   MemoDuplicateArgs,
@@ -72,6 +75,10 @@ export const ipc = {
 
   reportActiveMemo: (active: EditorReportActiveArgs['active']): Promise<Result<void>> =>
     window.api.editor.reportActive({ active }),
+
+  openExternalLink: (args: LinkOpenExternalArgs): Promise<Result<void>> => window.api.link.openExternal(args),
+  resolveMemoLink: (args: LinkResolveMemoArgs): Promise<Result<LinkResolveMemoResult | null>> =>
+    window.api.link.resolveMemo(args),
 
   onMetaRecovered: (handler: (payload: MetaRecoveredPayload) => void): (() => void) =>
     window.api.events.onMetaRecovered(handler),
