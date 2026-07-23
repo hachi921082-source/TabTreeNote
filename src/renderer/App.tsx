@@ -8,6 +8,7 @@ import { TabBar } from './components/TabBar/TabBar';
 import { Tree } from './components/Tree/Tree';
 import { NameInputDialog } from './components/dialogs/NameInputDialog';
 import { ConfirmDialog } from './components/dialogs/ConfirmDialog';
+import { ConflictDialog } from './components/dialogs/ConflictDialog';
 import { SearchPanel } from './components/Search/SearchPanel';
 import { EMPTY_SELECTION, type SelectionState } from './store/selection';
 import {
@@ -18,7 +19,16 @@ import {
   type MemoDragPayload
 } from './components/Tree/treeView';
 import { insertTreeNode, isDescendantOf, orderForBatchInsert, removeTreeNode } from '@shared/treeOps';
-import type { AddPosition, AppInfo, MetaRecoveredPayload, TrashFallbackPayload } from '@shared/ipc-contract';
+import type {
+  AddPosition,
+  AppInfo,
+  ConflictPayload,
+  EditorReportActiveArgs,
+  ExternalChangePayload,
+  MetaRecoveredPayload,
+  OpErrorPayload,
+  TrashFallbackPayload
+} from '@shared/ipc-contract';
 import type { MetaTreeNode, SearchHit, TabInfo, TreeNode } from '@shared/models';
 
 const MIN_TREE_WIDTH = 160;
@@ -86,11 +96,25 @@ export function App() {
   useEffect(() => {
     selectedTabIdRef.current = selectedTabId;
   }, [selectedTabId]);
+  // ファイル監視（M4）: evt:conflict/evt:externalChange のハンドラや editor:reportActive の
+  // 送信箇所は useCallback の deps に含めない箇所から最新の openMemo を参照する必要があるため、
+  // dirtyRef/selectedTabIdRef と同じ理由で ref 経由の参照を用意する。
+  const openMemoRef = useRef(openMemo);
+  useEffect(() => {
+    openMemoRef.current = openMemo;
+  }, [openMemo]);
 
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [nameDialog, setNameDialog] = useState<NameDialogRequest | null>(null);
   const [confirmDialog, setConfirmDialog] = useState<ConfirmDialogRequest | null>(null);
   const [trashFallback, setTrashFallback] = useState<TrashFallbackPayload | null>(null);
+  // 外部変更との競合（M4, DESIGN §3.3）。表示中はエディタ入力・保存をロックする。
+  const [conflictInfo, setConflictInfo] = useState<{ tabId: string; memoName: string } | null>(null);
+  // 同一メモのまま本文を強制的に再読込させるための世代カウンタ（M4）。CodeMirrorEditor は
+  // 非制御コンポーネントで `initialContentLF` はマウント時のみ使用するため、外部変更の
+  // 静かな反映・競合解決で本文を書き換える際は key に含めてこの値を進め、明示的に
+  // 再マウントさせる（同時に Undo 履歴もリセットされるのが適切、内容が外部由来のため）。
+  const [reloadGeneration, setReloadGeneration] = useState(0);
 
   // --- 全文検索（M3-②, docs/milestones/M3-search.md） ---
   const [showSearchPanel, setShowSearchPanel] = useState(false);
@@ -119,7 +143,7 @@ export function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // evt:metaRecovered / evt:trashFallback 購読。
+  // evt:metaRecovered / evt:trashFallback / evt:opError 購読。
   useEffect(() => {
     const unsubscribeRecovered = ipc.onMetaRecovered((payload: MetaRecoveredPayload) => {
       setStatusMessage(`メタ復旧通知: ${payload.message}`);
@@ -127,9 +151,14 @@ export function App() {
     const unsubscribeTrashFallback = ipc.onTrashFallback((payload: TrashFallbackPayload) => {
       setTrashFallback(payload);
     });
+    // M4 で初実装（ファイル監視のバックグラウンド I/O 失敗等, 00-core-principles.md §8）。
+    const unsubscribeOpError = ipc.onOpError((payload: OpErrorPayload) => {
+      setStatusMessage(`エラー[${payload.code}]: ${payload.message}`);
+    });
     return () => {
       unsubscribeRecovered();
       unsubscribeTrashFallback();
+      unsubscribeOpError();
     };
   }, []);
 
@@ -151,6 +180,125 @@ export function App() {
     }
   }, []);
 
+  // 現在開いている(かつ未保存の変更があるか)状態をメインへ通知する（M4、evt:conflict/
+  // evt:externalChange の振り分けに使われる。src/main/watch/activeMemoState.ts 参照）。
+  const reportActiveMemo = useCallback((active: EditorReportActiveArgs['active']): void => {
+    void ipc.reportActiveMemo(active).catch((e: unknown) => console.error('editor:reportActive failed', e));
+  }, []);
+
+  // evt:conflict / evt:externalChange 購読（M4, DESIGN §3.3 / docs/milestones/M4-watch.md）。
+  // 経路の分離厳守: 本 effect はツリー再取得・「編集中でない」開いているメモの静かな反映
+  // （または競合ダイアログ表示）のみを行う。全文検索インデックスの反映はメイン側
+  // （watch/watcher.ts 経路②）で完結済み（evt:indexUpdated で SearchPanel が追従する）。
+  useEffect(() => {
+    const unsubscribeConflict = ipc.onConflict((payload: ConflictPayload) => {
+      const om = openMemoRef.current;
+      // 現在開いているメモに対する通知のみ扱う（main 側は dirty な active メモのみに絞って
+      // 発火するが、念のため一致確認する）。
+      if (om && om.tabId === payload.tabId && om.memoName === payload.memoName) {
+        setConflictInfo({ tabId: payload.tabId, memoName: payload.memoName });
+      }
+    });
+
+    const unsubscribeExternalChange = ipc.onExternalChange((payload: ExternalChangePayload) => {
+      if (payload.tabId === selectedTabIdRef.current) {
+        void refreshTree(payload.tabId);
+      }
+
+      const om = openMemoRef.current;
+      if (!om || om.tabId !== payload.tabId) return;
+      const entry = payload.changes.find((c) => c.memoName === om.memoName);
+      if (!entry) return;
+      // main 側は dirty なら evt:conflict に振り分ける想定だが、通知間の僅かな競合に備えて
+      // ここでも dirty ならクロバーしない（防御的ガード）。
+      if (dirtyRef.current) return;
+
+      if (entry.kind === 'unlink') {
+        setOpenMemo(null);
+        setContentLF('');
+        setDirty(false);
+        setEditorStats(null);
+        setConflictInfo(null);
+        reportActiveMemo(null);
+        setStatusMessage(`「${om.memoName}」は外部で削除されました。`);
+        return;
+      }
+
+      void (async () => {
+        const res = await ipc.readMemo({ tabId: om.tabId, memoName: om.memoName });
+        if (!res.ok) return;
+        setOpenMemo(createOpenMemoState(om.tabId, om.memoName, res.value));
+        setContentLF(res.value.contentLF);
+        setDirty(false);
+        setEditorStats(null);
+        setReloadGeneration((g) => g + 1);
+        reportActiveMemo({ tabId: om.tabId, memoName: om.memoName, dirty: false });
+        setStatusMessage(`「${om.memoName}」の外部変更を反映しました。`);
+      })();
+    });
+
+    return () => {
+      unsubscribeConflict();
+      unsubscribeExternalChange();
+    };
+  }, [refreshTree, reportActiveMemo]);
+
+  // 競合ダイアログの解決アクション（M4）。
+  const handleConflictKeepMine = useCallback(() => {
+    if (!conflictInfo || !openMemo) {
+      setConflictInfo(null);
+      return;
+    }
+    void (async () => {
+      // expectedHash を渡さず（=競合チェックを迂回して）強制上書きする。ユーザーが競合
+      // ダイアログで明示的に選んだ意図的な上書きであり、既存の memo:save 競合チェックの
+      // バイパスは本ケースに限定される（DESIGN §3.3）。
+      const res = await ipc.saveMemo({
+        tabId: openMemo.tabId,
+        memoName: openMemo.memoName,
+        contentLF,
+        eol: openMemo.eol,
+        encoding: openMemo.encoding,
+        expectedHash: undefined
+      });
+      if (res.ok) {
+        setOpenMemo(withUpdatedHash(openMemo, res.value.savedHash));
+        setDirty(false);
+        reportActiveMemo({ tabId: openMemo.tabId, memoName: openMemo.memoName, dirty: false });
+        setStatusMessage(`保存しました（${openMemo.memoName}）`);
+      } else {
+        setStatusMessage(`保存エラー[${res.error.code}]: ${res.error.message}`);
+      }
+      setConflictInfo(null);
+    })();
+  }, [conflictInfo, openMemo, contentLF, reportActiveMemo]);
+
+  const handleConflictAdoptExternal = useCallback(() => {
+    if (!conflictInfo) return;
+    const { tabId, memoName } = conflictInfo;
+    void (async () => {
+      const res = await ipc.readMemo({ tabId, memoName });
+      if (res.ok) {
+        setOpenMemo(createOpenMemoState(tabId, memoName, res.value));
+        setContentLF(res.value.contentLF);
+        setDirty(false);
+        setEditorStats(null);
+        setReloadGeneration((g) => g + 1);
+        reportActiveMemo({ tabId, memoName, dirty: false });
+        setStatusMessage(`「${memoName}」の外部変更を反映しました。`);
+      } else {
+        // 外部で削除されていた場合など。メモを閉じる。
+        setOpenMemo(null);
+        setContentLF('');
+        setDirty(false);
+        setEditorStats(null);
+        reportActiveMemo(null);
+        setStatusMessage(`「${memoName}」は外部で削除されました。`);
+      }
+      setConflictInfo(null);
+    })();
+  }, [conflictInfo, reportActiveMemo]);
+
   const handleToggleTheme = useCallback(() => {
     const next = theme === 'light' ? 'dark' : 'light';
     setTheme(next);
@@ -170,8 +318,10 @@ export function App() {
     setDirty(false);
     setEditorStats(null);
     setRevealTarget(null);
+    setConflictInfo(null);
+    reportActiveMemo(null);
     await refreshTree(tabId);
-  }, [refreshTree]);
+  }, [refreshTree, reportActiveMemo]);
 
   const openMemoByName = useCallback(
     async (memoName: string, encrypted: boolean) => {
@@ -194,11 +344,14 @@ export function App() {
         // 通常のメモオープンでは前回のジャンプ位置を持ち越さない（handleJumpToHit は本関数の
         // 呼び出し後に必要な場合のみ revealTarget を再設定する）。
         setRevealTarget(null);
+        setConflictInfo(null);
+        setReloadGeneration(0);
+        reportActiveMemo({ tabId: selectedTabId, memoName, dirty: false });
       } else {
         setStatusMessage(`メモ読込エラー: ${res.error.message}`);
       }
     },
-    [selectedTabId]
+    [selectedTabId, reportActiveMemo]
   );
 
   // 全文検索の結果一覧からのジャンプ（M3-②）。ヒットしたタブ/メモへ切り替えてから、
@@ -236,12 +389,15 @@ export function App() {
       setEditorStats(null);
       setStatusMessage(null);
       setRevealTarget(null);
+      setConflictInfo(null);
+      setReloadGeneration(0);
+      reportActiveMemo({ tabId: hit.tabId, memoName: hit.memoName, dirty: false });
       if (hit.matchField === 'body' && hit.matchStart !== undefined && hit.matchEnd !== undefined) {
         revealTokenRef.current += 1;
         setRevealTarget({ from: hit.matchStart, to: hit.matchEnd, token: revealTokenRef.current });
       }
     },
-    [selectTab]
+    [selectTab, reportActiveMemo]
   );
 
   // 全文検索パネルのショートカット（Ctrl+Shift+F）。CodeMirror 側の Ctrl+F（現在メモ内検索,
@@ -258,17 +414,26 @@ export function App() {
   }, []);
 
   // CodeMirrorEditor（非制御）からの通知。doc 変更のたびに contentLF を最新化する。
-  const handleEditorChange = useCallback((content: string) => {
-    setContentLF(content);
-    setDirty(true);
-  }, []);
+  const handleEditorChange = useCallback(
+    (content: string) => {
+      setContentLF(content);
+      setDirty(true);
+      const om = openMemoRef.current;
+      if (om) reportActiveMemo({ tabId: om.tabId, memoName: om.memoName, dirty: true });
+    },
+    [reportActiveMemo]
+  );
 
   const handleEditorStats = useCallback((stats: EditorStats) => {
     setEditorStats(stats);
   }, []);
 
   const handleSave = useCallback(async () => {
-    if (!openMemo || !dirty) return;
+    // conflictInfo 表示中（対象メモが競合解決待ち）はロックする。解決は
+    // handleConflictKeepMine/handleConflictAdoptExternal 経由でのみ行う（DESIGN §3.3 解決中ロック）。
+    if (!openMemo || !dirty || (conflictInfo && conflictInfo.tabId === openMemo.tabId && conflictInfo.memoName === openMemo.memoName)) {
+      return;
+    }
     const res = await ipc.saveMemo({
       tabId: openMemo.tabId,
       memoName: openMemo.memoName,
@@ -280,11 +445,12 @@ export function App() {
     if (res.ok) {
       setOpenMemo(withUpdatedHash(openMemo, res.value.savedHash));
       setDirty(false);
+      reportActiveMemo({ tabId: openMemo.tabId, memoName: openMemo.memoName, dirty: false });
       setStatusMessage(`保存しました（${openMemo.memoName}）`);
     } else {
       setStatusMessage(`保存エラー[${res.error.code}]: ${res.error.message}`);
     }
-  }, [openMemo, contentLF, dirty]);
+  }, [openMemo, contentLF, dirty, conflictInfo, reportActiveMemo]);
 
   // --- ツリー開閉/ラベル（tree:updateStructure, メタのみ更新） ---
 
@@ -437,6 +603,7 @@ export function App() {
               setStatusMessage(`リネームしました: ${oldName} → ${newName}`);
               if (openMemo?.tabId === selectedTabId && openMemo.memoName === oldName) {
                 setOpenMemo({ ...openMemo, memoName: newName });
+                reportActiveMemo({ tabId: selectedTabId, memoName: newName, dirty: dirtyRef.current });
               }
               await refreshTree(selectedTabId);
             } else {
@@ -446,7 +613,7 @@ export function App() {
         }
       });
     },
-    [selectedTabId, openMemo, refreshTree]
+    [selectedTabId, openMemo, refreshTree, reportActiveMemo]
   );
 
   const handleRequestDuplicate = useCallback(
@@ -484,6 +651,8 @@ export function App() {
                 setContentLF('');
                 setDirty(false);
                 setEditorStats(null);
+                setConflictInfo(null);
+                reportActiveMemo(null);
               }
               setSelection(EMPTY_SELECTION);
             } else if (res.error.code !== 'TRASH_FAILED') {
@@ -495,7 +664,7 @@ export function App() {
         }
       });
     },
-    [selectedTabId, openMemo, refreshTree]
+    [selectedTabId, openMemo, refreshTree, reportActiveMemo]
   );
 
   const handleTrashFallbackConfirm = useCallback(() => {
@@ -511,13 +680,15 @@ export function App() {
           setContentLF('');
           setDirty(false);
           setEditorStats(null);
+          setConflictInfo(null);
+          reportActiveMemo(null);
         }
       } else {
         setStatusMessage(`直接削除エラー[${res.error.code}]: ${res.error.message}`);
       }
       if (selectedTabId === payload.tabId) await refreshTree(payload.tabId);
     })();
-  }, [trashFallback, selectedTabId, openMemo, refreshTree]);
+  }, [trashFallback, selectedTabId, openMemo, refreshTree, reportActiveMemo]);
 
   // --- タブ操作（PLAN §2.1） ---
 
@@ -620,6 +791,8 @@ export function App() {
                 setContentLF('');
                 setDirty(false);
                 setEditorStats(null);
+                setConflictInfo(null);
+                reportActiveMemo(null);
               }
               await refreshTabs();
             } else {
@@ -629,7 +802,7 @@ export function App() {
         }
       });
     },
-    [tabs, selectedTabId, refreshTabs]
+    [tabs, selectedTabId, refreshTabs, reportActiveMemo]
   );
 
   const handleReorderTabs = useCallback(
@@ -775,13 +948,14 @@ export function App() {
                 </button>
               </div>
               <CodeMirrorEditor
-                key={`${openMemo.tabId}:${openMemo.memoName}`}
+                key={`${openMemo.tabId}:${openMemo.memoName}:${reloadGeneration}`}
                 initialContentLF={contentLF}
                 onChange={handleEditorChange}
                 onStats={handleEditorStats}
                 onSave={() => void handleSave()}
                 settings={editorSettings}
                 revealTarget={revealTarget}
+                readOnly={conflictInfo !== null && conflictInfo.tabId === openMemo.tabId && conflictInfo.memoName === openMemo.memoName}
               />
             </div>
           ) : (
@@ -835,6 +1009,13 @@ export function App() {
           danger
           onConfirm={handleTrashFallbackConfirm}
           onCancel={() => setTrashFallback(null)}
+        />
+      )}
+      {conflictInfo && openMemo && conflictInfo.tabId === openMemo.tabId && conflictInfo.memoName === openMemo.memoName && (
+        <ConflictDialog
+          memoName={conflictInfo.memoName}
+          onKeepMine={handleConflictKeepMine}
+          onAdoptExternal={handleConflictAdoptExternal}
         />
       )}
       {showSearchPanel && (
