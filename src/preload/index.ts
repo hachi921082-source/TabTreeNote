@@ -9,6 +9,13 @@ import {
   IpcEvents,
   type AppInfo,
   type ConflictPayload,
+  type CryptoChangePasswordArgs,
+  type CryptoDecryptToPlainArgs,
+  type CryptoEncryptMemoArgs,
+  type CryptoLockArgs,
+  type CryptoOpenArgs,
+  type CryptoOpenResult,
+  type CryptoSaveEncryptedArgs,
   type EditorReportActiveArgs,
   type ExternalChangePayload,
   type IndexUpdatedPayload,
@@ -98,6 +105,18 @@ const api: PreloadApi = {
       ipcRenderer.invoke(IpcChannels.link.openExternal, args),
     resolveMemo: (args: LinkResolveMemoArgs): Promise<Result<LinkResolveMemoResult | null>> =>
       ipcRenderer.invoke(IpcChannels.link.resolveMemo, args)
+  },
+  crypto: {
+    encryptMemo: (args: CryptoEncryptMemoArgs): Promise<Result<MemoInfo>> =>
+      ipcRenderer.invoke(IpcChannels.crypto.encryptMemo, args),
+    decryptMemoToPlain: (args: CryptoDecryptToPlainArgs): Promise<Result<MemoInfo>> =>
+      ipcRenderer.invoke(IpcChannels.crypto.decryptMemoToPlain, args),
+    open: (args: CryptoOpenArgs): Promise<Result<CryptoOpenResult>> => ipcRenderer.invoke(IpcChannels.crypto.open, args),
+    saveEncrypted: (args: CryptoSaveEncryptedArgs): Promise<Result<SaveResult>> =>
+      ipcRenderer.invoke(IpcChannels.crypto.saveEncrypted, args),
+    changePassword: (args: CryptoChangePasswordArgs): Promise<Result<void>> =>
+      ipcRenderer.invoke(IpcChannels.crypto.changePassword, args),
+    lock: (args: CryptoLockArgs): Promise<Result<void>> => ipcRenderer.invoke(IpcChannels.crypto.lock, args)
   },
   events: {
     onMetaRecovered: (handler: (payload: MetaRecoveredPayload) => void): (() => void) => {
