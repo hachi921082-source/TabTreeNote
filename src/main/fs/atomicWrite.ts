@@ -18,7 +18,8 @@ import { promises as fs } from 'node:fs';
 import { BACKUP_SUFFIX } from '@shared/constants';
 import { makeTempFilePath } from './tempNaming';
 import { withRetry } from './retry';
-import { registerSelfWrite } from '../watch/selfWriteRegistry';
+import { hashBytes } from '../util/hash';
+import { consumeSelfWrite, refineSelfWriteExpectation, registerSelfWrite } from '../watch/selfWriteRegistry';
 
 async function pathExists(path: string): Promise<boolean> {
   try {
@@ -69,6 +70,14 @@ export async function atomicWrite(targetPath: string, data: Buffer): Promise<voi
       await fs.rename(bakPath, targetPath).catch(() => undefined);
     }
     await fs.rm(tempPath, { force: true }).catch(() => undefined);
+    // 世代スワップが完遂しなかったため、事前登録した自己書き込み予約（期待値未確定のまま）を
+    // 解放する（M4）。解放しないと以後 TTL が切れるまで、当該パスへの真の外部変更を誤って
+    // 自己発火扱いしてしまう（watch/conflict.ts の「期待値未確定 = 自己発火扱い」フォールバック）。
+    consumeSelfWrite(targetPath);
+    consumeSelfWrite(bakPath);
     throw e;
   }
+
+  // 世代スワップ成功。target の最終内容は `data` そのもの（再読込不要, M4）。
+  refineSelfWriteExpectation(targetPath, { kind: 'upsert', size: data.length, hash: hashBytes(data) });
 }
