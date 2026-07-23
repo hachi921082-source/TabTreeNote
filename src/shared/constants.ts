@@ -64,3 +64,12 @@ export const IO_RETRY_MAX_DELAY_MS = 200;
 
 /** 長パス警告の閾値（絶対パス文字数, DESIGN §4）。 */
 export const LONG_PATH_THRESHOLD = 260;
+
+/**
+ * `link:openExternal`（kind='path'）で `shell.openPath` を打ち切るまでのタイムアウト（ms）。
+ * tester検証（M5）にて、親フォルダは実在するが対象ファイル自体が存在しないパスを渡すと
+ * Windows側のファイル種別解決処理起因と見られる無期限ハングを確認したための安全網。
+ * 事前の存在チェック（fs.access）をすり抜けるレースや、その他の環境依存の遅延に対する
+ * 最終防御線として、既存の IO_RETRY/SELF_WRITE_TTL の秒オーダーの慣例に合わせた値。
+ */
+export const LINK_OPEN_PATH_TIMEOUT_MS = 5000;
