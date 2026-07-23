@@ -385,3 +385,56 @@ TabTreeNote エージェント活動記録。詳細な指摘理由は reviewer �
 - **4. 実DOM操作での存在しないファイルへのパスリンククリック（最重要）**: 実際にメモ本文へ`.\subdir\missing-target.txt`を含む内容を保存し、タブ/メモ行の実クリック（`MouseEvent`ディスパッチ）でメモを開き、リンク装飾（`.cm-link`）を実際のCDP `Input.dispatchMouseEvent`（Ctrl+クリック、既定`openTrigger:ctrlClick`）で操作。確認ダイアログ（`外部を開く確認`）表示→「開く」ボタンをクリックすると、約1秒以内にステータスバーへ`外部起動エラー[NOT_FOUND]: ファイルが見つかりません: ...`が表示され、アプリはフリーズせず即座に操作可能な状態を維持することを確認（`window.addEventListener('error'/'unhandledrejection')`のカウンタも0のまま）。ユーザー向けフィードバック（エラー表示）が機能しており、無反応どころか明確なエラーメッセージが出ることを確認。
 - 後片付け: 検証用一時フォルダ・スクリプト（scratchpad配下、リポジトリ外）を削除済み。`--user-data-dir`で隔離したElectronプロセス（PID確認済み）を`Stop-Process`で終了、検証後`Get-Process electron`は0件を確認。誤って開いた「アプリの選択」チューザー・Notepadは検証中に終了済み。
 - **外部サービスへの副作用（明記）**: 実際に`shell.openExternal`/`shell.openPath`を実行した。(1) 既定ブラウザ（Opera）で`https://example.com/m5-round2-regression-check`への新規タブが1回開かれた（IANA予約の実在しないプレースホルダドメイン、データ送信・課金なし）。(2) 上記「意図せず発生」の通り、mailto検証テストが実際に`shell.openExternal('mailto:not a valid mailto @@@')`を実行し、既定メールクライアント未設定のためOS標準の「アプリの選択」チューザーが表示された（実際のメール送信なし、検証後プロセス終了済み）。(3) 実在するローカルファイルをNotepadで開いた（検証後プロセス終了済み）。実運用のAPIキー/Webhook/課金の発生・外部への実データ送信は一切なし。ユーザーの既定ブラウザに新規タブが残っている場合があるため、必要であれば手動で閉じてください。
+
+## reviewer — M6（パスワード暗号化）実装 静的レビュー（ラウンド1）
+
+対象: M6差分一式（main/crypto/{cipher,encFormat,sessionKeyStore}.ts、main/ipc/cryptoHandlers.ts、shared/ipc-contract.ts・constants.ts、preload/index.ts・renderer/ipc.ts、main/ipc/registerIpc.ts・memoHandlers.ts、main/fs/memoFileService.ts、renderer/components/dialogs/PasswordDialog.tsx、renderer/components/Tree/Tree.tsx、renderer/App.tsx・App.css）。M6-crypto.md・00-core-principles.md §1-§11・data-model.md と照合。実行検証はtester範囲のため未実施。
+
+- M6-R1-01 [High] NG: `App.tsx` の `evt:externalChange` 購読（非dirty時の「静かな反映」経路、onExternalChangeハンドラ内、対象メモが暗号化メモかどうかの分岐なし）が、開封中(session鍵あり)かつ未編集の暗号化メモの`.txtenc`が外部変更された場合に`memo:read`を呼んでしまう。`memo:read`は`.txtenc`に対して本文を返さず`contentLF:''`のみ返す仕様（`memoFileService.readMemo`, PLAN §1.4）のため、エディタ表示内容が空文字列で上書きされ、同時に`dirty:false`・`lastKnownHash`も更新されて「保存済みの状態」として扱われてしまう。この直後にユーザーが編集すると、低頻度自動保存や手動保存が実際には空(+新規入力)の内容で`.txtenc`を上書きし、外部で追記されていた実データを消してしまうデータ損失リスクがある。同じ「暗号化メモは`memo:read`で本文取得不可」という制約は、dirty時の競合ダイアログ解決（`handleConflictAdoptExternal`）では`openMemo?.encrypted`分岐でセッション鍵破棄+再オープン誘導として正しく特別扱いされているが、非dirty時の静かな反映経路にはこの分岐が存在せず一貫していない。要修正: `onExternalChange`内で`om.encrypted`の場合は`handleConflictAdoptExternal`と同様に安全側（セッション鍵破棄+メモを閉じて再パスワード入力を促す、または少なくとも本文上書きをせず何もしない）に倒す。
+- M6-R1-02 [Med] 要確認/NG寄り: `cryptoHandlers.ts`の`crypto:changePassword`ハンドラが、パスワード変更成功後に無条件で`setSessionKey`を呼び直す。コード内コメントは「開封中であれば」updateする意図を述べているが、実装は変更前にその(tabId, memoName)のセッションが存在したかどうかを確認せず常に新規セッションを作る。Treeの右クリックメニュー「パスワードを変更」はそのメモが現在開封（エディタで開いている）状態でなくても常に選択可能なため、閉じたまま（一度も`crypto:open`していない）暗号化メモに対してパスワード変更だけ行うと、以後そのメモの復号鍵がメインプロセスのメモリに無期限に残り続ける。UIの「ロック」ボタンは現在開いているメモにしか表示されないため、ユーザー操作でこのセッションを明示的に閉じる手段がない（アプリ終了まで残存）。鍵は引き続きレンダラへは渡らずディスクにも残らないため直ちにセキュリティ不変条件違反ではないが、「鍵の保持は開封中のみ」という設計意図から外れる望ましくない残存。推奨: 変更前に`getSessionKey`が存在した場合のみ`setSessionKey`で更新し、存在しなかった場合は何もしない（呼び出し元に「未開封のまま変更した」ことを示す情報も不要なので変更不要）。
+- 型定義・IPC配線: `ipc-contract.ts`のCrypto*Args/Result、`data-model.md`§3/§4と完全一致。`preload/index.ts`・`renderer/ipc.ts`の6チャネル配線も過不足なし。`SCRYPT_DEFAULTS`(N=32768/r=8/p=1/keyLen=32)・`GCM_IV_LENGTH`(12)・`maxmem`(64MB)はdata-model.md §3の既定と一致。
+- セキュリティ不変条件: 鍵/パスワードはレンダラへ渡さない（`crypto:open`の戻り値は`contentLF`/`eol`/`hash`のみ）、内部ログ(`console.error`)に鍵・パスワード・復号平文の出力なし、`.txtenc`はJSON全体ハッシュで競合判定（hash対象規約§6と一致）、salt流用/IV新規生成（`generateIv()`を`saveEncrypted`/`encryptMemo`/`changePassword`いずれも都度呼び出し）を確認。`scrypt`は`deriveKey`がコールバックAPIをPromiseラップし`await`、`scryptSync`不使用を確認。
+- 平文原本削除の順序: `encryptMemo`が`atomicWrite(encPath)`→（fsync込み）→ `registerSelfWrite`+`fs.unlink(plainPath)`の順で、DESIGN §2.9「`.txtenc`永続化後に削除」を遵守。unlink失敗時は`consumeSelfWrite`で予約解放してrethrowする既存パターンと整合。
+- developer申告事項1-5はいずれも設計判断として妥当（editor:reportActive踏襲のlock前自動保存をrenderer側実装/DECRYPT_FAILEDへのヒント追記/暗号操作後のrefreshOpenMemoAfterCryptoOpによるhash更新/dirty時の構造操作ブロック/crash時平文併存の既知ギャップ）。ギャップ5（reconciliation未実装）はM6-crypto.mdに具体的なモジュール指定が無く、PLAN §8-3の「起動時突合」がどのマイルストーンで実装されるか派生ドキュメント上不明瞭なため、対応要否はdesigner確認事項として残る（M6ブロッキングとはしない）。
+- 判定: M6-R1-01（High）の解消が必要。M6-R1-02（Med）もあわせて修正を推奨。developer へ差し戻し（ラウンド1）。
+
+## developer — M6 指摘修正（ラウンド1 / M6-R1-01・M6-R1-02）
+
+対象: src/renderer/App.tsx（onExternalChange の非dirty「静かな反映」経路に encrypted 分岐を追加）, src/main/ipc/cryptoHandlers.ts（crypto:changePassword が変更前セッション有無を確認してから setSessionKey を呼ぶよう修正）。
+
+- M6-R1-01 対応: `onExternalChange`（unlink以外の変更通知、非dirty時）で `om.encrypted` の場合は `handleConflictAdoptExternal` と同一パターン（`ipc.lockMemo`でセッション鍵破棄→`clearEncryptedAutosaveTimer`→メモを閉じる→「開き直してください」表示）に倒し、`memo:read`（`contentLF:''`固定）での空文字上書きを回避。useEffect の deps に `clearEncryptedAutosaveTimer` を追加。
+- M6-R1-02 対応: `crypto:changePassword` 冒頭（旧鍵導出前）で `getSessionKey(args.tabId, args.memoName) !== undefined` を `hadSessionBeforeChange` として控え、末尾の `setSessionKey` 呼び出しを `if (hadSessionBeforeChange)` でガード。未開封のまま変更した場合は新規セッションを作らない。
+- 確認: `tsc --noEmit`（renderer/node両方）エラーなし、`electron-vite build` 成功。実行検証は tester 範囲のため未実施。
+- reviewer へ再レビュー依頼（2件とも1回目の修正）。
+
+## reviewer — M6 指摘修正確認（ラウンド2 / M6-R1-01・M6-R1-02）
+
+対象: src/renderer/App.tsx（onExternalChange の encrypted 分岐・useEffect deps）, src/main/ipc/cryptoHandlers.ts（changePassword の hadSessionBeforeChange ガード）。
+
+- M6-R1-01 OK（解消）: onExternalChange の非dirty経路に encrypted 分岐を追加し、memo:read を呼ばず lockMemo→clearEncryptedAutosaveTimer→setOpenMemo(null)等→「開き直してください」表示、の順で安全側に倒している。handleConflictAdoptExternal と手順・呼び出し順が一致し一貫性あり。useEffect deps 追加（clearEncryptedAutosaveTimer）は当該関数が useCallback([]) で恒等参照不変のため再購読タイミングへの影響なし。
+- M6-R1-02 OK（解消）: hadSessionBeforeChange を deriveKey 前・全エラー早期return経路より後で取得し、末尾 setSessionKey を同フラグでガード。getSessionKey は Map.get ベースで undefined 判定も妥当。「開封中かつ非dirtyで変更→継続編集」フロー（isOpenAndDirty は dirty のみブロック）は hadSessionBeforeChange=true となり refreshOpenMemoAfterCryptoOp 経由で継続編集可能なことを確認、ロック済みメモへの変更では新規セッションを作らないことも確認。
+- 00-core-principles.md §8/§10（セキュリティ不変条件・外部編集競合/暗号復号失敗の扱い）と整合。新規の副作用・不整合なし。
+- 判定: ブロッキング指摘なし。ラウンド2合格。tester へ進行可（実行検証はtester範囲、本レビューでは未実施）。
+
+## tester — M6（パスワード暗号化）動作検証（ラウンド1）
+
+対象: reviewer M6 ラウンド2（ブロッキング指摘なし）後の一式。npm install / typecheck / build / prod起動 / IPC直叩き+実DOM操作（CDP Runtime.evaluate・Input.dispatchMouseEvent/insertText）による暗号化/開封/保存/パスワード変更/暗号化解除/ロック/低頻度自動保存/誤パスワード/reviewer指摘2件の再現確認を独立して実施。
+
+- **判定: 全項目 OK。不具合なし。developer への差し戻しなし。**
+- npm install: 成功（`up to date, audited 393 packages`。allow-scripts警告のみで動作に支障なし）。
+- typecheck: `tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json` エラーなし。
+- build: `rm -rf out && electron-vite build` 成功。`out/main/index.js`(79.56kB→初回79.56kB相当)/`out/preload/index.js`(6.21kB)/`out/renderer/assets/index-*.js`(967.68kB)+cssを生成確認。1回目の起動でM4tester既知の一過性Rollupモジュール重複事象（`getAppSettings not initialized`の未処理例外でウィンドウ非生成）に再度遭遇したが、`rm -rf out && npm run build`のクリーン再ビルドで即解消（再現後は複数回の操作を通じて再発なし）。コード不具合ではなくビルド成果物の一過性事象と判断（M4ラウンド1で既に同種の記録あり）。
+- prod起動: `--user-data-dir`で隔離したuserDataを使い`electron . --remote-debugging-port=9333`起動（クリーンビルド後）。ログは`DevTools listening`のみでエラーなし。CDP（Node組込み`WebSocket`によるRuntime.evaluate/Input.dispatchMouseEvent/Input.insertText）で操作。
+- **ゴールデンパス（平文→暗号化→パスワード設定→保存→ロック→パスワード入力で復号）**: IPC直叩きで`memo.create`+`memo.save`（平文）→`crypto.encryptMemo`（`.txtenc`生成・`.txt`直接削除をディスクで確認）→`crypto.lock`→`crypto.open`（正しいパスワードで元の内容と完全一致する復号）を確認。実DOM操作でも同フロー（右クリック「パスワードを設定して暗号化」→確認再入力+ヒント入力→ロック🔒アイコン表示→クリックでパスワード入力ダイアログ→開封）を一気通貫で確認。
+- **暗号化メモの編集→低頻度自動保存→ロック→再度開いて内容保持**: CDP実キー入力（`Input.insertText`）でCodeMirrorへ実際に文字追加後、既定デバウンス（5000ms）経過後に自動保存が発火し（ステータスバー「自動保存しました（memo1）」）、ファイルの`mtime`更新も確認。UIの「ロック」ボタンクリック→再度パスワード入力で開封→追記内容が正しく保持されていることを確認。
+- **パスワード変更（開封中）**: `crypto.open`後に`crypto.changePassword`実行→変更直後に新パスワードで`crypto.saveEncrypted`が成功（新鍵でセッション継続）、旧パスワードでの`crypto.open`は`DECRYPT_FAILED`で拒否されることを確認。UIでも右クリック「パスワードを変更」→現在/新規/確認再入力の3フィールド+不一致時のメッセージ表示+送信ボタン非活性化を確認。
+- **パスワード変更（未開封, reviewer指摘M6-R1-02の再現確認, 最重要）**: `crypto.lock`でセッション破棄→**一度も`crypto.open`せず**`crypto.changePassword`をIPC直叩き→変更成功後、**同じく`crypto.open`せず**`crypto.saveEncrypted`を呼ぶと`DECRYPT_FAILED`（「このメモは開封されていません」）で拒否されることを確認。これは修正前なら無条件`setSessionKey`によりセッションが常駐し保存が成立してしまっていたはずの経路であり、**hadSessionBeforeChangeガードが実際に機能し余計なセッションが残らないことを実機で確認**。新パスワードで`crypto.open`すると正しく復号でき、旧パスワードでは`DECRYPT_FAILED`になることも確認。
+- **暗号化解除（`.txtenc`→平文`.txt`）**: 右クリック「暗号化を解除」→パスワード入力→`.txt`生成+内容一致+旧`.txtenc`削除（`.txtenc.bak`のみ残存、中身はJSON=暗号化済みで平文露出なしを確認）をディスクで確認。UI表示も🔒アイコンが📄へ変化し`encoding`/`eol`表示に切り替わることを確認。
+- **誤ったパスワード入力時のエラー表示・ヒント表示**: IPC直叩き（`DECRYPT_FAILED`+`パスワードが違います。（ヒント: ...）`、本文非返却）と実DOM操作（ダイアログ内にエラーメッセージ+ヒントが表示されダイアログは閉じずに再入力可能、続けて正しいパスワードで開封成功）の両方で確認。
+- **外部変更検知時の安全側フォールバック（reviewer指摘M6-R1-01の再現確認, 最重要）**: 実DOM操作で暗号化メモをパスワード入力で開封（未編集=非dirty状態を維持）した状態で、Node `fs`から直接（アプリ外の変更を模して）`.txtenc`のJSONヘッダ（`hint`フィールド）を書き換え。chokidar検知後、`memo:read`（`.txtenc`では`contentLF:''`固定）を呼ばずに**セッション鍵破棄+メモを閉じ**「「memo1」は外部で変更されました。開き直してください。」を表示することを確認。**この間ディスク上の`.txtenc`はアプリによって一切書き換えられていない**（外部変更後の内容がそのまま残存、空文字での上書き無し）ことをディスク上のファイル内容で直接確認。修正前バグ（`memo:read`経由で空文字を「保存済み」として静かに上書き）が再現しないことを実機で裏付けた。再度パスワード入力で開き直すと直前の（編集済みの）正しい内容へ問題なくアクセスできることも確認。
+- **dirtyガード（isOpenAndDirty）**: 暗号化メモを開封し実キー入力で編集（dirty化）した状態で右クリック「パスワードを設定して暗号化」相当の操作（暗号化解除・パスワード変更も同様のガード関数を共有）を試みると、パスワードダイアログを一切表示せず「未保存の変更を保存してから暗号化してください。」等のメッセージのみで中断されることを確認（誤操作によるデータ不整合防止が機能）。
+- **競合検出（`crypto:saveEncrypted`のexpectedHash）**: 開封時取得のhash（旧世代）で`saveEncrypted`を呼ぶと`CONFLICT`（「保存前に外部でメモが変更されています。」）で拒否されることを確認。新IV毎回生成（`saveEncrypted`成功のたびに`savedHash`が変化）も一貫して確認。
+- パスワード設定ダイアログの入力検証: 確認再入力の不一致時にメッセージ表示+送信ボタン`disabled`化、一致後は活性化して送信可能になることを実DOM操作で確認。ヒントは`.txtenc`ヘッダに平文文字列として保存される（DESIGN §2.9通り、UI側に警告文表示あり）ことをファイル直接確認。
+- console/例外チェック: 検証全体を通じて主要操作後にDOM上のエラー表示（`[class*=error]`等）0件を随時確認。メインプロセスの内部ログ（`console.error`）には鍵・パスワード・復号平文の出力なし（1件の`[main] unexpected error`は検証序盤に自作テストスクリプトが`memo:create`へ誤った形状の`position`引数を渡したことによるM6スコープ外の既存`memo:create`実装起因の例外であり、M6コードの不具合ではないことを確認。UI操作（「先頭に追加」「末尾に追加」ボタン）経由の呼び出しには影響なし）。
+- 後片付け: 検証用一時フォルダ・userData（scratchpad配下、リポジトリ外、`--user-data-dir`で隔離）を削除済み。検証後`Get-Process`/`tasklist`でelectronプロセス0件を確認。
+- 外部サービスへの副作用: なし（すべてローカルファイル操作・localhost CDPのみ。実運用のAPIキー/Webhook等は使用していない）。
