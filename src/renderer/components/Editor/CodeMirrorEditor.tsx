@@ -11,6 +11,7 @@
 import { useEffect, useRef } from 'react';
 import { EditorSelection, EditorState } from '@codemirror/state';
 import { EditorView } from '@codemirror/view';
+import type { AppSettings } from '@shared/models';
 import {
   INITIAL_SELECTION,
   buildReadOnlyExtension,
@@ -24,6 +25,7 @@ import {
   type EditorSettings,
   type EditorStats
 } from '../../editor/codeMirrorSetup';
+import { buildLinkExtension, type DetectedLink } from '../../editor/links';
 
 /**
  * 全文検索の結果ジャンプ（M3-②, docs/milestones/M3-search.md「結果一覧からのジャンプ」）用の
@@ -47,6 +49,10 @@ export interface CodeMirrorEditorProps {
   autoFocus?: boolean;
   /** 全文検索結果からのジャンプ要求（`contentLF` 中の文字オフセット）。 */
   revealTarget?: RevealTarget | null;
+  /** リンク（URL/mail/path/`memo:`）のクリック操作方式（M5, DESIGN §2.8。既定 `ctrlClick`）。 */
+  linkOpenTrigger: AppSettings['links']['openTrigger'];
+  /** リンククリック時のコールバック（実際の外部起動/`memo:` 遷移は呼び出し側=App.tsx に委譲, M5）。 */
+  onLinkClick: (link: DetectedLink) => void;
 }
 
 export function CodeMirrorEditor({
@@ -57,7 +63,9 @@ export function CodeMirrorEditor({
   settings,
   readOnly = false,
   autoFocus = true,
-  revealTarget = null
+  revealTarget = null,
+  linkOpenTrigger,
+  onLinkClick
 }: CodeMirrorEditorProps) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const viewRef = useRef<EditorView | null>(null);
@@ -68,11 +76,15 @@ export function CodeMirrorEditor({
   const onChangeRef = useRef(onChange);
   const onStatsRef = useRef(onStats);
   const onSaveRef = useRef(onSave);
+  const onLinkClickRef = useRef(onLinkClick);
+  const linkOpenTriggerRef = useRef(linkOpenTrigger);
   useEffect(() => {
     onChangeRef.current = onChange;
     onStatsRef.current = onStats;
     onSaveRef.current = onSave;
-  }, [onChange, onStats, onSave]);
+    onLinkClickRef.current = onLinkClick;
+    linkOpenTriggerRef.current = linkOpenTrigger;
+  }, [onChange, onStats, onSave, onLinkClick, linkOpenTrigger]);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -90,6 +102,12 @@ export function CodeMirrorEditor({
           (stats) => onStatsRef.current(stats),
           () => onSaveRef.current()
         ),
+        // リンク装飾+クリックハンドリング（M5）。コールバック/操作方式は ref 経由で常に最新値を
+        // 参照するため、他の設定同様マウント時に一度だけ組み込めばよい（Compartment 不要）。
+        ...buildLinkExtension({
+          getOpenTrigger: () => linkOpenTriggerRef.current,
+          onLinkClick: (link) => onLinkClickRef.current(link)
+        }),
         ...initialCompartmentExtensions(compartments, settings),
         compartments.readOnly.of(buildReadOnlyExtension(readOnly))
       ]
