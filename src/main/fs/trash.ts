@@ -8,12 +8,12 @@ import { shell } from 'electron';
 import { promises as fs } from 'node:fs';
 import type { Result } from '@shared/models';
 import { err, ok } from '../util/result';
-import { registerSelfWrite } from '../watch/selfWriteRegistry';
+import { consumeSelfWrite, registerSelfWrite } from '../watch/selfWriteRegistry';
 import { withRetry } from './retry';
 
 /** ファイル/フォルダを OS のごみ箱へ送る。失敗時は `TRASH_FAILED`（リトライはしない）。 */
 export async function trashPath(absolutePath: string): Promise<Result<void>> {
-  registerSelfWrite(absolutePath);
+  registerSelfWrite(absolutePath, { kind: 'delete' });
   try {
     await shell.trashItem(absolutePath);
     return ok(undefined);
@@ -21,6 +21,10 @@ export async function trashPath(absolutePath: string): Promise<Result<void>> {
     // 内部診断ログ（00-core-principles.md §10 Fix8）。UI へは code/message/path のみ返す。
     // eslint-disable-next-line no-console -- 内部診断ログ
     console.error('[main] trashItem failed', absolutePath, e);
+    // reviewer 指摘 M4-R1-01: trashItem 失敗時も事前登録した予約を解放する
+    // （atomicWrite.ts の既存パターンに合わせる。解放しないと TTL 満了まで登録が残り、
+    // その間の真の外部変更を自己発火と誤判定して握りつぶし得る）。
+    consumeSelfWrite(absolutePath);
     return err('TRASH_FAILED', 'ごみ箱へ送れませんでした。', absolutePath);
   }
 }
@@ -31,6 +35,12 @@ export async function trashPath(absolutePath: string): Promise<Result<void>> {
  * Windows ロック対策の短いリトライ（00-core-principles.md §7）を適用する。
  */
 export async function deletePathDirect(absolutePath: string): Promise<void> {
-  registerSelfWrite(absolutePath);
-  await withRetry(() => fs.unlink(absolutePath));
+  registerSelfWrite(absolutePath, { kind: 'delete' });
+  try {
+    await withRetry(() => fs.unlink(absolutePath));
+  } catch (e) {
+    // reviewer 指摘 M4-R1-01: unlink 失敗時も予約を解放する（atomicWrite.ts と同一パターン）。
+    consumeSelfWrite(absolutePath);
+    throw e;
+  }
 }
