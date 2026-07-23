@@ -4,6 +4,13 @@
 import type {
   AppInfo,
   ConflictPayload,
+  CryptoChangePasswordArgs,
+  CryptoDecryptToPlainArgs,
+  CryptoEncryptMemoArgs,
+  CryptoLockArgs,
+  CryptoOpenArgs,
+  CryptoOpenResult,
+  CryptoSaveEncryptedArgs,
   EditorReportActiveArgs,
   ExternalChangePayload,
   IndexUpdatedPayload,
@@ -79,6 +86,14 @@ export const ipc = {
   openExternalLink: (args: LinkOpenExternalArgs): Promise<Result<void>> => window.api.link.openExternal(args),
   resolveMemoLink: (args: LinkResolveMemoArgs): Promise<Result<LinkResolveMemoResult | null>> =>
     window.api.link.resolveMemo(args),
+
+  encryptMemo: (args: CryptoEncryptMemoArgs): Promise<Result<MemoInfo>> => window.api.crypto.encryptMemo(args),
+  decryptMemoToPlain: (args: CryptoDecryptToPlainArgs): Promise<Result<MemoInfo>> =>
+    window.api.crypto.decryptMemoToPlain(args),
+  openEncryptedMemo: (args: CryptoOpenArgs): Promise<Result<CryptoOpenResult>> => window.api.crypto.open(args),
+  saveEncryptedMemo: (args: CryptoSaveEncryptedArgs): Promise<Result<SaveResult>> => window.api.crypto.saveEncrypted(args),
+  changeMemoPassword: (args: CryptoChangePasswordArgs): Promise<Result<void>> => window.api.crypto.changePassword(args),
+  lockMemo: (args: CryptoLockArgs): Promise<Result<void>> => window.api.crypto.lock(args),
 
   onMetaRecovered: (handler: (payload: MetaRecoveredPayload) => void): (() => void) =>
     window.api.events.onMetaRecovered(handler),
