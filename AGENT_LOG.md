@@ -438,3 +438,74 @@ TabTreeNote エージェント活動記録。詳細な指摘理由は reviewer �
 - console/例外チェック: 検証全体を通じて主要操作後にDOM上のエラー表示（`[class*=error]`等）0件を随時確認。メインプロセスの内部ログ（`console.error`）には鍵・パスワード・復号平文の出力なし（1件の`[main] unexpected error`は検証序盤に自作テストスクリプトが`memo:create`へ誤った形状の`position`引数を渡したことによるM6スコープ外の既存`memo:create`実装起因の例外であり、M6コードの不具合ではないことを確認。UI操作（「先頭に追加」「末尾に追加」ボタン）経由の呼び出しには影響なし）。
 - 後片付け: 検証用一時フォルダ・userData（scratchpad配下、リポジトリ外、`--user-data-dir`で隔離）を削除済み。検証後`Get-Process`/`tasklist`でelectronプロセス0件を確認。
 - 外部サービスへの副作用: なし（すべてローカルファイル操作・localhost CDPのみ。実運用のAPIキー/Webhook等は使用していない）。
+
+## developer — M7（仕上げ）実装
+
+対象: M7-polish.md 記載の一式。ステータスバー・設定画面・ショートカット設定・トレイ常駐（最小）・AutoReName・マイグレーション土台・electron-builder ポータブル配布・各種エディタトグル。M0〜M6 は reviewer/tester 合格済みだが作業ツリー上は未コミット。
+
+- 新規: `src/renderer/components/StatusBar/StatusBar.tsx`（文字数/行数/カーソル行:列/選択文字数/フォントサイズ/改行コード/暗号化状態等の表示をコンポーネント切り出し）、`src/renderer/editor/autoRename.ts`（本文の最初の非空行抽出+変化検出、編集停止からのデバウンス発火。暗号化メモは対象外, DESIGN §2.2/§2.9）、`src/shared/shortcuts.ts`（`DEFAULT_SHORTCUTS`・`SHORTCUT_ACTION_LABELS`・`ShortcutAction`型・`formatShortcutFromEvent`）、`src/renderer/components/Settings/SettingsDialog.tsx`（設定画面。外観/エディタ/自動保存/リンク/パスワード/ショートカットの各セクション。永続化は行わず App.tsx の各 `onChange*` へ委譲）、`src/main/util/migrate.ts`（`schemaVersion`/`appVersion` マイグレーション土台、v1のみのため現状 no-op）。
+- 変更: `src/main/settings/appSettings.ts`（`defaultAppSettings`に`shortcuts`/`sessionRememberPassword`追加、`migrateSchema`呼び出し配線）、`src/main/index.ts`（タスクトレイ常駐+表示/非表示トグルの最小実装）、`src/main/fs/metaStore.ts`（マイグレーション呼び出し配線）、`src/renderer/App.tsx`（設定画面呼び出し・各種トグルの状態/永続化配線・AutoReName配線・ショートカット配線）、`src/renderer/editor/codeMirrorSetup.ts`/`eolKeeper.ts`（ショートカット/トグル対応の拡張）、`src/renderer/App.css`（設定画面・ステータスバーのスタイル追加）、`src/shared/models.ts`（`AppSettings.shortcuts`/`sessionRememberPassword`追加）、`electron-builder.yml`（ポータブル配布設定）。
+- developer 確認事項（reviewer/tester申し送り）: `AppSettings.sessionRememberPassword` は設定画面に「セッション内でパスワードを記憶する」トグルとして表示・永続化されるが、実際のセッション鍵保持/破棄ロジック（M6, crypto:lock 経路）には未接続で、値を変更しても実挙動（メモ切替のたびに常にロック）は変化しない設計上のギャップがある。セッション鍵の保持期間を延ばす方向の変更はセキュリティに関わる設計判断のため、M7 では値の保存のみ実装し designer 確認事項として申し送った。
+- 確認: `npm run typecheck`（renderer/node両方）エラーなし、`npm run build`成功。実行検証は tester 範囲のため未実施。
+
+## developer — M7 ユーザー確認事項の反映（sessionRememberPassword 設定項目の削除）
+
+対象: 上記 developer 申し送り事項について、designer への仕様確認を経ずユーザーへ直接確認した結果「この設定項目自体を UI から削除する」方針に決定。以下を修正。
+
+- `src/renderer/components/Settings/SettingsDialog.tsx`: 「パスワード」セクション（「セッション内でパスワードを記憶する」トグルとその既知の制限コメント）を丸ごと削除。`SettingsDialogProps`から`sessionRememberPassword`/`onChangeSessionRememberPassword`を削除。ファイル冒頭コメントの扱い一覧からも除去し、削除理由を追記。
+- `src/renderer/App.tsx`: `sessionRememberPassword` state・`settings:get`結果からの復元・`handleChangeSessionRememberPasswordFromDialog`・`SettingsDialog`への props 渡しを削除。他の editorDefaults/links/autosave/eol/shortcuts/theme の配線には触れていない。
+- `src/shared/models.ts`: `AppSettings.sessionRememberPassword: boolean` フィールドを型定義から削除（未使用設定値を型に残すと将来の混乱の元になるため、設計方針に基づき削除）。他フィールドは変更なし。
+- `src/main/settings/appSettings.ts`: `defaultAppSettings()`の`sessionRememberPassword: true`を削除。`migrateSchema`/`DEFAULT_SHORTCUTS`等の他ロジックは変更なし。
+- 影響範囲確認: `sessionRememberPassword`という識別子はリポジトリ全体で上記4ファイルのみが参照しており、main/ipc層・crypto層・migrate.ts・preload・ipc-contract.tsには元々参照が無かったため、型・デフォルト値・保存/読込ロジックの削除のみで完結（IPC契約やハンドラの変更は不要）。
+- 確認: `npm run typecheck`エラーなし、`npm run build`成功。
+- reviewer へ M7 実装全体（本修正含む）の初回レビューを依頼。
+
+## reviewer — M7（仕上げ）実装 静的レビュー（ラウンド1）
+
+対象: M7差分一式（StatusBar/SettingsDialog新設、autoRename.ts/shortcuts.ts/migrate.ts新設、main/index.ts のトレイ常駐、appSettings.ts/metaStore.ts の migrateSchema配線、App.tsx のAutoReName配線・平文自動保存・設定画面配線・グローバルショートカット、models.ts/electron-builder.yml）。M7-polish.md・00-core-principles.md・data-model.md と照合。実行検証はtester範囲のため未実施。
+
+- M7-R1-01 [Med] NG: `appSettings.ts` の設定読込（`tryReadSettings`）は `isValidAppSettings`（`schemaVersion`/`tabs`/`theme`のみ検査）を通れば既存ファイルをそのままキャッシュし、`defaultAppSettings()` とのマージ（不足フィールドの補完）を一切行わない。本 M7 で `AppSettings.shortcuts` を`schemaVersion`を上げずに新規追加したため、M0〜M6期に生成された既存 `app-settings.json`（`shortcuts`キー無し）を読み込むと `getAppSettings().shortcuts` が `undefined` のまま残る。結果: (1) `App.tsx` 初期化時 `setShortcuts(res.value.shortcuts)` で state が `undefined` になり、グローバルショートカットの `keydown` ハンドラ内 `shortcuts.globalSearch ?? ...` が `undefined` プロパティアクセスで例外化 → 全4種のグローバルショートカット（検索/テーマ切替/設定/ロック）が機能しなくなる。(2) `appSettings.ts` の `deepMerge` は `base`（ここでは `draft.shortcuts`）が `undefined` の場合 `typeof base !== 'object'` 分岐でそのまま `base`（undefined）を返し patch を握りつぶすため、設定画面でショートカットを変更（`settings:set({shortcuts:{action:value}})`）しても永続化されない（再起動で消える）。新規インストールでは`defaultAppSettings()`が`shortcuts`を含むため発生しないが、本milestoneが謳う「schemaVersion/appVersionマイグレーション土台」が実際には最も基本的な後方互換シナリオ（既存設定ファイルへの新フィールド追加）を全くカバーできていないことを示す実例。推奨修正: (a) 設定読込時に`defaultAppSettings()`とのディープマージで不足フィールドを補完してからキャッシュする、(b) `deepMerge`を修正し`base`がundefined/nullでも`patch`オブジェクトを起点にマージするようにする（現状は`base`未定義時にpatch全体を捨ててしまう一般的なバグ）。
+- [Info] 対応不要・参考: トレイ常駐（最小限）により×ボタンでは終了せずhideするだけになったため、ユーザーが誤って2重起動した場合（`requestSingleInstanceLock`未導入、M1以来未実装）に2プロセスが同一タブフォルダのメタJSON/chokidar監視を独立に持つリスクが従来よりも顕在化しやすくなる。M7-polish.mdは単一インスタンス化を要求しておらず、個人プロジェクトの「最小限」スコープを超える堅牢化提案のため今回はブロッキングとしない。将来検討事項として記録のみ。
+- [Info] 対応不要・参考: `sessionRememberPassword`のUI削除・型削除はユーザー直接承認済みだが、正本であるPLAN.md/data-model.md（§4.2のAppSettings例）には同フィールドの記載が残ったまま。designer側でのドキュメント同期を推奨（本レビューの合否には影響しない）。
+- AutoReName（`autoRenameBaseline`変化検出+800msデバウンス+`buildAutoRenameCandidate`のサニタイズ/重複回避）: `computeFirstNonEmptyLine`→`sanitizeCandidate`（`validateNameLive`/`suggestSanitizedName`、fs層`pathSafety.ts`と同じ禁止文字/予約名集合を共有）→ `isNameTaken`(大文字小文字非区別)→重複時ベース名+`" (2)"`以降採番、は`memoFileService.pickAvailableName`の命名規則と一致。最終権威検証は`memo:rename`（`NAME_DUPLICATE`等）がフェイルセーフとして残るためレンダラ側の`existingNames`はベストエフォートでよいとする設計判断も妥当。暗号化メモは`handleEditorChange`の`else`分岐（非encrypted時のみ）でしか`scheduleAutoRename`を呼ばず除外されている。手動リネーム・タブ切替・外部変更反映・暗号化操作後の各箇所で`autoRenameBaselineRef`/タイマーの再設定・クリアが漏れなく行われている。
+- タスクトレイの`isQuitting`状態遷移: トレイ「終了」クリック時と`before-quit`（OS主導終了含む）の両方で`isQuitting=true`を設定後`win.on('close')`のpreventDefault分岐を通らず実際にウィンドウが閉じる、`window-all-closed`→`app.quit()`（二重呼び出しでも無害）→`will-quit`でtray破棄、の順序は矛盾なし。×ボタンでの`hide()`のみ（実際には終了しない）という设计意図も一貫。
+- 平文メモの自動保存（`schedulePlainAutosave`/`performPlainAutosave`）とM2の破棄確認ダイアログ（`requestCloseCurrentMemo`内`window.confirm`）: 自動保存はdirty時のみ・conflict解決中はロック・保存成功時`dirty:false`+`reportActiveMemo`更新という暗号化メモの既存パターン（M6）と対称的に実装されており、タブ切替/クローズ時は引き続き`window.confirm`が安全網として機能する（自動保存が普段dirtyを解消しておりダイアログが出る頻度は下がるが、デバウンス中の未保存編集は引き続き確認対象になり矛盾はない）。開発者申告事項1の通り「全面自動保存への置き換えはしていない」は実装と一致。
+- IPC/型整合: `settings:get`/`settings:set`/`app:getInfo`のIPCチャネル自体はM0/M1から不変。`AppSettings.shortcuts: Record<string,string>`はdata-model.md記載通りmodels.tsに反映済み。
+- セキュリティ: 新規コード（migrate.ts/shortcuts.ts/autoRename.ts/StatusBar/SettingsDialog/トレイ）に鍵・パスワード・復号平文のハードコード/ログ出力なし。`console.error`はエラーオブジェクト（code/message）のみで内部情報の露出なし。preload/contextIsolation/sandbox設定は変更なし。
+- 判定: M7-R1-01（Med）の解消が必要。developer へ差し戻し（これは指摘M7-R1-01に対する1回目の修正依頼）。
+
+## developer — M7-R1-01 修正（1回目）
+
+対象: `src/main/settings/appSettings.ts`（`tryReadSettings`・`deepMerge`）。
+
+- `tryReadSettings`: `isValidAppSettings`通過後、`migrateSchema`適用結果を`defaultAppSettings()`と`deepMerge`してからキャッシュ/返却するよう変更（推奨修正(a)）。schemaVersionを上げずに追加したフィールド（`shortcuts`等）が既存ファイルに無くても既定値で補完される。
+- `deepMerge`: `base`が`undefined`/`null`/非オブジェクトでも`patch`オブジェクトを起点にマージするよう根本修正（推奨修正(b)）。`patch`が非オブジェクトの場合はそのまま値を採用する分岐を先頭に追加し、`base`側は「オブジェクトなら展開、それ以外は空オブジェクトから開始」に変更。`settings:set`の他フィールド（`shortcuts`以外）でも同種の握りつぶしが起きうる根本原因を解消。
+- 確認: `npm run typecheck`・`npm run build`とも成功。
+- reviewer へ再レビュー依頼（指摘M7-R1-01に対する1回目の修正）。
+
+## reviewer — M7-R1-01 再修正確認（ラウンド2）
+
+対象: `src/main/settings/appSettings.ts`（`tryReadSettings`のdeepMerge組込み、`deepMerge`本体の`base`未定義時ハンドリング修正）。
+
+- M7-R1-01 OK（解消）: `tryReadSettings`が`migrateSchema`適用後に`defaultAppSettings()`との`deepMerge`を経てからキャッシュ/返却するようになり、既存`app-settings.json`に`shortcuts`キーが無くても（patch側にキー自体が存在しないため走査対象にならず）base=defaultの値がそのまま残ることを確認。グローバルショートカット4種の`undefined`起因の例外は解消。`deepMerge`の`base`未定義時分岐修正（`patch`が非オブジェクトならそのまま返す／それ以外は`base`がオブジェクトなら展開、非オブジェクトなら空オブジェクトから開始）もトレース確認し、`settings:set({shortcuts:{action:value}})`のような単一キーパッチが握りつぶされず`draft.shortcuts`の該当キーのみ更新・他キー維持されることを確認。
+- 副作用確認: 配列フィールド（`tabs`等）は`Array.isArray`分岐により従来通り全体置換（deep mergeされない）で変更なし。ただし`tabs`/`window`は`tabService.ts`等が`updateAppSettings`の直接mutatorで書き換えており、`deepMerge`/`patchAppSettings`経路自体を通らないため今回の変更の影響対象外。`editorDefaults`/`links`/`autosave`/`eol`等のネストしたオブジェクトフィールドは全て同じ再帰ロジックを通り、部分更新時に未指定キーがbase（既存値）から維持されることを確認。既存の他フィールドへの意図しない副作用は確認できず。
+- docs/00-core-principles.md § Result型/エラーハンドリング表との整合: `tryReadSettings`はdeepMerge追加後も例外はtry/catchで捕捉しnullを返す既存の破損復旧カスケードに合流するのみで、Result型規約やIPC境界のエラーハンドリング方針に変更・逸脱なし。
+- 判定: ブロッキング指摘なし。M7-R1-01は解消。ラウンド2として合格。tester へ進行可。
+
+## tester — M7（仕上げ）動作検証（ラウンド1）
+
+対象: reviewer M7-R1-01 ラウンド2 OK後の一式。npm install / typecheck / build / prod起動（`--user-data-dir`で隔離）/ CDP実機操作（Runtime.evaluate・Input.dispatchKeyEvent・Page.javascriptDialogOpening）+ Win32 API（PostMessage/ShowWindow/IsWindowVisible）によるネイティブウィンドウ操作を独立して再現確認。
+
+- 判定: **軽微な情報提供1件を記録のみで報告（差し戻し不要）。それ以外は全項目OK。developer への差し戻しなし。**
+- npm install: 成功（`up to date, audited 393 packages`。allow-scripts警告のみ）。
+- typecheck: `tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json` エラーなし。
+- build: `electron-vite build` 成功。`out/main/index.js`(82.01kB)/`out/preload/index.js`(6.21kB)/`out/renderer/assets/index-*.js`(992.25kB)を生成確認。
+- **M7-R1-01（reviewer最重点指摘）の再現確認**: `shortcuts`キーの無い旧形式`app-settings.json`（M0〜M6期を模した`schemaVersion:1`、`tabs`/`window`/`theme`/`editorDefaults`/`autosave`/`links`/`encoding`/`eol`のみ）を手動生成し読み込ませた。結果、`settings:get`で`shortcuts`が`DEFAULT_SHORTCUTS`（`Ctrl+Shift+F`/`Ctrl+Shift+T`/`Ctrl+Shift+L`/`Ctrl+,`）で補完されていることを確認。実キー入力（`Input.dispatchKeyEvent`）でグローバルショートカット4種（全文検索起動=Ctrl+Shift+F相当→検索パネル表示、テーマ切替=Ctrl+Shift+T→`data-theme`属性変化、設定画面=Ctrl+,→設定ダイアログ表示、ロック=Ctrl+Shift+L→暗号化メモの実ロック+ステータスバー通知）が全て`undefined`起因の例外なく動作することを確認。設定画面でショートカット（globalSearchをCtrl+Alt+Gへ変更）を実DOM操作で変更→`app-settings.json`に他フィールドを保ったまま該当キーのみ反映→electronプロセスを`Stop-Process -Force`で終了→同一`--user-data-dir`で再起動→`settings:get`で変更後の値が維持され、かつ変更後のCtrl+Alt+Gで実際に検索パネルが開くことを確認（reviewer指摘の両症状=グローバルショートカット全滅・設定変更の握りつぶし、がいずれも再発しないことを実機確認）。
+- **設定画面・各種設定の永続化**: テーマ（トグル）、エディタ既定（折り返しchars/タブ幅8/ソフトタブOFF/行番号OFF/フォントサイズ18、うちwrap/softTabは実DOM操作で変更）、自動保存（plain 2500ms/encrypted 9000ms）、リンク（singleClick/確認なし）、改行コード（crlf）、ショートカットを変更し、electronプロセスを完全終了→同一userDataで再起動後、`settings:get`で全フィールドが変更後の値のまま維持されることを確認。`editorDefaults`のように複数回（IPC直叩き→UI操作）にまたがる部分更新でも他キーを握りつぶさず個別キーごとに正しくマージされることも確認（deepMergeのキー単位マージ動作の副次確認）。
+- **AutoReName**: 新規メモ作成→本文の最初の非空行を入力→800ms超のデバウンス後にツリー・エディタタイトル・実ファイル名（`.txt`）が追随してリネームされることを実DOM操作+ディスク確認で確認。禁止文字を含む先頭行（`Bad:Name?Test`）→`Bad_Name_Test`へサニタイズされてリネームされることを確認。既存メモと同名になる先頭行（`memo1`）→`memo1 (2)`へ自動採番されることを確認（いずれも実ファイル生成をディスクで確認）。**暗号化メモ（`.txtenc`）除外**: 暗号化メモを開き先頭行を編集→暗号化用autosave debounce（既定5000ms）超の待機後も名前が変化せず、実ファイルも`enc-test.txtenc`のまま維持されることを確認（AutoReName対象外の仕様通り）。
+- **平文メモの自動保存 + 既存の破棄確認ダイアログ**: 平文メモ編集後、放置（plainDebounceMs=1500ms超）で自動的にdirty解消・実ファイルへ反映されることを確認。デバウンス完了前に別メモへ切替を試みると`window.confirm`（「未保存の変更があります。破棄して別のメモを開きますか？」）が実際に表示され、`Page.handleJavaScriptDialog`でキャンセル時は編集内容を保持したまま同一メモに留まり、承諾時は編集を破棄して切替わることを確認（自動保存導入後もダイアログが matching タイミングで機能することを確認）。
+- **タスクトレイ（ネイティブOS操作での検証）**: Win32 API（`PostMessage`で実際の`WM_CLOSE`メッセージをメインウィンドウへ送信=物理的な×ボタンクリックと同一の通知経路）を送信した結果、`IsWindowVisible`が`True→False`に変化（ウィンドウは破棄されず非表示化）、プロセス数は変化なし（クラッシュ・終了なし）、Chromiumの`document.visibilityState`も`hidden`に変化しCDPセッションは生存し続けることを確認（×ボタンでhideのみ・実際には終了しない、という設計通りの挙動を実ネイティブメッセージで確認）。`ShowWindow`(`SW_SHOW`)で`IsWindowVisible`が`True`に戻ることも確認（トレイ「表示/非表示」相当のOSレベルの可視性反転自体は正常）。トレイコンテキストメニュー「終了」の物理クリック自体は本サンドボックス環境にシステムトレイ操作用のUIオートメーションツールが無く自動化できなかったため未実施（`isQuitting`フラグ＋`app.quit()`のロジックはreviewerラウンド1/2の静的解析と一致するコードのままで変更なし）。
+- **[Info] 記録のみ・ブロッキング対象外: レンダラから`window.close()`（JS API）を直接呼ぶと即座にアプリ全体が終了する（トレイのhide経由にならない）。** ネイティブの`WM_CLOSE`（物理×ボタン/Alt+F4相当）経由では正しくhideされる（上記で確認済み）のに対し、CDP経由で`window.close()`を明示的に呼び出すと`before-quit`を経由せずプロセスが即終了する挙動を確認（要因は未特定、Electron/Chromiumの`window.close()`実装の内部差異の可能性）。ただし`grep`で確認した限り`src/renderer`配下のどのコードも`window.close()`を呼び出しておらず、通常のユーザー操作（×ボタンクリック・Alt+F4）・既存のアプリコードのいずれからも到達しない経路のため、現行コードに対するリグレッションではない。将来何らかの理由でレンダラから`window.close()`を呼ぶコードが追加された場合にhideされず終了してしまう点にのみ留意（対応不要、記録のみ）。
+- console/例外チェック: 上記一連の操作を通してCDP `Runtime.consoleAPICalled`(error)/`Runtime.exceptionThrown`を監視し0件。electronプロセスの標準出力ログにも`Network service crashed, restarting service.`という無害なChromium基盤ログ以外にエラー行なし。
+- 後片付け: 検証用一時フォルダ複数（scratchpad配下、リポジトリ外）・Electron userData（`--user-data-dir`で隔離、リポジトリ外）を削除済み。検証後`Get-Process electron`は0件を確認（複数回の起動・強制終了サイクルを通じて確認）。
+- 外部サービスへの副作用: なし（すべてローカルファイル操作・localhost CDP・ローカルWin32 APIのみ。実運用のAPIキー/Webhook等は使用していない）。
