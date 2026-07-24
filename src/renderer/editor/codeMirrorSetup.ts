@@ -38,8 +38,12 @@ export interface EditorSettings {
   softTab: boolean;
   showLineNumbers: boolean;
   fontSize: number;
-  /** 空白/改行の可視化トグル（M7 で UI 配線予定。既定 off, data-model.md に永続フィールド無し）。 */
+  /** 空白/改行の可視化トグル（M7 で設定画面から配線。既定 off, data-model.md に永続フィールド
+   * 無しのためセッション内のみの設定として扱う, developer 判断）。 */
   showWhitespace: boolean;
+  /** カーソル行ハイライトトグル（M7 で設定画面から配線。既定 on, data-model.md に永続フィールド
+   * 無しのためセッション内のみの設定として扱う, developer 判断。DESIGN §2.3）。 */
+  highlightActiveLine: boolean;
 }
 
 export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
@@ -48,7 +52,8 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   softTab: true,
   showLineNumbers: true,
   fontSize: 14,
-  showWhitespace: false
+  showWhitespace: false,
+  highlightActiveLine: true
 };
 
 /** 再設定可能な項目ごとの Compartment。CodeMirrorEditor がインスタンスごとに新規生成する。 */
@@ -58,6 +63,7 @@ export interface EditorCompartments {
   lineNumbers: Compartment;
   whitespace: Compartment;
   font: Compartment;
+  activeLine: Compartment;
   /** 外部変更競合ダイアログ表示中のエディタ入力ロック用（M4, DESIGN §3.3「解決中ロック」）。 */
   readOnly: Compartment;
 }
@@ -69,6 +75,7 @@ export function createCompartments(): EditorCompartments {
     lineNumbers: new Compartment(),
     whitespace: new Compartment(),
     font: new Compartment(),
+    activeLine: new Compartment(),
     readOnly: new Compartment()
   };
 }
@@ -93,6 +100,11 @@ function buildWhitespaceExtension(show: boolean): Extension {
   return show ? [highlightWhitespace(), highlightTrailingWhitespace()] : [];
 }
 
+/** カーソル行ハイライト（本文側のみ。ガター側は showLineNumbers と連動したままにする）。 */
+function buildActiveLineExtension(enabled: boolean): Extension {
+  return enabled ? [highlightActiveLine()] : [];
+}
+
 function buildFontExtension(fontSize: number): Extension {
   return EditorView.theme({
     '&': { fontSize: `${fontSize}px` },
@@ -108,7 +120,8 @@ export function initialCompartmentExtensions(compartments: EditorCompartments, s
     compartments.indent.of(buildIndentExtension(settings.tabWidth, settings.softTab)),
     compartments.lineNumbers.of(buildLineNumbersExtension(settings.showLineNumbers)),
     compartments.whitespace.of(buildWhitespaceExtension(settings.showWhitespace)),
-    compartments.font.of(buildFontExtension(settings.fontSize))
+    compartments.font.of(buildFontExtension(settings.fontSize)),
+    compartments.activeLine.of(buildActiveLineExtension(settings.highlightActiveLine))
   ];
 }
 
@@ -120,7 +133,8 @@ export function reconfigureEditorSettings(view: EditorView, compartments: Editor
       compartments.indent.reconfigure(buildIndentExtension(settings.tabWidth, settings.softTab)),
       compartments.lineNumbers.reconfigure(buildLineNumbersExtension(settings.showLineNumbers)),
       compartments.whitespace.reconfigure(buildWhitespaceExtension(settings.showWhitespace)),
-      compartments.font.reconfigure(buildFontExtension(settings.fontSize))
+      compartments.font.reconfigure(buildFontExtension(settings.fontSize)),
+      compartments.activeLine.reconfigure(buildActiveLineExtension(settings.highlightActiveLine))
     ]
   });
 }
@@ -187,7 +201,6 @@ export function buildStaticExtensions(onChange: (contentLF: string) => void, onS
     drawSelection(),
     dropCursor(),
     rectangularSelection(),
-    highlightActiveLine(),
     EditorState.allowMultipleSelections.of(true),
     search({ top: true }),
     saveKeymap,
