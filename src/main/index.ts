@@ -1,8 +1,8 @@
 // src/main/index.ts
 // app 起動・BrowserWindow 生成・ライフサイクル（PLAN.md §3）。
-// トレイ常駐は M7 で本格化する（M0 では未実装）。
+// トレイ常駐（最小限: 表示/非表示トグル + 終了, DESIGN §2.7）は M7 で実装する。
 import { join } from 'node:path';
-import { app, BrowserWindow, screen, shell } from 'electron';
+import { app, BrowserWindow, Menu, nativeImage, screen, shell, Tray } from 'electron';
 import { registerIpc } from './ipc/registerIpc';
 import { initAppSettings } from './settings/appSettings';
 import { listTabs } from './fs/tabService';
@@ -34,6 +34,65 @@ interface WindowBounds {
   width: number;
   height: number;
   maximized: boolean;
+}
+
+// --- タスクトレイ常駐（最小限, M7 / DESIGN §2.7）---------------------------------------------
+// 「終了」メニュー/`app.quit()` 経由でのみ実際に終了する。ウィンドウの×ボタンはトレイへ
+// 最小化するだけにする（`win.on('close', ...)` で preventDefault し hide() する、下記参照）。
+let tray: Tray | null = null;
+let mainWindowRef: BrowserWindow | null = null;
+let isQuitting = false;
+
+/**
+ * トレイアイコン用の小さな単色ビットマップを生成する。本リポジトリには専用の .ico/.png
+ * アセットが無い（v1 では未作成、developer 判断でスコープ外）ため、外部アセットファイルに
+ * 依存せず自己完結する形で `nativeImage.createFromBuffer` 用の生 BGRA バッファを組み立てる
+ * （Electron の nativeImage 生バッファ形式は BGRA, 4 bytes/px）。将来 `build/icon.ico` 等の
+ * 正式アセットを用意したら `nativeImage.createFromPath` に差し替えてよい。
+ */
+function buildTrayIcon(): Electron.NativeImage {
+  const size = 16;
+  const buffer = Buffer.alloc(size * size * 4);
+  for (let i = 0; i < size * size; i++) {
+    const o = i * 4;
+    buffer[o] = 0xd0; // B
+    buffer[o + 1] = 0x7a; // G
+    buffer[o + 2] = 0x4a; // R（TabTreeNote既定アクセントカラーに寄せた単色, theme.css参照）
+    buffer[o + 3] = 0xff; // A
+  }
+  return nativeImage.createFromBuffer(buffer, { width: size, height: size });
+}
+
+function toggleMainWindowVisibility(): void {
+  const win = mainWindowRef;
+  if (!win || win.isDestroyed()) return;
+  if (win.isVisible()) {
+    win.hide();
+  } else {
+    win.show();
+    win.focus();
+  }
+}
+
+function createTray(): Tray {
+  const t = new Tray(buildTrayIcon());
+  t.setToolTip('TabTreeNote');
+  t.setContextMenu(
+    Menu.buildFromTemplate([
+      { label: '表示/非表示', click: () => toggleMainWindowVisibility() },
+      { type: 'separator' },
+      {
+        label: '終了',
+        click: () => {
+          isQuitting = true;
+          app.quit();
+        }
+      }
+    ])
+  );
+  // シングルクリックでも表示/非表示をトグルする（Windows の通知領域アイコンの慣習, DESIGN §2.7）。
+  t.on('click', () => toggleMainWindowVisibility());
+  return t;
 }
 
 /** 保存済みウィンドウ位置がプライマリディスプレイの作業領域と全く重ならない場合は既定値へフォールバックする。 */
@@ -68,6 +127,15 @@ function createMainWindow(windowState: WindowBounds): BrowserWindow {
 
   win.once('ready-to-show', () => {
     win.show();
+  });
+
+  // トレイ常駐（最小限, M7 / DESIGN §2.7）: ×ボタンでは終了せずトレイへ最小化するだけにする。
+  // 実際の終了はトレイメニュー「終了」（`isQuitting=true` → `app.quit()`）経由のみ。
+  win.on('close', (e) => {
+    if (!isQuitting) {
+      e.preventDefault();
+      win.hide();
+    }
   });
 
   // 外部リンクは既定ブラウザで開く。BrowserWindow 内でナビゲートさせない。
@@ -116,6 +184,8 @@ async function bootstrap(): Promise<void> {
   registerIpc();
   await buildIndex(listTabs());
   const win = createMainWindow(settings.window);
+  mainWindowRef = win;
+  tray = createTray();
   startWatching(
     win.webContents,
     listTabs().map((tab) => ({ tabId: tab.id, folderPath: tab.folderPath }))
@@ -136,10 +206,14 @@ async function bootstrap(): Promise<void> {
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       const reactivatedWin = createMainWindow(settings.window);
+      mainWindowRef = reactivatedWin;
+      if (!tray) tray = createTray();
       startWatching(
         reactivatedWin.webContents,
         listTabs().map((tab) => ({ tabId: tab.id, folderPath: tab.folderPath }))
       );
+    } else {
+      toggleMainWindowVisibility();
     }
   });
 }
@@ -153,5 +227,13 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', () => {
+  // トレイ「終了」以外の終了経路（Windows ログオフ等の OS 主導終了を含む）でもここを通るため、
+  // ×ボタンでの hide() を抑止する `isQuitting` を最終防御として必ず立てておく。
+  isQuitting = true;
   void stopWatching();
+});
+
+app.on('will-quit', () => {
+  tray?.destroy();
+  tray = null;
 });
