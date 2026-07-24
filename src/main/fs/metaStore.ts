@@ -19,6 +19,7 @@ import type { MetaTreeNode, TabMeta, TreeNode } from '@shared/models';
 import type { AddPosition } from '@shared/ipc-contract';
 import { atomicWrite } from './atomicWrite';
 import { scanTabFolder, type ScannedMemo } from './memoFileService';
+import { migrateSchema } from '../util/migrate';
 
 export interface LoadedMeta {
   tree: TreeNode[];
@@ -42,7 +43,8 @@ async function tryReadMeta(path: string): Promise<TabMeta | null> {
   try {
     const raw = await fs.readFile(path, 'utf-8');
     const parsed: unknown = JSON.parse(raw);
-    return isValidTabMeta(parsed) ? parsed : null;
+    // マイグレーション土台（M7, PLAN §7 / util/migrate.ts）: v1 のみの現状は no-op。
+    return isValidTabMeta(parsed) ? migrateSchema(parsed, []) : null;
   } catch {
     return null;
   }
