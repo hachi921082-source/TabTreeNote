@@ -126,7 +126,6 @@ export interface AppSettings {
   encoding: { defaultSave: 'utf-8' };
   eol: { policy: 'preserve' | 'crlf' | 'lf' | 'cr' };
   shortcuts: Record<string, string>;
-  sessionRememberPassword: boolean;
 }
 
 /**
