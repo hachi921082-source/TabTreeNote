@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
 import { ipc } from './ipc';
 import { useTheme } from './theme/useTheme';
-import { createOpenMemoState, withUpdatedHash, type OpenMemoState } from './editor/eolKeeper';
+import { createOpenMemoState, resolveEffectiveEol, withUpdatedHash, type OpenMemoState } from './editor/eolKeeper';
 import { DEFAULT_EDITOR_SETTINGS, type EditorSettings, type EditorStats } from './editor/codeMirrorSetup';
+import { AUTO_RENAME_DEBOUNCE_MS, buildAutoRenameCandidate, computeFirstNonEmptyLine } from './editor/autoRename';
 import { CodeMirrorEditor, type RevealTarget } from './components/Editor/CodeMirrorEditor';
 import type { DetectedLink } from './editor/links';
 import { TabBar } from './components/TabBar/TabBar';
@@ -12,6 +13,8 @@ import { ConfirmDialog } from './components/dialogs/ConfirmDialog';
 import { ConflictDialog } from './components/dialogs/ConflictDialog';
 import { PasswordDialog, type PasswordDialogMode, type PasswordDialogSubmitValues } from './components/dialogs/PasswordDialog';
 import { SearchPanel } from './components/Search/SearchPanel';
+import { StatusBar } from './components/StatusBar/StatusBar';
+import { SettingsDialog } from './components/Settings/SettingsDialog';
 import { EMPTY_SELECTION, type SelectionState } from './store/selection';
 import {
   dropZoneToPosition,
@@ -20,7 +23,8 @@ import {
   type DropZone,
   type MemoDragPayload
 } from './components/Tree/treeView';
-import { insertTreeNode, isDescendantOf, orderForBatchInsert, removeTreeNode } from '@shared/treeOps';
+import { collectTreeNames, insertTreeNode, isDescendantOf, orderForBatchInsert, removeTreeNode } from '@shared/treeOps';
+import { DEFAULT_SHORTCUTS, matchesShortcut, type ShortcutAction } from '@shared/shortcuts';
 import type {
   AddPosition,
   AppInfo,
@@ -31,7 +35,7 @@ import type {
   OpErrorPayload,
   TrashFallbackPayload
 } from '@shared/ipc-contract';
-import type { AppSettings, MetaTreeNode, SearchHit, TabInfo, TreeNode } from '@shared/models';
+import type { AppSettings, AppSettingsPatch, MetaTreeNode, SearchHit, TabInfo, TreeNode } from '@shared/models';
 
 const MIN_TREE_WIDTH = 160;
 const MAX_TREE_WIDTH = 600;
@@ -54,6 +58,12 @@ const DEFAULT_LINK_SETTINGS: AppSettings['links'] = { openTrigger: 'ctrlClick', 
 // 暗号化メモの低頻度自動保存デバウンス既定値（M6, DESIGN §2.6「編集停止から一定時間のデバウンス」）。
 // settings:get 応答（AppSettings.autosave.encryptedDebounceMs）で上書きされる。
 const DEFAULT_ENCRYPTED_AUTOSAVE_MS = 5000;
+// 平文メモの自動保存デバウンス既定値（M7, DESIGN §2.6「適度な自動保存。変更がなければ書き込まない」）。
+// 暗号化メモと同じ「編集停止からのデバウンス」方式を平文メモにも適用する（developer 判断。
+// タブ/メモ切替時の即時自動保存トリガーまでは本 M7 では実装せず、既存の未保存確認ダイアログを
+// 安全網として残す。詳細は requestCloseCurrentMemo 付近のコメント参照）。
+// settings:get 応答（AppSettings.autosave.plainDebounceMs）で上書きされる。
+const DEFAULT_PLAIN_AUTOSAVE_MS = 1500;
 
 interface CryptoDialogRequest {
   mode: PasswordDialogMode;
@@ -96,6 +106,20 @@ export function App() {
   const [editorStats, setEditorStats] = useState<EditorStats | null>(null);
   // リンク機能設定（M5, DESIGN §2.8）。settings:get 応答で上書きされる。
   const [linkSettings, setLinkSettings] = useState<AppSettings['links']>(DEFAULT_LINK_SETTINGS);
+  // 設定画面（M7）が扱う残りの AppSettings フィールド。settings:get 応答で上書きされる。
+  const [autosaveSettings, setAutosaveSettings] = useState<AppSettings['autosave']>({
+    plainDebounceMs: DEFAULT_PLAIN_AUTOSAVE_MS,
+    encryptedDebounceMs: DEFAULT_ENCRYPTED_AUTOSAVE_MS
+  });
+  const [eolPolicy, setEolPolicy] = useState<AppSettings['eol']['policy']>('preserve');
+  // 保存系 useCallback（handleSave/performPlainAutosave 等）から常に最新の改行コードポリシーを
+  // 読むための ref（dirtyRef 等と同じ理由, M7）。
+  const eolPolicyRef = useRef(eolPolicy);
+  useEffect(() => {
+    eolPolicyRef.current = eolPolicy;
+  }, [eolPolicy]);
+  const [shortcuts, setShortcuts] = useState<Record<string, string>>({ ...DEFAULT_SHORTCUTS });
+  const [showSettingsDialog, setShowSettingsDialog] = useState(false);
   const fontSizePersistTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const editorWheelCleanup = useRef<(() => void) | null>(null);
   // reviewer 指摘 M2-R1-01: selectTab/openMemoByName の未保存確認ガードは deps に dirty を
@@ -143,6 +167,13 @@ export function App() {
   // 暗号化メモの低頻度自動保存デバウンス（既定値。settings:get 応答で上書き, DESIGN §2.6）。
   const encryptedAutosaveMsRef = useRef(DEFAULT_ENCRYPTED_AUTOSAVE_MS);
   const autosaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // 平文メモの自動保存デバウンス（M7。既定値。settings:get 応答で上書き, DESIGN §2.6）。
+  const plainAutosaveMsRef = useRef(DEFAULT_PLAIN_AUTOSAVE_MS);
+  const plainAutosaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // AutoReName（M7, PLAN §5.9/Fix12）: 直近に判定した「最初の非空行」の値（変化検出の基準）と
+  // デバウンスタイマー。暗号化メモでは使わない（値は無視される）。
+  const autoRenameBaselineRef = useRef<string | null>(null);
+  const autoRenameTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // 同一メモのまま本文を強制的に再読込させるための世代カウンタ（M4）。CodeMirrorEditor は
   // 非制御コンポーネントで `initialContentLF` はマウント時のみ使用するため、外部変更の
   // 静かな反映・競合解決で本文を書き換える際は key に含めてこの値を進め、明示的に
@@ -170,6 +201,10 @@ export function App() {
           setEditorSettings((prev) => ({ ...prev, ...res.value.editorDefaults }));
           setLinkSettings(res.value.links);
           encryptedAutosaveMsRef.current = res.value.autosave.encryptedDebounceMs;
+          plainAutosaveMsRef.current = res.value.autosave.plainDebounceMs;
+          setAutosaveSettings(res.value.autosave);
+          setEolPolicy(res.value.eol.policy);
+          setShortcuts(res.value.shortcuts);
         }
       })
       .catch((e: unknown) => console.error('settings:get failed', e));
@@ -230,6 +265,22 @@ export function App() {
     }
   }, []);
 
+  // --- 平文メモの自動保存（M7, DESIGN §2.6「適度な自動保存」） / AutoReName（M7, PLAN §5.9/Fix12） ---
+
+  const clearPlainAutosaveTimer = useCallback((): void => {
+    if (plainAutosaveTimerRef.current) {
+      clearTimeout(plainAutosaveTimerRef.current);
+      plainAutosaveTimerRef.current = null;
+    }
+  }, []);
+
+  const clearAutoRenameTimer = useCallback((): void => {
+    if (autoRenameTimerRef.current) {
+      clearTimeout(autoRenameTimerRef.current);
+      autoRenameTimerRef.current = null;
+    }
+  }, []);
+
   /**
    * 現在開いているメモを安全に閉じてよいかを判定し、必要な後始末を行う。
    * - 平文メモ: dirty なら window.confirm で破棄確認する（既存 M2 の挙動を維持）。
@@ -247,6 +298,10 @@ export function App() {
       if (dirtyRef.current && !window.confirm('未保存の変更があります。破棄して別のメモを開きますか？')) {
         return false;
       }
+      // 切り替えが確定した時点で AutoReName/平文自動保存の保留タイマーを解除する（M7。
+      // キャンセルされた場合はここへ到達しないため、保留中の自動保存/リネームは温存される）。
+      clearAutoRenameTimer();
+      clearPlainAutosaveTimer();
       return true;
     }
 
@@ -256,7 +311,7 @@ export function App() {
         tabId: om.tabId,
         memoName: om.memoName,
         contentLF: contentLFRef.current,
-        eol: om.eol,
+        eol: resolveEffectiveEol(om.eol, eolPolicyRef.current),
         expectedHash: om.lastKnownHash
       });
       if (!res.ok) {
@@ -271,7 +326,7 @@ export function App() {
       console.error('crypto:lock failed', lockRes.error);
     }
     return true;
-  }, [clearEncryptedAutosaveTimer]);
+  }, [clearEncryptedAutosaveTimer, clearAutoRenameTimer, clearPlainAutosaveTimer]);
 
   const performEncryptedAutosave = useCallback(async (): Promise<void> => {
     const om = openMemoRef.current;
@@ -283,7 +338,7 @@ export function App() {
       tabId: om.tabId,
       memoName: om.memoName,
       contentLF: contentLFRef.current,
-      eol: om.eol,
+      eol: resolveEffectiveEol(om.eol, eolPolicyRef.current),
       expectedHash: om.lastKnownHash
     });
     if (res.ok) {
@@ -307,7 +362,87 @@ export function App() {
     }, encryptedAutosaveMsRef.current);
   }, [clearEncryptedAutosaveTimer, performEncryptedAutosave]);
 
+  // 平文メモの自動保存（M7, DESIGN §2.6「適度な自動保存。変更がなければ書き込まない」）。
+  // 暗号化メモの低頻度自動保存と対称の「編集停止からのデバウンス」方式（AppSettings.autosave.
+  // plainDebounceMs、既定値より短い）。
+  const performPlainAutosave = useCallback(async (): Promise<void> => {
+    const om = openMemoRef.current;
+    if (!om || om.encrypted || !dirtyRef.current) return;
+    const conflict = conflictInfoRef.current;
+    if (conflict && conflict.tabId === om.tabId && conflict.memoName === om.memoName) return; // 解決中ロック。
+
+    const res = await ipc.saveMemo({
+      tabId: om.tabId,
+      memoName: om.memoName,
+      contentLF: contentLFRef.current,
+      eol: resolveEffectiveEol(om.eol, eolPolicyRef.current),
+      encoding: om.encoding,
+      expectedHash: om.lastKnownHash
+    });
+    if (res.ok) {
+      setOpenMemo((prev) =>
+        prev && prev.tabId === om.tabId && prev.memoName === om.memoName ? withUpdatedHash(prev, res.value.savedHash) : prev
+      );
+      setDirty(false);
+      reportActiveMemo({ tabId: om.tabId, memoName: om.memoName, dirty: false });
+      setStatusMessage(`自動保存しました（${om.memoName}）`);
+    } else if (res.error.code !== 'CONFLICT') {
+      // CONFLICT は evt:conflict 経由の競合ダイアログに解決を委ねる（ここでは静かに諦める）。
+      setStatusMessage(`自動保存エラー[${res.error.code}]: ${res.error.message}`);
+    }
+  }, [reportActiveMemo]);
+
+  const schedulePlainAutosave = useCallback((): void => {
+    clearPlainAutosaveTimer();
+    plainAutosaveTimerRef.current = setTimeout(() => {
+      plainAutosaveTimerRef.current = null;
+      void performPlainAutosave();
+    }, plainAutosaveMsRef.current);
+  }, [clearPlainAutosaveTimer, performPlainAutosave]);
+
+  // AutoReName（M7, PLAN §5.9/Fix12, DESIGN §2.2）: 最初の非空行が実際に変化した場合のみ、
+  // 編集停止から AUTO_RENAME_DEBOUNCE_MS 後にサニタイズ+重複回避を経てリネームする。
+  // 暗号化メモは対象外（呼び出し側の handleEditorChange で除外する）。
+  const performAutoRename = useCallback(
+    async (tabId: string, oldName: string): Promise<void> => {
+      const om = openMemoRef.current;
+      if (!om || om.tabId !== tabId || om.memoName !== oldName || om.encrypted) return;
+      const conflict = conflictInfoRef.current;
+      if (conflict && conflict.tabId === tabId && conflict.memoName === oldName) return; // 解決中ロック。
+
+      const rawFirstLine = computeFirstNonEmptyLine(contentLFRef.current);
+      if (!rawFirstLine) return;
+      const candidate = buildAutoRenameCandidate(rawFirstLine, collectTreeNames(toMetaTree(tree)), oldName);
+      if (!candidate) return;
+
+      const res = await ipc.renameMemo({ tabId, oldName, newName: candidate });
+      if (!res.ok) {
+        // ベストエフォートの自動処理のため、ユーザーへは通知せず内部ログのみに留める
+        // （00-core-principles.md §10 と同様、レンダラ向けには詳細を出さない方針に倣う）。
+        console.error('AutoReName failed', res.error);
+        return;
+      }
+      setOpenMemo((prev) => (prev && prev.tabId === tabId && prev.memoName === oldName ? { ...prev, memoName: candidate } : prev));
+      reportActiveMemo({ tabId, memoName: candidate, dirty: dirtyRef.current });
+      await refreshTree(tabId);
+    },
+    [tree, reportActiveMemo, refreshTree]
+  );
+
+  const scheduleAutoRename = useCallback(
+    (tabId: string, oldName: string): void => {
+      clearAutoRenameTimer();
+      autoRenameTimerRef.current = setTimeout(() => {
+        autoRenameTimerRef.current = null;
+        void performAutoRename(tabId, oldName);
+      }, AUTO_RENAME_DEBOUNCE_MS);
+    },
+    [clearAutoRenameTimer, performAutoRename]
+  );
+
   useEffect(() => clearEncryptedAutosaveTimer, [clearEncryptedAutosaveTimer]);
+  useEffect(() => clearPlainAutosaveTimer, [clearPlainAutosaveTimer]);
+  useEffect(() => clearAutoRenameTimer, [clearAutoRenameTimer]);
 
   // evt:conflict / evt:externalChange 購読（M4, DESIGN §3.3 / docs/milestones/M4-watch.md）。
   // 経路の分離厳守: 本 effect はツリー再取得・「編集中でない」開いているメモの静かな反映
@@ -369,6 +504,10 @@ export function App() {
         setDirty(false);
         setEditorStats(null);
         setReloadGeneration((g) => g + 1);
+        // 外部内容の静かな反映（M7）: 保留中の自動保存/AutoReName の判定基準を新しい本文へ引き直す。
+        clearPlainAutosaveTimer();
+        clearAutoRenameTimer();
+        autoRenameBaselineRef.current = computeFirstNonEmptyLine(res.value.contentLF);
         reportActiveMemo({ tabId: om.tabId, memoName: om.memoName, dirty: false });
         setStatusMessage(`「${om.memoName}」の外部変更を反映しました。`);
       })();
@@ -378,7 +517,7 @@ export function App() {
       unsubscribeConflict();
       unsubscribeExternalChange();
     };
-  }, [refreshTree, reportActiveMemo, clearEncryptedAutosaveTimer]);
+  }, [refreshTree, reportActiveMemo, clearEncryptedAutosaveTimer, clearPlainAutosaveTimer, clearAutoRenameTimer]);
 
   // 競合ダイアログの解決アクション（M4）。
   const handleConflictKeepMine = useCallback(() => {
@@ -396,14 +535,14 @@ export function App() {
             tabId: openMemo.tabId,
             memoName: openMemo.memoName,
             contentLF,
-            eol: openMemo.eol,
+            eol: resolveEffectiveEol(openMemo.eol, eolPolicyRef.current),
             expectedHash: undefined
           })
         : await ipc.saveMemo({
             tabId: openMemo.tabId,
             memoName: openMemo.memoName,
             contentLF,
-            eol: openMemo.eol,
+            eol: resolveEffectiveEol(openMemo.eol, eolPolicyRef.current),
             encoding: openMemo.encoding,
             expectedHash: undefined
           });
@@ -446,10 +585,17 @@ export function App() {
         setDirty(false);
         setEditorStats(null);
         setReloadGeneration((g) => g + 1);
+        // 外部内容の採用（M7）: 保留中の自動保存/AutoReName は古い本文を前提にしているため破棄し、
+        // 判定基準を採用後の本文へ引き直す。
+        clearPlainAutosaveTimer();
+        clearAutoRenameTimer();
+        autoRenameBaselineRef.current = computeFirstNonEmptyLine(res.value.contentLF);
         reportActiveMemo({ tabId, memoName, dirty: false });
         setStatusMessage(`「${memoName}」の外部変更を反映しました。`);
       } else {
         // 外部で削除されていた場合など。メモを閉じる。
+        clearPlainAutosaveTimer();
+        clearAutoRenameTimer();
         setOpenMemo(null);
         setContentLF('');
         setDirty(false);
@@ -459,13 +605,76 @@ export function App() {
       }
       setConflictInfo(null);
     })();
-  }, [conflictInfo, openMemo, reportActiveMemo, clearEncryptedAutosaveTimer]);
+  }, [conflictInfo, openMemo, reportActiveMemo, clearEncryptedAutosaveTimer, clearPlainAutosaveTimer, clearAutoRenameTimer]);
 
   const handleToggleTheme = useCallback(() => {
     const next = theme === 'light' ? 'dark' : 'light';
     setTheme(next);
     void ipc.setSettings({ theme: next }).catch((e: unknown) => console.error('settings:set failed', e));
   }, [theme, setTheme]);
+
+  // --- 設定画面（M7, docs/milestones/M7-polish.md）---
+  // SettingsDialog 自体は IPC を呼ばず、すべて以下の onChange* 経由で App.tsx が settings:set を
+  // 呼ぶ（Tree/TabBar 等、他コンポーネントと同じくファイル操作/設定保存は親経由という既存の
+  // アーキテクチャ方針に合わせる, PLAN §1.3）。
+
+  const applySettingsPatch = useCallback(async (patch: AppSettingsPatch): Promise<void> => {
+    const res = await ipc.setSettings(patch);
+    if (!res.ok) {
+      setStatusMessage(`設定保存エラー[${res.error.code}]: ${res.error.message}`);
+    }
+  }, []);
+
+  const handleChangeEditorSettingsFromDialog = useCallback(
+    (patch: Partial<EditorSettings>) => {
+      setEditorSettings((prev) => ({ ...prev, ...patch }));
+      const persistable: Partial<AppSettings['editorDefaults']> = {};
+      if (patch.wrap !== undefined) persistable.wrap = patch.wrap;
+      if (patch.tabWidth !== undefined) persistable.tabWidth = patch.tabWidth;
+      if (patch.softTab !== undefined) persistable.softTab = patch.softTab;
+      if (patch.showLineNumbers !== undefined) persistable.showLineNumbers = patch.showLineNumbers;
+      if (patch.fontSize !== undefined) persistable.fontSize = patch.fontSize;
+      // showWhitespace/highlightActiveLine は AppSettings.editorDefaults に永続フィールドが無い
+      // （data-model.md 未変更の範囲, codeMirrorSetup.ts EditorSettings 冒頭コメント参照）ため、
+      // セッション内のみの設定として扱い settings:set には含めない（developer 判断）。
+      if (Object.keys(persistable).length > 0) void applySettingsPatch({ editorDefaults: persistable });
+    },
+    [applySettingsPatch]
+  );
+
+  const handleChangeLinksFromDialog = useCallback(
+    (patch: Partial<AppSettings['links']>) => {
+      setLinkSettings((prev) => ({ ...prev, ...patch }));
+      void applySettingsPatch({ links: patch });
+    },
+    [applySettingsPatch]
+  );
+
+  const handleChangeAutosaveFromDialog = useCallback(
+    (patch: Partial<AppSettings['autosave']>) => {
+      setAutosaveSettings((prev) => ({ ...prev, ...patch }));
+      if (patch.plainDebounceMs !== undefined) plainAutosaveMsRef.current = patch.plainDebounceMs;
+      if (patch.encryptedDebounceMs !== undefined) encryptedAutosaveMsRef.current = patch.encryptedDebounceMs;
+      void applySettingsPatch({ autosave: patch });
+    },
+    [applySettingsPatch]
+  );
+
+  const handleChangeEolPolicyFromDialog = useCallback(
+    (policy: AppSettings['eol']['policy']) => {
+      setEolPolicy(policy);
+      void applySettingsPatch({ eol: { policy } });
+    },
+    [applySettingsPatch]
+  );
+
+  const handleChangeShortcutFromDialog = useCallback(
+    (action: ShortcutAction, value: string) => {
+      setShortcuts((prev) => ({ ...prev, [action]: value }));
+      void applySettingsPatch({ shortcuts: { [action]: value } });
+    },
+    [applySettingsPatch]
+  );
 
   const selectTab = useCallback(async (tabId: string) => {
     // requestCloseCurrentMemo が平文/暗号化それぞれの適切なガード・後始末（平文=破棄確認,
@@ -509,6 +718,9 @@ export function App() {
         setRevealTarget(null);
         setConflictInfo(null);
         setReloadGeneration(0);
+        // AutoReName（M7）: 新規に開いたメモの「最初の非空行」を判定基準として記録する
+        // （この直後に本文を変更していない限り発火しない）。
+        autoRenameBaselineRef.current = computeFirstNonEmptyLine(res.value.contentLF);
         reportActiveMemo({ tabId: selectedTabId, memoName, dirty: false });
       } else {
         setStatusMessage(`メモ読込エラー: ${res.error.message}`);
@@ -557,6 +769,7 @@ export function App() {
       setRevealTarget(null);
       setConflictInfo(null);
       setReloadGeneration(0);
+      autoRenameBaselineRef.current = computeFirstNonEmptyLine(res.value.contentLF); // AutoReName（M7）。
       reportActiveMemo({ tabId: hit.tabId, memoName: hit.memoName, dirty: false });
       if (hit.matchField === 'body' && hit.matchStart !== undefined && hit.matchEnd !== undefined) {
         revealTokenRef.current += 1;
@@ -592,6 +805,7 @@ export function App() {
       setRevealTarget(null);
       setConflictInfo(null);
       setReloadGeneration(0);
+      autoRenameBaselineRef.current = computeFirstNonEmptyLine(res.value.contentLF); // AutoReName（M7）。
       reportActiveMemo({ tabId, memoName, dirty: false });
     },
     [reportActiveMemo]
@@ -653,19 +867,6 @@ export function App() {
     [selectedTabId, linkSettings, selectTab, openMemoDirect, requestCloseCurrentMemo]
   );
 
-  // 全文検索パネルのショートカット（Ctrl+Shift+F）。CodeMirror 側の Ctrl+F（現在メモ内検索,
-  // @codemirror/search）とはキーが異なるため衝突しない。
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent): void => {
-      if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === 'f') {
-        e.preventDefault();
-        setShowSearchPanel(true);
-      }
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, []);
-
   // CodeMirrorEditor（非制御）からの通知。doc 変更のたびに contentLF を最新化する。
   const handleEditorChange = useCallback(
     (content: string) => {
@@ -674,11 +875,23 @@ export function App() {
       const om = openMemoRef.current;
       if (om) {
         reportActiveMemo({ tabId: om.tabId, memoName: om.memoName, dirty: true });
-        // 暗号化メモの低頻度自動保存（DESIGN §2.6「編集停止から一定時間のデバウンス」, M6）。
-        if (om.encrypted) scheduleEncryptedAutosave();
+        if (om.encrypted) {
+          // 暗号化メモの低頻度自動保存（DESIGN §2.6「編集停止から一定時間のデバウンス」, M6）。
+          // AutoReName は暗号化メモ対象外（DESIGN §2.2/§2.9, M6/M7）。
+          scheduleEncryptedAutosave();
+        } else {
+          // 平文メモの自動保存（M7, DESIGN §2.6「適度な自動保存」）。
+          schedulePlainAutosave();
+          // AutoReName（M7, PLAN §5.9/Fix12）: 最初の非空行が実際に変化した場合のみ発火する。
+          const firstLine = computeFirstNonEmptyLine(content);
+          if (firstLine.length > 0 && firstLine !== autoRenameBaselineRef.current) {
+            autoRenameBaselineRef.current = firstLine;
+            scheduleAutoRename(om.tabId, om.memoName);
+          }
+        }
       }
     },
-    [reportActiveMemo, scheduleEncryptedAutosave]
+    [reportActiveMemo, scheduleEncryptedAutosave, schedulePlainAutosave, scheduleAutoRename]
   );
 
   const handleEditorStats = useCallback((stats: EditorStats) => {
@@ -691,21 +904,22 @@ export function App() {
     if (!openMemo || !dirty || (conflictInfo && conflictInfo.tabId === openMemo.tabId && conflictInfo.memoName === openMemo.memoName)) {
       return;
     }
-    // 手動保存は保留中の暗号化メモ自動保存タイマーを無効化する（二重保存を避ける, M6）。
+    // 手動保存は保留中の自動保存タイマーを無効化する（二重保存を避ける, M6/M7）。
     clearEncryptedAutosaveTimer();
+    clearPlainAutosaveTimer();
     const res = openMemo.encrypted
       ? await ipc.saveEncryptedMemo({
           tabId: openMemo.tabId,
           memoName: openMemo.memoName,
           contentLF,
-          eol: openMemo.eol,
+          eol: resolveEffectiveEol(openMemo.eol, eolPolicyRef.current),
           expectedHash: openMemo.lastKnownHash
         })
       : await ipc.saveMemo({
           tabId: openMemo.tabId,
           memoName: openMemo.memoName,
           contentLF,
-          eol: openMemo.eol,
+          eol: resolveEffectiveEol(openMemo.eol, eolPolicyRef.current),
           encoding: openMemo.encoding,
           expectedHash: openMemo.lastKnownHash
         });
@@ -717,7 +931,7 @@ export function App() {
     } else {
       setStatusMessage(`保存エラー[${res.error.code}]: ${res.error.message}`);
     }
-  }, [openMemo, contentLF, dirty, conflictInfo, reportActiveMemo, clearEncryptedAutosaveTimer]);
+  }, [openMemo, contentLF, dirty, conflictInfo, reportActiveMemo, clearEncryptedAutosaveTimer, clearPlainAutosaveTimer]);
 
   // 「ロック」ボタン（暗号化メモを開封中のみ表示）: dirty なら自動保存してからセッション鍵を破棄し、
   // レンダラ側の CodeMirror ドキュメント/Undo 履歴も破棄する（厳格な履歴破棄, DESIGN §2.9）。
@@ -804,6 +1018,9 @@ export function App() {
       const res = await ipc.readMemo({ tabId, memoName });
       if (!res.ok) {
         clearEncryptedAutosaveTimer();
+        clearPlainAutosaveTimer();
+        clearAutoRenameTimer();
+        autoRenameBaselineRef.current = null;
         setOpenMemo(null);
         setContentLF('');
         setDirty(false);
@@ -813,13 +1030,21 @@ export function App() {
         return;
       }
       if (newEncrypted) {
+        // 暗号化された（AutoReName 対象外へ移行, DESIGN §2.2/§2.9）。保留中の平文自動保存/
+        // AutoReName タイマーは実行時ガード（om.encrypted チェック）で安全に無視されるが、
+        // 明示的に解除しておく（M7, developer 判断）。
+        clearPlainAutosaveTimer();
+        clearAutoRenameTimer();
+        autoRenameBaselineRef.current = null;
         setOpenMemo((prev) => (prev ? { ...prev, encrypted: true, lastKnownHash: res.value.hash } : prev));
       } else {
+        // 暗号化解除（平文へ復帰）。AutoReName の判定基準を復帰後の本文へ引き直す（M7）。
+        autoRenameBaselineRef.current = computeFirstNonEmptyLine(res.value.contentLF);
         setOpenMemo(createOpenMemoState(tabId, memoName, res.value));
         setContentLF(res.value.contentLF);
       }
     },
-    [openMemo, reportActiveMemo, clearEncryptedAutosaveTimer]
+    [openMemo, reportActiveMemo, clearEncryptedAutosaveTimer, clearPlainAutosaveTimer, clearAutoRenameTimer]
   );
 
   const handleCryptoDialogSubmit = useCallback(
@@ -1085,6 +1310,9 @@ export function App() {
               setStatusMessage('削除しました。');
               if (openMemo && memoNames.includes(openMemo.memoName)) {
                 clearEncryptedAutosaveTimer();
+                clearPlainAutosaveTimer();
+                clearAutoRenameTimer();
+                autoRenameBaselineRef.current = null;
                 setOpenMemo(null);
                 setContentLF('');
                 setDirty(false);
@@ -1102,7 +1330,7 @@ export function App() {
         }
       });
     },
-    [selectedTabId, openMemo, refreshTree, reportActiveMemo, clearEncryptedAutosaveTimer]
+    [selectedTabId, openMemo, refreshTree, reportActiveMemo, clearEncryptedAutosaveTimer, clearPlainAutosaveTimer, clearAutoRenameTimer]
   );
 
   const handleTrashFallbackConfirm = useCallback(() => {
@@ -1115,6 +1343,9 @@ export function App() {
         setStatusMessage('直接削除しました。');
         if (openMemo && payload.memoNames.includes(openMemo.memoName)) {
           clearEncryptedAutosaveTimer();
+          clearPlainAutosaveTimer();
+          clearAutoRenameTimer();
+          autoRenameBaselineRef.current = null;
           setOpenMemo(null);
           setContentLF('');
           setDirty(false);
@@ -1127,7 +1358,7 @@ export function App() {
       }
       if (selectedTabId === payload.tabId) await refreshTree(payload.tabId);
     })();
-  }, [trashFallback, selectedTabId, openMemo, refreshTree, reportActiveMemo, clearEncryptedAutosaveTimer]);
+  }, [trashFallback, selectedTabId, openMemo, refreshTree, reportActiveMemo, clearEncryptedAutosaveTimer, clearPlainAutosaveTimer, clearAutoRenameTimer]);
 
   // --- タブ操作（PLAN §2.1） ---
 
@@ -1225,6 +1456,9 @@ export function App() {
               setStatusMessage(deleteFolder ? 'タブとフォルダを削除しました。' : 'タブの登録を解除しました。');
               if (selectedTabId === tabId) {
                 clearEncryptedAutosaveTimer();
+                clearPlainAutosaveTimer();
+                clearAutoRenameTimer();
+                autoRenameBaselineRef.current = null;
                 setSelectedTabId(null);
                 setTree([]);
                 setOpenMemo(null);
@@ -1242,7 +1476,7 @@ export function App() {
         }
       });
     },
-    [tabs, selectedTabId, refreshTabs, reportActiveMemo, clearEncryptedAutosaveTimer]
+    [tabs, selectedTabId, refreshTabs, reportActiveMemo, clearEncryptedAutosaveTimer, clearPlainAutosaveTimer, clearAutoRenameTimer]
   );
 
   const handleReorderTabs = useCallback(
@@ -1327,6 +1561,38 @@ export function App() {
     },
     []
   );
+
+  // グローバルショートカット（M7, AppSettings.shortcuts / shared/shortcuts.ts。CodeMirror 内蔵の
+  // ショートカット=保存 Ctrl+S・検索 Ctrl+F 等はエディタ自身のキーマップが処理するため対象外、
+  // shortcuts.ts 冒頭コメント参照）。設定変更を都度反映できるよう `shortcuts` state を deps に含める。
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent): void => {
+      if (matchesShortcut(e, shortcuts.globalSearch ?? DEFAULT_SHORTCUTS.globalSearch)) {
+        e.preventDefault();
+        setShowSearchPanel(true);
+        return;
+      }
+      if (matchesShortcut(e, shortcuts.toggleTheme ?? DEFAULT_SHORTCUTS.toggleTheme)) {
+        e.preventDefault();
+        handleToggleTheme();
+        return;
+      }
+      if (matchesShortcut(e, shortcuts.openSettings ?? DEFAULT_SHORTCUTS.openSettings)) {
+        e.preventDefault();
+        setShowSettingsDialog(true);
+        return;
+      }
+      if (matchesShortcut(e, shortcuts.lockCurrentMemo ?? DEFAULT_SHORTCUTS.lockCurrentMemo)) {
+        const om = openMemoRef.current;
+        if (om && om.encrypted) {
+          e.preventDefault();
+          void handleLockMemo();
+        }
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [shortcuts, handleToggleTheme, handleLockMemo]);
 
   return (
     <div className="app">
@@ -1418,21 +1684,14 @@ export function App() {
           )}
         </div>
       </div>
-      <div className="app__statusbar">
-        <span>Theme: {theme}</span>
-        <span>
-          {appInfo ? `v${appInfo.appVersion} / schema ${appInfo.schemaVersion}` : 'app:getInfo 応答待ち…'}
-        </span>
-        {editorStats && (
-          <span className="app__statusbar-editor-stats">
-            {editorStats.charCount} 文字 / {editorStats.lineCount} 行 / 行 {editorStats.cursorLine}, 列{' '}
-            {editorStats.cursorColumn}
-            {editorStats.selectedCharCount > 0 ? ` (選択 ${editorStats.selectedCharCount} 文字)` : ''} / フォント{' '}
-            {editorSettings.fontSize}px
-          </span>
-        )}
-        {statusMessage && <span className="app__statusbar-message">{statusMessage}</span>}
-      </div>
+      <StatusBar
+        theme={theme}
+        appInfo={appInfo}
+        editorStats={editorStats}
+        fontSize={editorSettings.fontSize}
+        statusMessage={statusMessage}
+        onOpenSettings={() => setShowSettingsDialog(true)}
+      />
 
       {nameDialog && (
         <NameInputDialog
@@ -1486,6 +1745,23 @@ export function App() {
           currentTabId={selectedTabId}
           onClose={() => setShowSearchPanel(false)}
           onJump={(hit) => void handleJumpToHit(hit)}
+        />
+      )}
+      {showSettingsDialog && (
+        <SettingsDialog
+          theme={theme}
+          onToggleTheme={handleToggleTheme}
+          editorSettings={editorSettings}
+          onChangeEditorSettings={handleChangeEditorSettingsFromDialog}
+          linkSettings={linkSettings}
+          onChangeLinks={handleChangeLinksFromDialog}
+          autosave={autosaveSettings}
+          onChangeAutosave={handleChangeAutosaveFromDialog}
+          eolPolicy={eolPolicy}
+          onChangeEolPolicy={handleChangeEolPolicyFromDialog}
+          shortcuts={shortcuts}
+          onChangeShortcut={handleChangeShortcutFromDialog}
+          onClose={() => setShowSettingsDialog(false)}
         />
       )}
     </div>
