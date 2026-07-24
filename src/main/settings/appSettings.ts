@@ -6,8 +6,10 @@ import { app } from 'electron';
 import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
 import { BACKUP_SUFFIX, SCHEMA_VERSION } from '@shared/constants';
+import { DEFAULT_SHORTCUTS } from '@shared/shortcuts';
 import type { AppSettings, AppSettingsPatch } from '@shared/models';
 import { atomicWrite } from '../fs/atomicWrite';
+import { migrateSchema } from '../util/migrate';
 
 const SETTINGS_FILE_NAME = 'app-settings.json';
 
@@ -29,8 +31,9 @@ export function defaultAppSettings(): AppSettings {
     links: { openTrigger: 'ctrlClick', confirmBeforeOpen: true },
     encoding: { defaultSave: 'utf-8' },
     eol: { policy: 'preserve' },
-    shortcuts: {},
-    sessionRememberPassword: true
+    // 既定ショートカット（M7, DESIGN §2.7「既定は原作を参考に妥当なものを整備。ユーザー設定可能な
+    // 構造」）。`shared/shortcuts.ts` に定義を集約する。
+    shortcuts: { ...DEFAULT_SHORTCUTS }
   };
 }
 
@@ -44,7 +47,15 @@ async function tryReadSettings(path: string): Promise<AppSettings | null> {
   try {
     const raw = await fs.readFile(path, 'utf-8');
     const parsed: unknown = JSON.parse(raw);
-    return isValidAppSettings(parsed) ? parsed : null;
+    if (!isValidAppSettings(parsed)) return null;
+    // マイグレーション土台（M7, PLAN §7）: v1 のみの現状は no-op だが、将来 schemaVersion を
+    // 引き上げた際にここへ変換ステップを追加するだけで済むようにする（docs/00-core-principles.md
+    // 経由では触れていない M7 固有の追加）。
+    const migrated = migrateSchema(parsed, []);
+    // 既定値とのディープマージで不足フィールドを補完する（レビュー指摘 M7-R1-01）。
+    // schemaVersion を上げずにフィールドを追加した場合（本 M7 の `shortcuts` 追加など）、
+    // 既存ファイルにキーが存在せず `undefined` のまま残ることを防ぐための後方互換処理。
+    return deepMerge(defaultAppSettings(), migrated as unknown as AppSettingsPatch);
   } catch {
     return null;
   }
@@ -123,8 +134,15 @@ export async function updateAppSettings(mutator: (draft: AppSettings) => void): 
 }
 
 function deepMerge<T>(base: T, patch: AppSettingsPatch | Partial<T>): T {
-  if (typeof base !== 'object' || base === null) return base;
-  const result: Record<string, unknown> = { ...(base as Record<string, unknown>) };
+  // `patch` がオブジェクトでない場合はそのまま採用（値の上書き）。
+  if (patch === null || typeof patch !== 'object' || Array.isArray(patch)) {
+    return patch as unknown as T;
+  }
+  // `base` が undefined/null/非オブジェクトでも、`patch` オブジェクトを起点にマージを続ける
+  // （レビュー指摘 M7-R1-01(b)）。従来は `base` 未定義時に patch 全体を捨てて `base` を
+  // そのまま返してしまい、設定の部分更新が握りつぶされるバグがあった。
+  const result: Record<string, unknown> =
+    typeof base === 'object' && base !== null && !Array.isArray(base) ? { ...(base as Record<string, unknown>) } : {};
   for (const [key, value] of Object.entries(patch as Record<string, unknown>)) {
     if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
       result[key] = deepMerge(result[key], value as AppSettingsPatch);
