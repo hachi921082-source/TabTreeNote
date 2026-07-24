@@ -437,6 +437,101 @@
   cursor: pointer;
 }
 
+/* --- 設定画面（components/Settings/SettingsDialog.tsx, M7） --- */
+
+.settings-dialog {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  max-height: 70vh;
+  overflow-y: auto;
+  min-width: 360px;
+}
+
+.settings-dialog__section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.settings-dialog__section-title {
+  margin: 0 0 4px;
+  font-size: 13px;
+  color: var(--color-text);
+  border-bottom: 1px solid var(--color-border);
+  padding-bottom: 4px;
+}
+
+.settings-dialog__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12px;
+  color: var(--color-text-muted);
+}
+
+.settings-dialog__row select,
+.settings-dialog__row input[type='number'],
+.settings-dialog__row input[type='text'] {
+  border: 1px solid var(--color-border);
+  background-color: var(--color-bg);
+  color: var(--color-text);
+  border-radius: 4px;
+  padding: 4px 6px;
+  font-size: 12px;
+  min-width: 140px;
+}
+
+.settings-dialog__row button {
+  border: 1px solid var(--color-border);
+  background-color: var(--color-bg);
+  color: var(--color-text);
+  border-radius: 4px;
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.settings-dialog__hint {
+  margin: 0;
+  font-size: 11px;
+  color: var(--color-text-muted);
+}
+
+.settings-dialog__shortcut-input {
+  text-align: center;
+}
+
+.settings-dialog__actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.settings-dialog__actions button {
+  border: 1px solid var(--color-border);
+  background-color: var(--color-bg);
+  color: var(--color-text);
+  border-radius: 4px;
+  padding: 5px 12px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.app__statusbar-settings-button {
+  border: 1px solid var(--color-border);
+  background-color: var(--color-bg);
+  color: var(--color-text);
+  border-radius: 4px;
+  padding: 1px 8px;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.app__statusbar-settings-button:hover {
+  border-color: var(--color-accent);
+}
+
 /* --- 全文検索パネル（components/Search/SearchPanel.tsx, M3-②） --- */
 
 .search-panel-overlay {
