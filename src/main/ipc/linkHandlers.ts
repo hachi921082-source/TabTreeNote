@@ -17,7 +17,7 @@ import type { LinkOpenExternalArgs, LinkResolveMemoArgs, LinkResolveMemoResult }
 import type { Result } from '@shared/models';
 import { err, ok, wrapHandler } from '../util/result';
 import { findMemoFile } from '../fs/memoFileService';
-import { normalizeForCompare, validateName } from '../fs/pathSafety';
+import { normalizeForCompare, validateExistingName } from '../fs/pathSafety';
 import { getTabFolderPath, listTabs } from '../fs/tabService';
 
 /**
@@ -186,10 +186,11 @@ async function resolveMemoLink(args: LinkResolveMemoArgs): Promise<Result<LinkRe
     return ok({ tabId: targetTabId });
   }
 
-  // メモ名はサニタイズ規則上 `/`/`\` 等を含み得ない（validateName, 00-core-principles.md §11）。
-  // 万一含む場合（悪意ある/破損した本文由来）は解決不能扱いとし、フォルダ閉じ込め外の
+  // リンク先は既存メモの参照であり新規命名ではないため、前後空白等を理由に拒否しない
+  // （ユーザー報告バグ: 前後空白付きの既存メモ名へのリンクが解決できなかった）。
+  // `/`/`\` 等パス区切りに使われ得る文字のみ引き続き拒否し、フォルダ閉じ込め外の
   // パスへ `findMemoFile` の join が到達すること自体を未然に防ぐ（多層防御）。
-  if (!validateName(memoName).ok) return ok(null);
+  if (!validateExistingName(memoName).ok) return ok(null);
 
   const found = await findMemoFile(folder.value, memoName);
   if (!found) return ok(null); // 実ファイル未検出 → 解決不能（エラーダイアログは出さない）
