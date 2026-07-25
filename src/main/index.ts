@@ -151,12 +151,6 @@ function clampWindowBounds(bounds: WindowBounds): WindowBounds {
  */
 const startedHidden = process.argv.includes('--hidden');
 
-// ウィンドウ左上（タイトルバー/タスクバー）のアイコン（ユーザー要望）。ビルド後の実行ファイル
-// アイコン（electron-builder.yml の win.icon, icon02.png）とは別素材を使う指定のため、
-// BrowserWindow 個別に指定する。`files` にプロジェクト直下の icon01.png を含めているため、
-// `app.getAppPath()`（開発時=プロジェクト直下、パッケージ後=app.asar 直下）から解決できる。
-const WINDOW_ICON_PATH = join(app.getAppPath(), 'icon01.png');
-
 function createMainWindow(windowState: WindowBounds, startHidden: boolean): BrowserWindow {
   const { x, y, width, height, maximized } = clampWindowBounds(windowState);
   const win = new BrowserWindow({
@@ -166,7 +160,6 @@ function createMainWindow(windowState: WindowBounds, startHidden: boolean): Brow
     height,
     show: false,
     autoHideMenuBar: true,
-    icon: WINDOW_ICON_PATH,
     webPreferences: {
       // セキュリティ不変条件（docs/00-core-principles.md §10）: 必ず設定すること。
       contextIsolation: true,
