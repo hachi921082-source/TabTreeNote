@@ -3,6 +3,11 @@
    将来的にユーザー定義テーマ（JSON/CSS変数）へ拡張可能なよう、配色は CSS カスタムプロパティに集約する。
    [data-theme] 属性は App 側で document.documentElement に設定する。 */
 
+:root {
+  /* UI（エディタ本文を除く）文字サイズ倍率。App.tsx が設定値に応じて上書きする（設定画面「外観」）。 */
+  --ui-font-scale: 1;
+}
+
 :root,
 [data-theme='light'] {
   --color-bg: #ffffff;
@@ -14,6 +19,9 @@
   --color-accent: #2f6fed;
   --color-accent-soft: #e3ecfd;
   --color-splitter-hover: #2f6fed;
+  /* エディタのテキスト選択範囲専用色（--color-accent-soft とは別。カーソル行ハイライトと
+     同色だと選択範囲が全く見分けられなくなるため分離した, ユーザー指摘）。 */
+  --color-selection: #bcd6ff;
 }
 
 [data-theme='dark'] {
@@ -26,6 +34,7 @@
   --color-accent: #5b9bff;
   --color-accent-soft: #223554;
   --color-splitter-hover: #5b9bff;
+  --color-selection: #3a5a8c;
 }
 
 * {
@@ -47,5 +56,5 @@ body {
     system-ui,
     -apple-system,
     sans-serif;
-  font-size: 14px;
+  font-size: calc(14px * var(--ui-font-scale, 1));
 }
