@@ -19,6 +19,7 @@ export interface FlatTreeRow {
   hasChildren: boolean;
   depth: number;
   label?: Label;
+  locked?: boolean;
 }
 
 /** 開閉状態（expanded）を反映して、現在表示すべき行だけをフラットな配列にする（仮想化の入力）。 */
@@ -30,7 +31,8 @@ export function flattenVisibleTree(nodes: readonly TreeNode[], depth = 0, out: F
       expanded: node.expanded,
       hasChildren: node.children.length > 0,
       depth,
-      label: node.label
+      label: node.label,
+      locked: node.locked
     });
     if (node.expanded && node.children.length > 0) {
       flattenVisibleTree(node.children, depth + 1, out);
@@ -46,8 +48,19 @@ export function toMetaTree(nodes: readonly TreeNode[]): MetaTreeNode[] {
     expanded: n.expanded,
     label: n.label,
     editor: n.editor,
+    locked: n.locked,
     children: toMetaTree(n.children)
   }));
+}
+
+/** ツリー中から指定 memoName のノードを深さ優先で探す（編集ロック判定等に使う）。 */
+export function findTreeNode(nodes: readonly TreeNode[], memoName: string): TreeNode | null {
+  for (const n of nodes) {
+    if (n.memoName === memoName) return n;
+    const found = findTreeNode(n.children, memoName);
+    if (found) return found;
+  }
+  return null;
 }
 
 /** ツリー中の指定 memoName のノードだけを `updater` で書き換えた新しい TreeNode[] を返す（不変更新）。 */
