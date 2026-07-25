@@ -114,6 +114,7 @@ interface MetaTreeNode {
   expanded: boolean;
   label?: Label;
   editor?: MemoEditorSettings;
+  locked?: boolean;              // 編集ロック（本文編集のみ禁止。リネーム/削除等は対象外）
   children: MetaTreeNode[];
 }
 
@@ -147,6 +148,8 @@ interface AppSettings {
   tabs: { id: string; name: string; folderPath: string }[];  // 並び順は配列順が正本。order フィールドは持たない（Fix7）
   window: { x: number; y: number; width: number; height: number; maximized: boolean; treeWidth: number; treeSide: 'left' | 'right' };
   theme: 'light' | 'dark';
+  uiFontScale: number;  // UI（エディタ本文を除く）の文字サイズ倍率。既定 1
+  lastOpened: { tabId: string; memoName: string } | null;  // 起動時に自動で開くメモ（前回開いていたメモの復元）
   editorDefaults: { wrap: 'none' | 'chars' | 'window'; tabWidth: number; softTab: boolean; showLineNumbers: boolean; fontSize: number };
   autosave: { plainDebounceMs: number; encryptedDebounceMs: number };
   links: { openTrigger: 'ctrlClick' | 'singleClick' | 'doubleClick'; confirmBeforeOpen: boolean };
