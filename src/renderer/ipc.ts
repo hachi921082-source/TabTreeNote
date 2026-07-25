@@ -11,6 +11,8 @@ import type {
   CryptoOpenArgs,
   CryptoOpenResult,
   CryptoSaveEncryptedArgs,
+  DialogPickFolderArgs,
+  EditorMenuCommandPayload,
   EditorReportActiveArgs,
   ExternalChangePayload,
   IndexUpdatedPayload,
@@ -20,23 +22,30 @@ import type {
   MemoCreateArgs,
   MemoDeleteArgs,
   MemoDuplicateArgs,
+  MemoGetPropertiesArgs,
   MemoMoveArgs,
+  MemoProperties,
   MemoReadArgs,
   MemoReadWithEncodingArgs,
   MemoRenameArgs,
+  MemoRevealInFolderArgs,
   MemoSaveArgs,
   MetaRecoveredPayload,
   OpErrorPayload,
   SearchGlobalArgs,
   SearchHistoryAddArgs,
+  ShowPropertiesPayload,
   TabCreateArgs,
+  TabOpenFolderArgs,
   TabOpenTreeArgs,
   TabRegisterArgs,
   TabRemoveArgs,
   TabRenameArgs,
   TabReorderArgs,
   TrashFallbackPayload,
-  TreeUpdateStructureArgs
+  TreeUpdateStructureArgs,
+  WindowSetAlwaysOnTopArgs,
+  WindowSetOpenAtLoginArgs
 } from '@shared/ipc-contract';
 import type {
   AppSettings,
@@ -52,6 +61,10 @@ import type {
 
 export const ipc = {
   getAppInfo: (): Promise<AppInfo> => window.api.app.getInfo(),
+  setAlwaysOnTop: (args: WindowSetAlwaysOnTopArgs): Promise<Result<void>> => window.api.window.setAlwaysOnTop(args),
+  setOpenAtLogin: (args: WindowSetOpenAtLoginArgs): Promise<Result<void>> => window.api.window.setOpenAtLogin(args),
+  getOpenAtLogin: (): Promise<Result<boolean>> => window.api.window.getOpenAtLogin(),
+  pickFolder: (args?: DialogPickFolderArgs): Promise<Result<string | null>> => window.api.dialog.pickFolder(args),
 
   listTabs: (): Promise<Result<TabInfo[]>> => window.api.tab.list(),
   registerTab: (args: TabRegisterArgs): Promise<Result<TabInfo>> => window.api.tab.register(args),
@@ -60,6 +73,7 @@ export const ipc = {
   renameTab: (args: TabRenameArgs): Promise<Result<void>> => window.api.tab.rename(args),
   removeTab: (args: TabRemoveArgs): Promise<Result<void>> => window.api.tab.remove(args),
   reorderTabs: (args: TabReorderArgs): Promise<Result<void>> => window.api.tab.reorder(args),
+  openTabFolder: (args: TabOpenFolderArgs): Promise<Result<void>> => window.api.tab.openFolder(args),
 
   readMemo: (args: MemoReadArgs): Promise<Result<MemoReadResult>> => window.api.memo.read(args),
   readMemoWithEncoding: (args: MemoReadWithEncodingArgs): Promise<Result<MemoReadResult>> =>
@@ -70,6 +84,8 @@ export const ipc = {
   deleteMemo: (args: MemoDeleteArgs): Promise<Result<void>> => window.api.memo.delete(args),
   duplicateMemo: (args: MemoDuplicateArgs): Promise<Result<MemoInfo>> => window.api.memo.duplicate(args),
   moveMemo: (args: MemoMoveArgs): Promise<Result<void>> => window.api.memo.move(args),
+  getMemoProperties: (args: MemoGetPropertiesArgs): Promise<Result<MemoProperties>> => window.api.memo.getProperties(args),
+  revealMemoInFolder: (args: MemoRevealInFolderArgs): Promise<Result<void>> => window.api.memo.revealInFolder(args),
 
   updateTreeStructure: (args: TreeUpdateStructureArgs): Promise<Result<void>> => window.api.tree.updateStructure(args),
 
@@ -104,5 +120,9 @@ export const ipc = {
   onExternalChange: (handler: (payload: ExternalChangePayload) => void): (() => void) =>
     window.api.events.onExternalChange(handler),
   onConflict: (handler: (payload: ConflictPayload) => void): (() => void) => window.api.events.onConflict(handler),
-  onOpError: (handler: (payload: OpErrorPayload) => void): (() => void) => window.api.events.onOpError(handler)
+  onOpError: (handler: (payload: OpErrorPayload) => void): (() => void) => window.api.events.onOpError(handler),
+  onShowProperties: (handler: (payload: ShowPropertiesPayload) => void): (() => void) =>
+    window.api.events.onShowProperties(handler),
+  onEditorMenuCommand: (handler: (payload: EditorMenuCommandPayload) => void): (() => void) =>
+    window.api.events.onEditorMenuCommand(handler)
 };
