@@ -16,6 +16,9 @@ import { Modal } from '../dialogs/Modal';
 export interface SettingsDialogProps {
   theme: AppSettings['theme'];
   onToggleTheme: () => void;
+  /** UI（タブ・ツリー・ボタン・設定画面等、エディタ本文を除く）の文字サイズ倍率。 */
+  uiFontScale: AppSettings['uiFontScale'];
+  onChangeUiFontScale: (next: number) => void;
   editorSettings: EditorSettings;
   onChangeEditorSettings: (patch: Partial<EditorSettings>) => void;
   linkSettings: AppSettings['links'];
@@ -26,6 +29,9 @@ export interface SettingsDialogProps {
   onChangeEolPolicy: (policy: AppSettings['eol']['policy']) => void;
   shortcuts: Record<string, string>;
   onChangeShortcut: (action: ShortcutAction, value: string) => void;
+  /** Windowsログイン時の自動起動（トレイに隠れた状態で常駐, ユーザー要望）。状態はOS側が真実源。 */
+  openAtLogin: boolean;
+  onChangeOpenAtLogin: (enabled: boolean) => void;
   onClose: () => void;
 }
 
@@ -59,6 +65,8 @@ function ShortcutInput({ value, onChange }: { value: string; onChange: (value: s
 export function SettingsDialog({
   theme,
   onToggleTheme,
+  uiFontScale,
+  onChangeUiFontScale,
   editorSettings,
   onChangeEditorSettings,
   linkSettings,
@@ -69,11 +77,25 @@ export function SettingsDialog({
   onChangeEolPolicy,
   shortcuts,
   onChangeShortcut,
+  openAtLogin,
+  onChangeOpenAtLogin,
   onClose
 }: SettingsDialogProps) {
   return (
     <Modal title="設定" onClose={onClose}>
       <div className="settings-dialog">
+        <section className="settings-dialog__section">
+          <h3 className="settings-dialog__section-title">起動</h3>
+          <label className="settings-dialog__row">
+            <span>Windowsログイン時に自動起動する（トレイに常駐）</span>
+            <input
+              type="checkbox"
+              checked={openAtLogin}
+              onChange={(e) => onChangeOpenAtLogin(e.target.checked)}
+            />
+          </label>
+        </section>
+
         <section className="settings-dialog__section">
           <h3 className="settings-dialog__section-title">外観</h3>
           <label className="settings-dialog__row">
@@ -81,6 +103,25 @@ export function SettingsDialog({
             <button type="button" onClick={onToggleTheme}>
               {theme === 'light' ? 'Light（クリックで Dark へ）' : 'Dark（クリックで Light へ）'}
             </button>
+          </label>
+          <label className="settings-dialog__row">
+            <span>UI文字サイズ（タブ・ツリー・ボタン等。エディタ本文は別設定）</span>
+            <span>
+              <input
+                type="number"
+                min={80}
+                max={150}
+                step={5}
+                value={Math.round(uiFontScale * 100)}
+                onChange={(e) => {
+                  const percent = Number(e.target.value);
+                  if (Number.isFinite(percent) && percent >= 80 && percent <= 150) {
+                    onChangeUiFontScale(percent / 100);
+                  }
+                }}
+              />{' '}
+              %
+            </span>
           </label>
         </section>
 
@@ -199,7 +240,7 @@ export function SettingsDialog({
         </section>
 
         <section className="settings-dialog__section">
-          <h3 className="settings-dialog__section-title">リンク（DESIGN §2.8）</h3>
+          <h3 className="settings-dialog__section-title">リンク</h3>
           <label className="settings-dialog__row">
             <span>クリック操作</span>
             <select
@@ -222,7 +263,7 @@ export function SettingsDialog({
         </section>
 
         <section className="settings-dialog__section">
-          <h3 className="settings-dialog__section-title">ショートカット（DESIGN §2.7）</h3>
+          <h3 className="settings-dialog__section-title">ショートカット</h3>
           <p className="settings-dialog__hint">
             入力欄をクリックして新しいキーの組合せを押すと記録されます。CodeMirror
             エディタ内蔵のショートカット（保存 Ctrl+S、検索 Ctrl+F 等）は対象外です。
