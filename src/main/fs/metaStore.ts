@@ -74,6 +74,7 @@ function reconcile(metaTree: MetaTreeNode[], scanned: ScannedMemo[]): TreeNode[]
           expanded: node.expanded,
           label: node.label,
           editor: node.editor,
+          locked: node.locked,
           children: reconciledChildren
         });
       } else {
