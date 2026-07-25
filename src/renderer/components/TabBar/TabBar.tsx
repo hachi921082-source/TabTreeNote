@@ -17,12 +17,17 @@ export interface TabBarProps {
   onRequestCreate: () => void;
   onRequestRename: (tabId: string) => void;
   onRequestRemove: (tabId: string, deleteFolder: boolean) => void;
+  /** 登録フォルダをエクスプローラで開く（ユーザー要望）。 */
+  onRequestOpenFolder: (tabId: string) => void;
   onDropMemo: (destTabId: string, payload: MemoDragPayload, copy: boolean) => void;
   onDropExternalFolder: (folderPath: string) => void;
   theme: 'light' | 'dark';
   onToggleTheme: () => void;
   /** 全文検索パネルを開く（M3-②, docs/milestones/M3-search.md）。 */
   onRequestSearch: () => void;
+  /** 常時最前面表示の状態（ユーザー要望）。 */
+  alwaysOnTop: boolean;
+  onToggleAlwaysOnTop: () => void;
 }
 
 interface TabContextMenuState {
@@ -40,11 +45,14 @@ export function TabBar({
   onRequestCreate,
   onRequestRename,
   onRequestRemove,
+  onRequestOpenFolder,
   onDropMemo,
   onDropExternalFolder,
   theme,
   onToggleTheme,
-  onRequestSearch
+  onRequestSearch,
+  alwaysOnTop,
+  onToggleAlwaysOnTop
 }: TabBarProps) {
   const [draggingTabId, setDraggingTabId] = useState<string | null>(null);
   const [dropSide, setDropSide] = useState<{ tabId: string; side: 'left' | 'right' } | null>(null);
@@ -116,6 +124,7 @@ export function TabBar({
 
   const buildContextMenuItems = (tabId: string): ContextMenuItem[] => [
     { label: '名前変更', onSelect: () => onRequestRename(tabId) },
+    { label: 'タブの場所を開く', onSelect: () => onRequestOpenFolder(tabId) },
     {
       label: 'タブを削除（登録解除のみ・フォルダは残す）',
       danger: true,
@@ -168,6 +177,14 @@ export function TabBar({
           ＋
         </button>
       </div>
+      <button
+        type="button"
+        className={`app__theme-toggle${alwaysOnTop ? ' app__theme-toggle--active' : ''}`}
+        onClick={onToggleAlwaysOnTop}
+        title={alwaysOnTop ? '最前面固定を解除' : '最前面に固定'}
+      >
+        📌
+      </button>
       <button type="button" className="app__theme-toggle" onClick={onRequestSearch} title="全文検索（Ctrl+Shift+F）">
         🔍 検索
       </button>
