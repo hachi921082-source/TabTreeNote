@@ -26,9 +26,12 @@ export function defaultAppSettings(): AppSettings {
     tabs: [],
     window: { x: 100, y: 100, width: 1200, height: 800, maximized: false, treeWidth: 260, treeSide: 'left' },
     theme: 'light',
+    uiFontScale: 1,
+    lastOpened: null,
     editorDefaults: { wrap: 'window', tabWidth: 4, softTab: true, showLineNumbers: true, fontSize: 14 },
     autosave: { plainDebounceMs: 1500, encryptedDebounceMs: 5000 },
-    links: { openTrigger: 'ctrlClick', confirmBeforeOpen: true },
+    // ユーザー要望により既定を変更: 確認なしの単純クリックで開く（2026-07-24）。
+    links: { openTrigger: 'singleClick', confirmBeforeOpen: false },
     encoding: { defaultSave: 'utf-8' },
     eol: { policy: 'preserve' },
     // 既定ショートカット（M7, DESIGN §2.7「既定は原作を参考に妥当なものを整備。ユーザー設定可能な
