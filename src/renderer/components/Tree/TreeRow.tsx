@@ -1,14 +1,17 @@
 // src/renderer/components/Tree/TreeRow.tsx
 // 仮想化ツリーの1行分の描画（開閉トライアングル・暗号アイコン・ラベル色・選択/ドラッグ状態）。
 import type { DragEvent as ReactDragEvent, MouseEvent as ReactMouseEvent } from 'react';
+import { FileIcon } from './FileIcon';
 import type { DropZone, FlatTreeRow } from './treeView';
 import { computeDropZone } from './treeView';
 
-export const ROW_HEIGHT = 26;
+/** 既定の行高（px）。実際の描画高は `uiFontScale` を乗じた値を Tree.tsx が計算して渡す。 */
+export const BASE_ROW_HEIGHT = 26;
 
 interface TreeRowProps {
   row: FlatTreeRow;
   top: number;
+  rowHeight: number;
   selected: boolean;
   isOpenMemo: boolean;
   isDragging: boolean;
@@ -26,6 +29,7 @@ interface TreeRowProps {
 export function TreeRow({
   row,
   top,
+  rowHeight,
   selected,
   isOpenMemo,
   isDragging,
@@ -60,6 +64,7 @@ export function TreeRow({
     selected ? 'tree-row--selected' : '',
     isOpenMemo ? 'tree-row--open' : '',
     isDragging ? 'tree-row--dragging' : '',
+    row.locked ? 'tree-row--locked' : '',
     dropZone ? `tree-row--drop-${dropZone}` : ''
   ]
     .filter(Boolean)
@@ -68,7 +73,7 @@ export function TreeRow({
   return (
     <div
       className={classNames}
-      style={{ position: 'absolute', top, left: 0, right: 0, height: ROW_HEIGHT, paddingLeft: 6 + row.depth * 16 }}
+      style={{ position: 'absolute', top, left: 0, right: 0, height: rowHeight, paddingLeft: 6 + row.depth * 16 }}
       draggable
       onClick={onClick}
       onContextMenu={onContextMenu}
@@ -87,9 +92,15 @@ export function TreeRow({
       >
         {row.hasChildren ? (row.expanded ? '▾' : '▸') : ''}
       </span>
-      {labelColor && <span className="tree-row__label-dot" style={{ backgroundColor: labelColor }} />}
-      <span className="tree-row__icon">{row.encrypted ? '🔒' : '📄'}</span>
+      <span className="tree-row__icon">
+        <FileIcon color={labelColor ?? 'var(--color-text-muted)'} encrypted={row.encrypted} />
+      </span>
       <span className="tree-row__name">{row.memoName}</span>
+      {row.locked && (
+        <span className="tree-row__lock-icon" title="編集ロック中">
+          🔏
+        </span>
+      )}
     </div>
   );
 }
