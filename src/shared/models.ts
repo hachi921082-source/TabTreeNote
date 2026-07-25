@@ -64,6 +64,8 @@ export interface MetaTreeNode {
   expanded: boolean;
   label?: Label;
   editor?: MemoEditorSettings;
+  /** 編集ロック（true の間、本文の編集を禁止する。リネーム/削除等ファイル操作は対象外, developer 判断）。 */
+  locked?: boolean;
   children: MetaTreeNode[];
 }
 
@@ -77,6 +79,7 @@ export interface TreeNode {
   readonly expanded: boolean;
   readonly label?: Label;
   readonly editor?: MemoEditorSettings;
+  readonly locked?: boolean;
   readonly children: readonly TreeNode[];
 }
 
@@ -114,6 +117,10 @@ export interface AppSettings {
     treeSide: 'left' | 'right';
   };
   theme: 'light' | 'dark';
+  /** UI（タブ・ツリー・ボタン・設定画面等、エディタ本文を除く）の文字サイズ倍率。既定 1（100%）。 */
+  uiFontScale: number;
+  /** 起動時に自動で開くメモ（ユーザー要望。前回開いていたメモを復元）。未使用/存在しない場合は null。 */
+  lastOpened: { tabId: string; memoName: string } | null;
   editorDefaults: {
     wrap: 'none' | 'chars' | 'window';
     tabWidth: number;
