@@ -12,7 +12,7 @@
 
 .app__tabbar {
   flex: 0 0 auto;
-  height: 36px;
+  min-height: calc(36px * var(--ui-font-scale, 1));
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -75,6 +75,11 @@
   border-color: var(--color-accent);
 }
 
+.app__theme-toggle--active {
+  border-color: var(--color-accent);
+  background-color: var(--color-accent-soft, var(--color-bg-elevated));
+}
+
 .app__body {
   flex: 1 1 auto;
   display: flex;
@@ -98,7 +103,7 @@
 .app__tree-placeholder {
   margin: 16px;
   color: var(--color-text-muted);
-  font-size: 12px;
+  font-size: calc(12px * var(--ui-font-scale, 1));
 }
 
 /* --- ツリー本体（Tree.tsx / TreeRow.tsx, M2） --- */
@@ -111,33 +116,39 @@
   min-height: 0;
 }
 
-.tree-toolbar {
-  flex: 0 0 auto;
-  display: flex;
-  gap: 4px;
-  padding: 6px 8px;
-  border-bottom: 1px solid var(--color-border);
-}
-
-.tree-toolbar button {
-  border: 1px solid var(--color-border);
-  background-color: var(--color-bg);
-  color: var(--color-text);
-  border-radius: 4px;
-  padding: 3px 8px;
-  font-size: 11px;
-  cursor: pointer;
-}
-
-.tree-toolbar button:hover {
-  border-color: var(--color-accent);
-}
-
 .tree-scroll {
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
   position: relative;
+}
+
+.tree-scroll:focus {
+  outline: none;
+}
+
+.tree-empty-state {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+}
+
+.tree-empty-state button {
+  pointer-events: auto;
+  border: 1px solid var(--color-border);
+  background-color: var(--color-bg);
+  color: var(--color-text);
+  border-radius: 4px;
+  padding: 6px 16px;
+  font-size: calc(12px * var(--ui-font-scale, 1));
+  cursor: pointer;
+}
+
+.tree-empty-state button:hover {
+  border-color: var(--color-accent);
 }
 
 .tree-spacer {
@@ -149,7 +160,7 @@
   display: flex;
   align-items: center;
   gap: 4px;
-  font-size: 13px;
+  font-size: calc(13px * var(--ui-font-scale, 1));
   color: var(--color-text);
   cursor: pointer;
   user-select: none;
@@ -190,7 +201,7 @@
 
 .tree-row__twisty {
   display: inline-flex;
-  width: 14px;
+  width: calc(14px * var(--ui-font-scale, 1));
   justify-content: center;
   color: var(--color-text-muted);
   flex: 0 0 auto;
@@ -200,21 +211,27 @@
   cursor: pointer;
 }
 
-.tree-row__label-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  flex: 0 0 auto;
-}
-
 .tree-row__icon {
   flex: 0 0 auto;
-  font-size: 11px;
+  display: inline-flex;
+  align-items: center;
+  font-size: calc(11px * var(--ui-font-scale, 1));
 }
 
 .tree-row__name {
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.tree-row__lock-icon {
+  flex: 0 0 auto;
+  font-size: calc(11px * var(--ui-font-scale, 1));
+  color: var(--color-text-muted);
+}
+
+.tree-row--locked .tree-row__name {
+  font-style: italic;
+  color: var(--color-text-muted);
 }
 
 /* --- 右クリックコンテキストメニュー（Tree/ContextMenu.tsx） --- */
@@ -239,7 +256,7 @@
   color: var(--color-text);
   padding: 6px 10px;
   border-radius: 4px;
-  font-size: 12px;
+  font-size: calc(12px * var(--ui-font-scale, 1));
   cursor: pointer;
 }
 
@@ -255,6 +272,32 @@
   margin-top: 4px;
   border-top: 1px solid var(--color-border);
   padding-top: 8px;
+}
+
+.context-menu__item-wrap {
+  position: relative;
+}
+
+.context-menu--submenu {
+  position: absolute;
+  left: 100%;
+  top: 0;
+}
+
+.context-menu__submenu-arrow {
+  float: right;
+  margin-left: 8px;
+  color: var(--color-text-muted);
+}
+
+.context-menu__swatch {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  margin-right: 6px;
+  border: 1px solid var(--color-border);
+  vertical-align: middle;
 }
 
 /* --- モーダル/ダイアログ（dialogs/Modal.tsx, NameInputDialog.tsx, ConfirmDialog.tsx） --- */
@@ -295,7 +338,7 @@
   border: none;
   background: none;
   color: var(--color-text-muted);
-  font-size: 16px;
+  font-size: calc(16px * var(--ui-font-scale, 1));
   cursor: pointer;
   line-height: 1;
 }
@@ -311,7 +354,7 @@
 }
 
 .name-dialog__label {
-  font-size: 12px;
+  font-size: calc(12px * var(--ui-font-scale, 1));
   color: var(--color-text-muted);
 }
 
@@ -321,13 +364,13 @@
   color: var(--color-text);
   border-radius: 4px;
   padding: 6px 8px;
-  font-size: 13px;
+  font-size: calc(13px * var(--ui-font-scale, 1));
 }
 
 .name-dialog__message {
   margin: 0;
   color: #e05a5a;
-  font-size: 12px;
+  font-size: calc(12px * var(--ui-font-scale, 1));
 }
 
 .name-dialog__suggestion {
@@ -337,7 +380,7 @@
   color: var(--color-accent);
   border-radius: 4px;
   padding: 4px 8px;
-  font-size: 12px;
+  font-size: calc(12px * var(--ui-font-scale, 1));
   cursor: pointer;
 }
 
@@ -356,13 +399,13 @@
   color: var(--color-text);
   border-radius: 4px;
   padding: 5px 12px;
-  font-size: 12px;
+  font-size: calc(12px * var(--ui-font-scale, 1));
   cursor: pointer;
 }
 
 .confirm-dialog__message {
   white-space: pre-wrap;
-  font-size: 13px;
+  font-size: calc(13px * var(--ui-font-scale, 1));
   color: var(--color-text);
   margin: 0 0 8px;
 }
@@ -382,13 +425,13 @@
 
 .password-dialog__memo-name {
   margin: 0;
-  font-size: 12px;
+  font-size: calc(12px * var(--ui-font-scale, 1));
   color: var(--color-text-muted);
   word-break: break-all;
 }
 
 .password-dialog__label {
-  font-size: 12px;
+  font-size: calc(12px * var(--ui-font-scale, 1));
   color: var(--color-text-muted);
 }
 
@@ -398,25 +441,25 @@
   color: var(--color-text);
   border-radius: 4px;
   padding: 6px 8px;
-  font-size: 13px;
+  font-size: calc(13px * var(--ui-font-scale, 1));
 }
 
 .password-dialog__message {
   margin: 0;
   color: #e05a5a;
-  font-size: 12px;
+  font-size: calc(12px * var(--ui-font-scale, 1));
 }
 
 .password-dialog__warning {
   margin: 0;
   color: #e0a040;
-  font-size: 12px;
+  font-size: calc(12px * var(--ui-font-scale, 1));
 }
 
 .password-dialog__error {
   margin: 0;
   color: #e05a5a;
-  font-size: 12px;
+  font-size: calc(12px * var(--ui-font-scale, 1));
   white-space: pre-wrap;
 }
 
@@ -433,7 +476,72 @@
   color: var(--color-text);
   border-radius: 4px;
   padding: 5px 12px;
-  font-size: 12px;
+  font-size: calc(12px * var(--ui-font-scale, 1));
+  cursor: pointer;
+}
+
+/* --- プロパティ画面（components/dialogs/PropertiesDialog.tsx, ユーザー要望） --- */
+
+.properties-dialog {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 420px;
+  max-width: 560px;
+}
+
+.properties-dialog__section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.properties-dialog__section-title {
+  margin: 0 0 4px;
+  font-size: calc(13px * var(--ui-font-scale, 1));
+  color: var(--color-text);
+  border-bottom: 1px solid var(--color-border);
+  padding-bottom: 4px;
+}
+
+.properties-dialog__list {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 12px;
+  margin: 0;
+  font-size: calc(12px * var(--ui-font-scale, 1));
+}
+
+.properties-dialog__list dt {
+  color: var(--color-text-muted);
+  white-space: nowrap;
+}
+
+.properties-dialog__list dd {
+  margin: 0;
+  color: var(--color-text);
+  word-break: break-all;
+}
+
+.properties-dialog__hint {
+  margin: 0;
+  font-size: calc(11px * var(--ui-font-scale, 1));
+  color: var(--color-text-muted);
+}
+
+.properties-dialog__actions {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.properties-dialog__actions button {
+  border: 1px solid var(--color-border);
+  background-color: var(--color-bg);
+  color: var(--color-text);
+  border-radius: 4px;
+  padding: 5px 12px;
+  font-size: calc(12px * var(--ui-font-scale, 1));
   cursor: pointer;
 }
 
@@ -456,7 +564,7 @@
 
 .settings-dialog__section-title {
   margin: 0 0 4px;
-  font-size: 13px;
+  font-size: calc(13px * var(--ui-font-scale, 1));
   color: var(--color-text);
   border-bottom: 1px solid var(--color-border);
   padding-bottom: 4px;
@@ -467,7 +575,7 @@
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  font-size: 12px;
+  font-size: calc(12px * var(--ui-font-scale, 1));
   color: var(--color-text-muted);
 }
 
@@ -479,7 +587,7 @@
   color: var(--color-text);
   border-radius: 4px;
   padding: 4px 6px;
-  font-size: 12px;
+  font-size: calc(12px * var(--ui-font-scale, 1));
   min-width: 140px;
 }
 
@@ -489,13 +597,13 @@
   color: var(--color-text);
   border-radius: 4px;
   padding: 4px 10px;
-  font-size: 12px;
+  font-size: calc(12px * var(--ui-font-scale, 1));
   cursor: pointer;
 }
 
 .settings-dialog__hint {
   margin: 0;
-  font-size: 11px;
+  font-size: calc(11px * var(--ui-font-scale, 1));
   color: var(--color-text-muted);
 }
 
@@ -514,7 +622,7 @@
   color: var(--color-text);
   border-radius: 4px;
   padding: 5px 12px;
-  font-size: 12px;
+  font-size: calc(12px * var(--ui-font-scale, 1));
   cursor: pointer;
 }
 
@@ -524,7 +632,7 @@
   color: var(--color-text);
   border-radius: 4px;
   padding: 1px 8px;
-  font-size: 11px;
+  font-size: calc(11px * var(--ui-font-scale, 1));
   cursor: pointer;
 }
 
@@ -587,7 +695,7 @@
   color: var(--color-text);
   border-radius: 4px;
   padding: 6px 8px;
-  font-size: 13px;
+  font-size: calc(13px * var(--ui-font-scale, 1));
 }
 
 .search-panel__form button[type='submit'] {
@@ -596,7 +704,7 @@
   color: var(--color-text);
   border-radius: 4px;
   padding: 6px 12px;
-  font-size: 12px;
+  font-size: calc(12px * var(--ui-font-scale, 1));
   cursor: pointer;
 }
 
@@ -605,7 +713,7 @@
   flex-wrap: wrap;
   gap: 12px;
   width: 100%;
-  font-size: 12px;
+  font-size: calc(12px * var(--ui-font-scale, 1));
   color: var(--color-text-muted);
 }
 
@@ -623,7 +731,7 @@
   gap: 6px;
   padding: 6px 12px;
   border-bottom: 1px solid var(--color-border);
-  font-size: 12px;
+  font-size: calc(12px * var(--ui-font-scale, 1));
 }
 
 .search-panel__history-label {
@@ -636,7 +744,7 @@
   color: var(--color-text);
   border-radius: 12px;
   padding: 2px 10px;
-  font-size: 11px;
+  font-size: calc(11px * var(--ui-font-scale, 1));
   cursor: pointer;
 }
 
@@ -647,7 +755,7 @@
 .search-panel__error {
   margin: 8px 12px 0;
   color: #e05a5a;
-  font-size: 12px;
+  font-size: calc(12px * var(--ui-font-scale, 1));
 }
 
 .search-panel__results {
@@ -659,7 +767,7 @@
 .search-panel__status {
   margin: 12px;
   color: var(--color-text-muted);
-  font-size: 12px;
+  font-size: calc(12px * var(--ui-font-scale, 1));
 }
 
 .search-panel__hit {
@@ -682,12 +790,12 @@
 }
 
 .search-panel__hit-location {
-  font-size: 12px;
+  font-size: calc(12px * var(--ui-font-scale, 1));
   font-weight: 600;
 }
 
 .search-panel__hit-preview {
-  font-size: 12px;
+  font-size: calc(12px * var(--ui-font-scale, 1));
   color: var(--color-text-muted);
   white-space: pre;
   overflow: hidden;
@@ -715,7 +823,7 @@
   gap: 12px;
   padding: 6px 10px;
   border-bottom: 1px solid var(--color-border);
-  font-size: 12px;
+  font-size: calc(12px * var(--ui-font-scale, 1));
   color: var(--color-text);
 }
 
@@ -765,7 +873,11 @@
 }
 
 .cm-editor-host .cm-selectionBackground {
-  background-color: var(--color-accent-soft, var(--color-bg-elevated)) !important;
+  background-color: var(--color-selection) !important;
+}
+
+.cm-editor-host .cm-content ::selection {
+  background-color: var(--color-selection) !important;
 }
 
 .cm-editor-host .cm-panels {
@@ -820,12 +932,12 @@
 
 .app__statusbar {
   flex: 0 0 auto;
-  height: 24px;
+  min-height: calc(24px * var(--ui-font-scale, 1));
   display: flex;
   align-items: center;
   gap: 12px;
   padding: 0 8px;
-  font-size: 12px;
+  font-size: calc(12px * var(--ui-font-scale, 1));
   color: var(--color-text-muted);
   background-color: var(--color-bg-elevated);
   border-top: 1px solid var(--color-border);
