@@ -7,10 +7,12 @@
 // 依存追加のリスクを避け軽量な自前実装を採用した）。
 import {
   useCallback,
+  useEffect,
   useMemo,
   useRef,
   useState,
   type DragEvent as ReactDragEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
   type UIEvent as ReactUIEvent
 } from 'react';
@@ -18,7 +20,7 @@ import type { AddPosition } from '@shared/ipc-contract';
 import type { TreeNode } from '@shared/models';
 import { rangeSelect, selectSingle, toggleSelection, type SelectionState } from '../../store/selection';
 import { ContextMenu, type ContextMenuItem } from './ContextMenu';
-import { TreeRow, ROW_HEIGHT } from './TreeRow';
+import { TreeRow, BASE_ROW_HEIGHT } from './TreeRow';
 import { computeVirtualRange, flattenVisibleTree, MEMO_DND_MIME, type DropZone, type MemoDragPayload } from './treeView';
 
 const LABEL_PRESETS: { name: string; color: string | null }[] = [
@@ -35,11 +37,12 @@ export interface TreeProps {
   openMemoName: string | null;
   selection: SelectionState;
   onSelectionChange: (next: SelectionState) => void;
-  onOpenMemo: (memoName: string, encrypted: boolean) => void;
+  /** `focusEditor` 省略時（クリック等）は既定でエディタへフォーカス移動する。矢印キー連続移動の
+   * 間はツリー側にフォーカスを残したいため（ユーザー要望）、その場合のみ明示的に `false` を渡す。 */
+  onOpenMemo: (memoName: string, encrypted: boolean, focusEditor?: boolean) => void;
   onToggleExpand: (memoName: string) => void;
   onRequestCreate: (position: AddPosition, anchorMemoName?: string) => void;
   onRequestRename: (memoName: string) => void;
-  onRequestDuplicate: (memoName: string) => void;
   onRequestDelete: (memoNames: string[]) => void;
   onRequestSetLabel: (memoName: string, color: string | null) => void;
   /** パスワードを設定して暗号化する（平文メモのみ, M6）。 */
@@ -48,16 +51,23 @@ export interface TreeProps {
   onRequestDecrypt: (memoName: string) => void;
   /** パスワードを変更する（暗号化メモのみ, M6）。 */
   onRequestChangePassword: (memoName: string) => void;
+  /** 編集ロックの切替（本文編集のみ禁止。リネーム/削除等ファイル操作は対象外, ユーザー要望）。 */
+  onRequestToggleLock: (memoName: string) => void;
+  /** プロパティ画面を開く（ユーザー要望）。 */
+  onRequestProperties: (memoName: string) => void;
   /** 同一タブ内の並べ替え・階層変更（ファイル移動不要, tree:updateStructure）。 */
   onLocalMove: (draggedNames: string[], destAnchorMemoName: string, zone: DropZone) => void;
   /** 同一タブ内コピー（実ファイル複製が必要, memo:move copy:true）。 */
   onLocalCopy: (draggedNames: string[], destAnchorMemoName: string, zone: DropZone) => void;
+  /** UI 文字サイズ倍率（設定画面「外観」）。行高（仮想化・DnD 判定に使う固定高）をこれに連動させる。 */
+  uiFontScale: number;
 }
 
 interface ContextMenuState {
   x: number;
   y: number;
-  memoName: string;
+  /** null = 行ではなく空白部分の右クリック（ユーザー要望: ツリーが空でもメモを作成できるように）。 */
+  memoName: string | null;
 }
 
 export function Tree({
@@ -70,14 +80,16 @@ export function Tree({
   onToggleExpand,
   onRequestCreate,
   onRequestRename,
-  onRequestDuplicate,
   onRequestDelete,
   onRequestSetLabel,
   onRequestEncrypt,
   onRequestDecrypt,
   onRequestChangePassword,
+  onRequestToggleLock,
+  onRequestProperties,
   onLocalMove,
-  onLocalCopy
+  onLocalCopy,
+  uiFontScale
 }: TreeProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [scrollTop, setScrollTop] = useState(0);
@@ -86,14 +98,78 @@ export function Tree({
   const [dragNames, setDragNames] = useState<string[] | null>(null);
   const [dropTarget, setDropTarget] = useState<{ memoName: string; zone: DropZone } | null>(null);
 
+  const rowHeight = Math.round(BASE_ROW_HEIGHT * uiFontScale);
   const flatRows = useMemo(() => flattenVisibleTree(tree), [tree]);
   const visibleOrder = useMemo(() => flatRows.map((r) => r.memoName), [flatRows]);
-  const range = computeVirtualRange(flatRows.length, ROW_HEIGHT, scrollTop, viewportHeight);
+  const range = computeVirtualRange(flatRows.length, rowHeight, scrollTop, viewportHeight);
   const visibleRows = flatRows.slice(range.startIndex, range.endIndex);
 
   const handleScroll = useCallback((e: ReactUIEvent<HTMLDivElement>) => {
     setScrollTop(e.currentTarget.scrollTop);
   }, []);
+
+  // F2 でリネーム（単一選択時のみ, ユーザー要望）。右クリックメニューの「名前変更」と同じ
+  // onRequestRename に委譲する。
+  // ↑/↓ は既定のスクロールではなく前後のメモへ移動する（ユーザー要望）。クリック時と同様に
+  // 単一選択+オープンまで行う。仮想化のため、選択後は必要に応じて手動でスクロール位置を補正する。
+  const handleTreeKeyDown = useCallback(
+    (e: ReactKeyboardEvent<HTMLDivElement>) => {
+      if (e.key === 'F2') {
+        if (selection.selected.size !== 1) return;
+        e.preventDefault();
+        const [memoName] = selection.selected;
+        if (memoName) onRequestRename(memoName);
+        return;
+      }
+
+      if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+      if (flatRows.length === 0) return;
+      e.preventDefault();
+
+      const currentName = selection.anchor ?? [...selection.selected][0] ?? null;
+      const currentIndex = currentName ? flatRows.findIndex((r) => r.memoName === currentName) : -1;
+      const nextIndex =
+        currentIndex === -1
+          ? e.key === 'ArrowDown'
+            ? 0
+            : flatRows.length - 1
+          : e.key === 'ArrowDown'
+            ? Math.min(currentIndex + 1, flatRows.length - 1)
+            : Math.max(currentIndex - 1, 0);
+      const nextRow = flatRows[nextIndex];
+      if (!nextRow) return;
+
+      onSelectionChange(selectSingle(nextRow.memoName));
+      // 矢印キーでの連続移動中はツリー側にフォーカスを残す（ユーザー要望: 移動のたびに右ペイン
+      // へフォーカスが奪われると、そのまま↑/↓を押し続けられなくなるため）。
+      onOpenMemo(nextRow.memoName, nextRow.encrypted, false);
+
+      const rowTop = nextIndex * rowHeight;
+      const rowBottom = rowTop + rowHeight;
+      const container = containerRef.current;
+      if (container) {
+        if (rowTop < scrollTop) container.scrollTop = rowTop;
+        else if (rowBottom > scrollTop + viewportHeight) container.scrollTop = rowBottom - viewportHeight;
+      }
+    },
+    [selection, flatRows, rowHeight, scrollTop, viewportHeight, onRequestRename, onSelectionChange, onOpenMemo]
+  );
+
+  // 開いているメモが変わったら（起動時の前回メモ復元/memo:リンク遷移/検索結果ジャンプ等）、
+  // 対応する行が表示範囲内に入るようスクロール位置を補正する（ユーザー要望）。
+  // `container.scrollTop` を直接読むことで、手動スクロール中の scrollTop state 更新のたびに
+  // 再実行されるのを避ける（依存配列に scrollTop を含めない）。
+  useEffect(() => {
+    if (!openMemoName) return;
+    const index = flatRows.findIndex((r) => r.memoName === openMemoName);
+    if (index === -1) return;
+    const container = containerRef.current;
+    if (!container) return;
+    const rowTop = index * rowHeight;
+    const rowBottom = rowTop + rowHeight;
+    if (rowTop < container.scrollTop) container.scrollTop = rowTop;
+    else if (rowBottom > container.scrollTop + viewportHeight) container.scrollTop = rowBottom - viewportHeight;
+  }, [openMemoName, flatRows, rowHeight, viewportHeight]);
 
   const measureRef = useCallback((node: HTMLDivElement | null) => {
     containerRef.current = node;
@@ -102,6 +178,9 @@ export function Tree({
 
   const handleRowClick = useCallback(
     (memoName: string, encrypted: boolean, e: ReactMouseEvent) => {
+      // F2 リネームはこのコンテナが DOM フォーカスを持っている必要がある（行クリック時点で
+      // 明示的にフォーカスしておく。ユーザー要望）。
+      containerRef.current?.focus();
       if (e.shiftKey) {
         onSelectionChange(rangeSelect(selection, visibleOrder, memoName));
         return;
@@ -167,19 +246,25 @@ export function Tree({
   );
 
   const buildContextMenuItems = useCallback(
-    (memoName: string): ContextMenuItem[] => {
+    (memoName: string | null): ContextMenuItem[] => {
+      // 空白部分の右クリック（ユーザー要望）: ツリーが空でも「メモを作成」だけは常に出す。
+      if (memoName === null) {
+        return [{ label: 'メモを作成', onSelect: () => onRequestCreate('last') }];
+      }
       const multi = selection.selected.size > 1 && selection.selected.has(memoName);
       // M6: 暗号化/暗号化解除/パスワード変更は単一選択時のみ（rename/duplicate と同様の制約）。
-      const rowEncrypted = flatRows.find((r) => r.memoName === memoName)?.encrypted ?? false;
-      const items: ContextMenuItem[] = [
-        { label: '前に追加', onSelect: () => onRequestCreate('before', memoName) },
-        { label: '後に追加', onSelect: () => onRequestCreate('after', memoName) },
-        { label: '子として追加', onSelect: () => onRequestCreate('child', memoName) }
-      ];
+      const row = flatRows.find((r) => r.memoName === memoName);
+      const rowEncrypted = row?.encrypted ?? false;
+      const rowLocked = row?.locked ?? false;
+      // ユーザー要望: 前/後/子の3項目は「メモを作成」1つに統一し、常に後ろ（'after'）に追加する。
+      const items: ContextMenuItem[] = [{ label: 'メモを作成', onSelect: () => onRequestCreate('after', memoName) }];
       if (!multi) {
         items.push(
           { label: '名前変更', onSelect: () => onRequestRename(memoName), separatorBefore: true },
-          { label: '複製', onSelect: () => onRequestDuplicate(memoName) }
+          {
+            label: rowLocked ? '編集ロックを解除' : '編集ロック',
+            onSelect: () => onRequestToggleLock(memoName)
+          }
         );
         if (rowEncrypted) {
           items.push(
@@ -201,13 +286,16 @@ export function Tree({
         onSelect: () => onRequestDelete(multi ? [...selection.selected] : [memoName])
       });
       if (!multi) {
-        for (const preset of LABEL_PRESETS) {
-          items.push({
-            label: `ラベル: ${preset.name}`,
-            separatorBefore: preset === LABEL_PRESETS[0],
+        items.push({
+          label: 'アイコン',
+          separatorBefore: true,
+          submenu: LABEL_PRESETS.map((preset) => ({
+            label: preset.name,
+            swatchColor: preset.color,
             onSelect: () => onRequestSetLabel(memoName, preset.color)
-          });
-        }
+          }))
+        });
+        items.push({ label: 'プロパティ', onSelect: () => onRequestProperties(memoName) });
       }
       return items;
     },
@@ -216,42 +304,39 @@ export function Tree({
       flatRows,
       onRequestCreate,
       onRequestRename,
-      onRequestDuplicate,
       onRequestDelete,
       onRequestSetLabel,
       onRequestEncrypt,
       onRequestDecrypt,
-      onRequestChangePassword
+      onRequestChangePassword,
+      onRequestToggleLock,
+      onRequestProperties
     ]
   );
 
   return (
     <div className="tree-toolbar-wrap">
-      <div className="tree-toolbar">
-        <button type="button" onClick={() => onRequestCreate('first')}>
-          先頭に追加
-        </button>
-        <button type="button" onClick={() => onRequestCreate('last')}>
-          末尾に追加
-        </button>
-      </div>
       <div
         className="tree-scroll"
         ref={measureRef}
+        tabIndex={0}
+        onKeyDown={handleTreeKeyDown}
         onScroll={handleScroll}
         onContextMenu={(e) => {
+          // 行ではなく空白部分の右クリック（ユーザー要望: ツリーが空でもメモを作成できるように）。
           if (e.target === e.currentTarget) {
             e.preventDefault();
-            setContextMenu(null);
+            setContextMenu({ x: e.clientX, y: e.clientY, memoName: null });
           }
         }}
       >
-        <div className="tree-spacer" style={{ height: range.paddingTop + range.paddingBottom + visibleRows.length * ROW_HEIGHT }}>
+        <div className="tree-spacer" style={{ height: range.paddingTop + range.paddingBottom + visibleRows.length * rowHeight }}>
           {visibleRows.map((row, i) => (
             <TreeRow
               key={row.memoName}
               row={row}
-              top={range.paddingTop + i * ROW_HEIGHT}
+              top={range.paddingTop + i * rowHeight}
+              rowHeight={rowHeight}
               selected={selection.selected.has(row.memoName)}
               isOpenMemo={openMemoName === row.memoName}
               isDragging={dragNames?.includes(row.memoName) ?? false}
@@ -270,6 +355,13 @@ export function Tree({
             />
           ))}
         </div>
+        {flatRows.length === 0 && (
+          <div className="tree-empty-state">
+            <button type="button" onClick={() => onRequestCreate('last')}>
+              メモを作成
+            </button>
+          </div>
+        )}
       </div>
       {contextMenu && (
         <ContextMenu
