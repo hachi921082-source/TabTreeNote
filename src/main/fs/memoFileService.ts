@@ -1,16 +1,17 @@
 // src/main/fs/memoFileService.ts
 // .txt/.txtenc の read/write/rename（M1 は read/save/rename 中心, PLAN §3）。
 // フォルダ直下走査（リンク無視）もここに置く（metaStore/tabService から利用される）。
-import { promises as fs } from 'node:fs';
+import { promises as fs, type Dirent } from 'node:fs';
 import { join } from 'node:path';
 import { MEMO_EXT_ENCRYPTED, MEMO_EXT_PLAIN, TEMP_FILE_PREFIX, BACKUP_SUFFIX } from '@shared/constants';
+import type { MemoCharCounts, MemoProperties } from '@shared/ipc-contract';
 import type { MemoReadResult, Result, SaveResult } from '@shared/models';
 import { err, ok } from '../util/result';
 import { atomicWrite } from './atomicWrite';
 import { decodeBuffer, decodeBufferAs, encodeText, type DetectedEncoding } from './encoding';
 import { detectEol, normalizeToLf, restoreEol } from './eol';
 import { hashBytes } from '../util/hash';
-import { isLongPath, isPathContained, normalizeForCompare, validateName } from './pathSafety';
+import { isLongPath, isPathContained, normalizeForCompare, validateExistingName, validateName } from './pathSafety';
 import { consumeSelfWrite, refineSelfWriteExpectation, registerSelfWrite } from '../watch/selfWriteRegistry';
 import { withRetry } from './retry';
 import { deletePathDirect, trashPath } from './trash';
@@ -25,7 +26,22 @@ import { deletePathDirect, trashPath } from './trash';
 export function validateMemoNameForPath(folderPath: string, memoName: string): Result<void> {
   const nameCheck = validateName(memoName);
   if (!nameCheck.ok) return nameCheck;
+  return checkMemoPathSafety(folderPath, memoName);
+}
 
+/**
+ * 既存メモ（実ファイルが既に存在する前提）を読込/保存/移動/複製/削除する際に使う、緩めの検証
+ * （ユーザー報告バグ対応: 前後に空白を含む名前の `.txt`/`.txtenc` が既に存在する場合でも、
+ * それを開く/保存する/移動する操作自体はブロックしない。新規に名付ける操作（`memo:create`・
+ * リネーム先の名前）は引き続き `validateMemoNameForPath`／`validateName` の厳格な規則を課す）。
+ */
+export function validateExistingMemoNameForPath(folderPath: string, memoName: string): Result<void> {
+  const nameCheck = validateExistingName(memoName);
+  if (!nameCheck.ok) return nameCheck;
+  return checkMemoPathSafety(folderPath, memoName);
+}
+
+function checkMemoPathSafety(folderPath: string, memoName: string): Result<void> {
   const candidate = join(folderPath, `${memoName}${MEMO_EXT_PLAIN}`);
   if (!isPathContained(folderPath, candidate)) {
     return err('NAME_INVALID', `不正なメモ名です: ${memoName}`);
@@ -44,9 +60,17 @@ export interface ScannedMemo {
 /**
  * フォルダ直下の `.txt`/`.txtenc` を走査する（直下のみ、シンボリックリンク/ジャンクション無視,
  * DESIGN §2.2）。一時ファイル・`.bak`・メタ JSON は対象外。
+ * タブ登録後にフォルダごとアプリ外で削除された場合（ユーザー報告のバグ: 起動時インデックス
+ * 構築が例外で止まりアプリ自体が起動しなくなっていた）に備え、フォルダ不在/読取不可は
+ * 「空フォルダ」として扱い、例外を投げない（呼び出し元の起動処理等を巻き込んで壊さないため）。
  */
 export async function scanTabFolder(folderPath: string): Promise<ScannedMemo[]> {
-  const entries = await fs.readdir(folderPath, { withFileTypes: true });
+  let entries: Dirent[];
+  try {
+    entries = await fs.readdir(folderPath, { withFileTypes: true });
+  } catch {
+    return [];
+  }
   const result: ScannedMemo[] = [];
 
   for (const entry of entries) {
@@ -106,7 +130,7 @@ async function pathExists(path: string): Promise<boolean> {
 
 /** 平文 `.txt` を読み込む。`.txtenc` の場合は本文を返さず暗号化フラグのみ（M1 スコープ, PLAN §2.2）。 */
 export async function readMemo(folderPath: string, memoName: string): Promise<Result<MemoReadResult>> {
-  const nameCheck = validateMemoNameForPath(folderPath, memoName);
+  const nameCheck = validateExistingMemoNameForPath(folderPath, memoName);
   if (!nameCheck.ok) return nameCheck;
 
   const found = await findMemoFile(folderPath, memoName);
@@ -134,7 +158,7 @@ export async function readMemoWithEncoding(
   memoName: string,
   encoding: DetectedEncoding
 ): Promise<Result<MemoReadResult>> {
-  const nameCheck = validateMemoNameForPath(folderPath, memoName);
+  const nameCheck = validateExistingMemoNameForPath(folderPath, memoName);
   if (!nameCheck.ok) return nameCheck;
 
   const found = await findMemoFile(folderPath, memoName);
@@ -151,6 +175,46 @@ export async function readMemoWithEncoding(
   return ok({ contentLF, encoding, eol, encrypted: false, hash });
 }
 
+function computeCharCounts(contentLF: string): MemoCharCounts {
+  const chars = [...contentLF];
+  return {
+    total: chars.length,
+    excludingWhitespace: chars.filter((c) => !/\s/.test(c)).length,
+    lines: contentLF.split('\n').length
+  };
+}
+
+/**
+ * プロパティ画面用の情報を取得する（`memo:getProperties`, ユーザー要望）。
+ * 暗号化メモ（`.txtenc`）は復号しない（PLAN §1.4「鍵/パスワードはメインに閉じる」の一環で
+ * パスワード無しに本文へ触れない）ため `charCounts` は null（ファイル情報のみ表示, developer 判断）。
+ */
+export async function getMemoProperties(folderPath: string, memoName: string): Promise<Result<MemoProperties>> {
+  const nameCheck = validateExistingMemoNameForPath(folderPath, memoName);
+  if (!nameCheck.ok) return nameCheck;
+
+  const found = await findMemoFile(folderPath, memoName);
+  if (!found) return err('NOT_FOUND', `メモが見つかりません: ${memoName}`, folderPath);
+
+  const stat = await fs.stat(found.path);
+  let charCounts: MemoCharCounts | null = null;
+  if (!found.encrypted) {
+    const buf = await fs.readFile(found.path);
+    const { text } = decodeBuffer(buf);
+    charCounts = computeCharCounts(normalizeToLf(text));
+  }
+
+  return ok({
+    memoName,
+    filePath: found.path,
+    createdAtMs: stat.birthtimeMs,
+    modifiedAtMs: stat.mtimeMs,
+    sizeBytes: stat.size,
+    encrypted: found.encrypted,
+    charCounts
+  });
+}
+
 /**
  * 平文メモを保存する（PLAN §5.2）。
  * 1. 競合チェック（`expectedHash` 指定時、現在のディスク実体ハッシュと一致するか一発判定）。
@@ -164,7 +228,7 @@ export async function saveMemo(
   encoding: DetectedEncoding,
   expectedHash: string | undefined
 ): Promise<Result<SaveResult>> {
-  const nameCheck = validateMemoNameForPath(folderPath, memoName);
+  const nameCheck = validateExistingMemoNameForPath(folderPath, memoName);
   if (!nameCheck.ok) return nameCheck;
 
   const targetPath = join(folderPath, `${memoName}${MEMO_EXT_PLAIN}`);
@@ -207,7 +271,7 @@ export async function createEmptyMemoFile(folderPath: string, memoName: string):
  * `oldName`/`newName` 双方をパス閉じ込め検証してから解決する（reviewer 指摘 M1-R1-01）。
  */
 export async function renameMemoFile(folderPath: string, oldName: string, newName: string): Promise<Result<void>> {
-  const oldNameCheck = validateMemoNameForPath(folderPath, oldName);
+  const oldNameCheck = validateExistingMemoNameForPath(folderPath, oldName);
   if (!oldNameCheck.ok) return oldNameCheck;
   const newNameCheck = validateMemoNameForPath(folderPath, newName);
   if (!newNameCheck.ok) return newNameCheck;
@@ -242,7 +306,7 @@ export async function renameMemoFile(folderPath: string, oldName: string, newNam
 
 /** `folderPath` 内の `memoName` の実ファイルパスを検証込みで解決する（存在しなければ NOT_FOUND）。 */
 async function resolveMemoPath(folderPath: string, memoName: string): Promise<Result<{ path: string; encrypted: boolean }>> {
-  const nameCheck = validateMemoNameForPath(folderPath, memoName);
+  const nameCheck = validateExistingMemoNameForPath(folderPath, memoName);
   if (!nameCheck.ok) return nameCheck;
   const found = await findMemoFile(folderPath, memoName);
   if (!found) return err('NOT_FOUND', `メモが見つかりません: ${memoName}`, folderPath);
@@ -284,7 +348,10 @@ export async function duplicateMemoFile(
   const existingNames = new Set(scanned.map((s) => s.memoName));
   const newName = pickAvailableName(existingNames, memoName);
 
-  const newNameCheck = validateMemoNameForPath(folderPath, newName);
+  // newName は元の名前（前後空白等を含み得る）から機械的に導出した名前であり、ユーザーが
+  // 新規に名付けたものではないため、既存名向けの緩い検証を使う（複製元が前後空白付きの
+  // 既存ファイルでも複製自体は失敗させない）。
+  const newNameCheck = validateExistingMemoNameForPath(folderPath, newName);
   if (!newNameCheck.ok) return newNameCheck;
 
   const ext = found.value.encrypted ? MEMO_EXT_ENCRYPTED : MEMO_EXT_PLAIN;
@@ -314,7 +381,8 @@ export async function moveMemoFileToFolder(
 ): Promise<Result<void>> {
   const found = await resolveMemoPath(srcFolderPath, memoName);
   if (!found.ok) return found;
-  const destCheck = validateMemoNameForPath(destFolderPath, memoName);
+  // 移動先でも名前は変えない（既存名の引き継ぎ）ため、緩い検証を使う。
+  const destCheck = validateExistingMemoNameForPath(destFolderPath, memoName);
   if (!destCheck.ok) return destCheck;
 
   const ext = found.value.encrypted ? MEMO_EXT_ENCRYPTED : MEMO_EXT_PLAIN;
@@ -355,7 +423,9 @@ export async function copyMemoFileToFolder(
 ): Promise<Result<void>> {
   const found = await resolveMemoPath(srcFolderPath, memoName);
   if (!found.ok) return found;
-  const destCheck = validateMemoNameForPath(destFolderPath, destMemoName);
+  // destMemoName は呼び出し側が既存名または既存名から機械的に導出した重複回避名を渡す
+  // （ユーザーが自由入力した新規名ではない）ため、緩い検証を使う。
+  const destCheck = validateExistingMemoNameForPath(destFolderPath, destMemoName);
   if (!destCheck.ok) return destCheck;
 
   const ext = found.value.encrypted ? MEMO_EXT_ENCRYPTED : MEMO_EXT_PLAIN;
