@@ -24,7 +24,7 @@ import type { MemoInfo, Result, SaveResult } from '@shared/models';
 import { MEMO_EXT_ENCRYPTED, MEMO_EXT_PLAIN, SCRYPT_DEFAULTS } from '@shared/constants';
 import { err, ok, wrapHandler } from '../util/result';
 import { getTabFolderPath } from '../fs/tabService';
-import { findMemoFile, readMemo, validateMemoNameForPath } from '../fs/memoFileService';
+import { findMemoFile, readMemo, validateExistingMemoNameForPath } from '../fs/memoFileService';
 import { atomicWrite } from '../fs/atomicWrite';
 import { encodeText } from '../fs/encoding';
 import { restoreEol } from '../fs/eol';
@@ -68,7 +68,7 @@ export function registerCryptoHandlers(): void {
       if (!folder.ok) return folder;
       const folderPath = folder.value;
 
-      const nameCheck = validateMemoNameForPath(folderPath, args.memoName);
+      const nameCheck = validateExistingMemoNameForPath(folderPath, args.memoName);
       if (!nameCheck.ok) return nameCheck;
 
       const found = await findMemoFile(folderPath, args.memoName);
@@ -136,7 +136,7 @@ export function registerCryptoHandlers(): void {
       if (!folder.ok) return folder;
       const folderPath = folder.value;
 
-      const nameCheck = validateMemoNameForPath(folderPath, args.memoName);
+      const nameCheck = validateExistingMemoNameForPath(folderPath, args.memoName);
       if (!nameCheck.ok) return nameCheck;
 
       const found = await findMemoFile(folderPath, args.memoName);
@@ -188,7 +188,7 @@ export function registerCryptoHandlers(): void {
       if (!folder.ok) return folder;
       const folderPath = folder.value;
 
-      const nameCheck = validateMemoNameForPath(folderPath, args.memoName);
+      const nameCheck = validateExistingMemoNameForPath(folderPath, args.memoName);
       if (!nameCheck.ok) return nameCheck;
 
       const found = await findMemoFile(folderPath, args.memoName);
@@ -228,7 +228,7 @@ export function registerCryptoHandlers(): void {
       if (!folder.ok) return folder;
       const folderPath = folder.value;
 
-      const nameCheck = validateMemoNameForPath(folderPath, args.memoName);
+      const nameCheck = validateExistingMemoNameForPath(folderPath, args.memoName);
       if (!nameCheck.ok) return nameCheck;
 
       const session = getSessionKey(args.tabId, args.memoName);
@@ -281,7 +281,7 @@ export function registerCryptoHandlers(): void {
       if (!folder.ok) return folder;
       const folderPath = folder.value;
 
-      const nameCheck = validateMemoNameForPath(folderPath, args.memoName);
+      const nameCheck = validateExistingMemoNameForPath(folderPath, args.memoName);
       if (!nameCheck.ok) return nameCheck;
 
       const found = await findMemoFile(folderPath, args.memoName);
