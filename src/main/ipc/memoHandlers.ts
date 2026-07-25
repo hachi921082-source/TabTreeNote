@@ -6,7 +6,7 @@
 // M3 で各操作の完了点から全文検索インデックス経路①（`searchIndex` の直接更新）を配線し、
 // `evt:indexUpdated` を発火するようにした（docs/milestones/M3-search.md「インデックス差分更新の
 // 2経路」。経路②=ファイル監視経由の反映は M4）。
-import { ipcMain, type IpcMainInvokeEvent } from 'electron';
+import { ipcMain, shell, type IpcMainInvokeEvent } from 'electron';
 import {
   IpcChannels,
   IpcEvents,
@@ -14,7 +14,10 @@ import {
   type IndexUpdatedPayload,
   type MemoDeleteArgs,
   type MemoDuplicateArgs,
+  type MemoGetPropertiesArgs,
   type MemoMoveArgs,
+  type MemoProperties,
+  type MemoRevealInFolderArgs,
   type TreeUpdateStructureArgs,
   type TrashFallbackPayload
 } from '@shared/ipc-contract';
@@ -29,6 +32,8 @@ import {
   deleteMemoFileDirect,
   deleteMemoFileViaTrash,
   duplicateMemoFile,
+  findMemoFile,
+  getMemoProperties,
   moveMemoFileToFolder,
   pickAvailableName,
   readMemo,
@@ -122,6 +127,27 @@ export function registerMemoHandlers(): void {
       const folder = getTabFolderPath(args.tabId);
       if (!folder.ok) return folder;
       return readMemo(folder.value, args.memoName);
+    })
+  );
+
+  ipcMain.handle(
+    IpcChannels.memo.getProperties,
+    wrapHandler(async (_event: IpcMainInvokeEvent, args: MemoGetPropertiesArgs): Promise<Result<MemoProperties>> => {
+      const folder = getTabFolderPath(args.tabId);
+      if (!folder.ok) return folder;
+      return getMemoProperties(folder.value, args.memoName);
+    })
+  );
+
+  ipcMain.handle(
+    IpcChannels.memo.revealInFolder,
+    wrapHandler(async (_event: IpcMainInvokeEvent, args: MemoRevealInFolderArgs): Promise<Result<void>> => {
+      const folder = getTabFolderPath(args.tabId);
+      if (!folder.ok) return folder;
+      const found = await findMemoFile(folder.value, args.memoName);
+      if (!found) return err('NOT_FOUND', `メモが見つかりません: ${args.memoName}`, folder.value);
+      shell.showItemInFolder(found.path);
+      return ok(undefined);
     })
   );
 
