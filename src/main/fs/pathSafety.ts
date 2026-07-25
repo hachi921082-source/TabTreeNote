@@ -62,6 +62,24 @@ export function validateName(name: string): Result<void> {
   return ok(undefined);
 }
 
+/**
+ * 既に実体（ファイル/フォルダ）が存在する名前を解決する際の検証（読込・保存・移動・複製・
+ * リンク解決・既存フォルダ登録など）。`validateName` は「新規に名付ける」場面向けの厳格な
+ * 規則（前後空白・末尾ピリオド禁止等）を課すが、それらは飽くまで本アプリで新規作成する際の
+ * 命名規約であり、OS API 等アプリ外で作成された実在の名前（前後空白付きファイル名など）まで
+ * 拒否すると、実在するデータを一切読み書きできなくなってしまう（ユーザー報告バグ）。
+ * ここでは「実在確認/パス構築に使って安全か」だけを見る最小限の検証に留める。
+ */
+export function validateExistingName(name: string): Result<void> {
+  if (name.length === 0) {
+    return err('NAME_INVALID', '名前を入力してください。');
+  }
+  if (FORBIDDEN_CHARS_RE.test(name)) {
+    return err('NAME_INVALID', '使用できない文字が含まれています（\\ / : * ? " < > | および制御文字）。');
+  }
+  return ok(undefined);
+}
+
 /** 絶対パスの長さが Windows 長パス閾値（既定 260 文字）を超えているか（v1 は正式対応外, DESIGN §4）。 */
 export function isLongPath(absolutePath: string): boolean {
   return absolutePath.length > LONG_PATH_THRESHOLD;
