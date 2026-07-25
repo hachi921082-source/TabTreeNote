@@ -35,7 +35,9 @@ export const IpcChannels = {
     rename: 'tab:rename',
     remove: 'tab:remove',
     reorder: 'tab:reorder',
-    openTree: 'tab:openTree'
+    openTree: 'tab:openTree',
+    /** タブの登録フォルダをエクスプローラで開く（ユーザー要望）。 */
+    openFolder: 'tab:openFolder'
   },
   memo: {
     read: 'memo:read',
@@ -45,7 +47,11 @@ export const IpcChannels = {
     rename: 'memo:rename',
     delete: 'memo:delete',
     duplicate: 'memo:duplicate',
-    move: 'memo:move'
+    move: 'memo:move',
+    /** プロパティ表示（ファイル情報+文字数カウント, ユーザー要望）。 */
+    getProperties: 'memo:getProperties',
+    /** エクスプローラでファイルを選択表示する（プロパティ画面「ファイルの場所を開く」）。 */
+    revealInFolder: 'memo:revealInFolder'
   },
   tree: {
     updateStructure: 'tree:updateStructure'
@@ -84,6 +90,21 @@ export const IpcChannels = {
   },
   app: {
     getInfo: 'app:getInfo'
+  },
+  window: {
+    /** 常時最前面表示のトグル（ユーザー要望。セッション内のみ、設定への永続化はしない）。 */
+    setAlwaysOnTop: 'window:setAlwaysOnTop',
+    /** Windowsログイン時の自動起動トグル（ユーザー要望）。状態はOS（レジストリ）が真実源。 */
+    setOpenAtLogin: 'window:setOpenAtLogin',
+    getOpenAtLogin: 'window:getOpenAtLogin'
+  },
+  dialog: {
+    /**
+     * ネイティブのフォルダ選択ダイアログを開く（developer 判断。`window.prompt()` は
+     * Electron のレンダラープロセスでは何も表示せず即 `null` を返す未実装機能のため、
+     * タブ登録/新規タブ作成の絶対パス手入力の代替として追加した）。
+     */
+    pickFolder: 'dialog:pickFolder'
   }
 } as const;
 
@@ -94,7 +115,14 @@ export const IpcEvents = {
   indexUpdated: 'evt:indexUpdated',
   metaRecovered: 'evt:metaRecovered',
   trashFallback: 'evt:trashFallback',
-  opError: 'evt:opError'
+  opError: 'evt:opError',
+  /** エディタのネイティブ右クリックメニュー「プロパティ」選択時（main/index.ts の
+   * `context-menu` ハンドラが現在アクティブなメモに対して発火する, ユーザー要望）。 */
+  showProperties: 'evt:showProperties',
+  /** エディタのネイティブ右クリックメニューの各種コマンド選択時（ユーザー要望: 元に戻す/変換/
+   * チェック/書式ショートカット等）。main は CodeMirror の内部状態を持たないため、実行自体は
+   * レンダラ側（CodeMirrorEditor.tsx）へ委譲する。 */
+  editorMenuCommand: 'evt:editorMenuCommand'
 } as const;
 
 /** `app:getInfo` の返却型（PLAN §2.6）。 */
@@ -114,12 +142,33 @@ export interface TabRegisterArgs {
   folderPath: string;
 }
 
+/** `dialog:pickFolder` の引数（developer 判断）。`defaultPath` はダイアログの初期表示先。 */
+export interface DialogPickFolderArgs {
+  defaultPath?: string;
+}
+
+/** `window:setAlwaysOnTop` の引数（ユーザー要望）。 */
+export interface WindowSetAlwaysOnTopArgs {
+  enabled: boolean;
+}
+
+/** `window:setOpenAtLogin` の引数（ユーザー要望: 起動時にトレイへ自動常駐）。 */
+export interface WindowSetOpenAtLoginArgs {
+  enabled: boolean;
+}
+
 export interface TabCreateArgs {
-  parentDir: string;
+  /** 省略時はアプリ本体直下の `data` フォルダを既定の作成先とする（developer 判断、ポータブル性優先）。 */
+  parentDir?: string;
   name: string;
 }
 
 export interface TabOpenTreeArgs {
+  tabId: string;
+}
+
+/** `tab:openFolder` の引数（ユーザー要望: タブバー右クリック「タブの場所を開く」）。 */
+export interface TabOpenFolderArgs {
   tabId: string;
 }
 
@@ -155,6 +204,68 @@ export interface MemoRenameArgs {
   oldName: string;
   newName: string;
 }
+
+export interface MemoGetPropertiesArgs {
+  tabId: string;
+  memoName: string;
+}
+
+export interface MemoRevealInFolderArgs {
+  tabId: string;
+  memoName: string;
+}
+
+/** プロパティ画面「文字数カウント」（ユーザー要望。総字数/改行・空白を除く字数/行数のみ）。 */
+export interface MemoCharCounts {
+  total: number;
+  excludingWhitespace: number;
+  lines: number;
+}
+
+/** `memo:getProperties` の返却型（ユーザー要望）。暗号化メモは復号しないため charCounts は null。 */
+export interface MemoProperties {
+  memoName: string;
+  filePath: string;
+  createdAtMs: number;
+  modifiedAtMs: number;
+  sizeBytes: number;
+  encrypted: boolean;
+  charCounts: MemoCharCounts | null;
+}
+
+/** `evt:showProperties` のペイロード。 */
+export interface ShowPropertiesPayload {
+  tabId: string;
+  memoName: string;
+}
+
+/**
+ * エディタ右クリックメニューの「変換」「元に戻す」等（ユーザー要望）。CodeMirror の内部状態
+ * （選択範囲/Undo履歴）を直接操作する必要があるため、main はコマンド名だけを送りレンダラの
+ * CodeMirrorEditor.tsx が実際の処理を行う（editor/textCommands.ts）。
+ */
+export type EditorTextCommand =
+  | 'undo'
+  | 'redo'
+  | 'deleteSelection'
+  | 'invertCase'
+  | 'toUpperCase'
+  | 'toLowerCase'
+  | 'toHiragana'
+  | 'toKatakana'
+  | 'toHalfWidth'
+  | 'toFullWidth'
+  | 'tabsToSpaces'
+  | 'spacesToTabs'
+  | 'toggleCheckbox';
+
+/** `evt:editorMenuCommand` のペイロード。 */
+export type EditorMenuCommandPayload =
+  | { kind: 'textCommand'; command: EditorTextCommand }
+  | { kind: 'setWrap'; wrap: 'none' | 'chars' | 'window' }
+  | { kind: 'toggleLineNumbers' }
+  | { kind: 'toggleWhitespace' }
+  | { kind: 'fontSize'; action: 'increase' | 'decrease' | 'reset' };
 
 /** `evt:metaRecovered` のペイロード（00-core-principles.md §9）。 */
 export interface MetaRecoveredPayload {
@@ -416,6 +527,18 @@ export interface PreloadApi {
   app: {
     getInfo(): Promise<AppInfo>;
   };
+  window: {
+    /** 常時最前面表示のトグル（ユーザー要望）。 */
+    setAlwaysOnTop(args: WindowSetAlwaysOnTopArgs): Promise<Result<void>>;
+    /** Windowsログイン時の自動起動トグル（ユーザー要望）。 */
+    setOpenAtLogin(args: WindowSetOpenAtLoginArgs): Promise<Result<void>>;
+    /** 現在の自動起動設定（OSのレジストリ状態を反映）。 */
+    getOpenAtLogin(): Promise<Result<boolean>>;
+  };
+  dialog: {
+    /** フォルダ未選択（キャンセル）時は `Result<null>` を返す（エラーにしない）。 */
+    pickFolder(args?: DialogPickFolderArgs): Promise<Result<string | null>>;
+  };
   tab: {
     list(): Promise<Result<TabInfo[]>>;
     register(args: TabRegisterArgs): Promise<Result<TabInfo>>;
@@ -424,6 +547,7 @@ export interface PreloadApi {
     rename(args: TabRenameArgs): Promise<Result<void>>;
     remove(args: TabRemoveArgs): Promise<Result<void>>;
     reorder(args: TabReorderArgs): Promise<Result<void>>;
+    openFolder(args: TabOpenFolderArgs): Promise<Result<void>>;
   };
   memo: {
     read(args: MemoReadArgs): Promise<Result<MemoReadResult>>;
@@ -434,6 +558,8 @@ export interface PreloadApi {
     delete(args: MemoDeleteArgs): Promise<Result<void>>;
     duplicate(args: MemoDuplicateArgs): Promise<Result<MemoInfo>>;
     move(args: MemoMoveArgs): Promise<Result<void>>;
+    getProperties(args: MemoGetPropertiesArgs): Promise<Result<MemoProperties>>;
+    revealInFolder(args: MemoRevealInFolderArgs): Promise<Result<void>>;
   };
   tree: {
     updateStructure(args: TreeUpdateStructureArgs): Promise<Result<void>>;
@@ -484,5 +610,9 @@ export interface PreloadApi {
     onConflict(handler: (payload: ConflictPayload) => void): () => void;
     /** `evt:opError` を購読する（M4 で初実装）。返り値の関数を呼ぶと購読解除する。 */
     onOpError(handler: (payload: OpErrorPayload) => void): () => void;
+    /** `evt:showProperties` を購読する（エディタ右クリック「プロパティ」, ユーザー要望）。 */
+    onShowProperties(handler: (payload: ShowPropertiesPayload) => void): () => void;
+    /** `evt:editorMenuCommand` を購読する（エディタ右クリックの各種コマンド, ユーザー要望）。 */
+    onEditorMenuCommand(handler: (payload: EditorMenuCommandPayload) => void): () => void;
   };
 }
