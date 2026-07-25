@@ -12,6 +12,8 @@ import { registerSettingsHandlers } from './settingsHandlers';
 import { registerEditorHandlers } from './editorHandlers';
 import { registerLinkHandlers } from './linkHandlers';
 import { registerCryptoHandlers } from './cryptoHandlers';
+import { registerDialogHandlers } from './dialogHandlers';
+import { registerWindowHandlers } from './windowHandlers';
 
 export function registerIpc(): void {
   ipcMain.handle(IpcChannels.app.getInfo, (): AppInfo => {
@@ -25,4 +27,6 @@ export function registerIpc(): void {
   registerEditorHandlers();
   registerLinkHandlers();
   registerCryptoHandlers();
+  registerDialogHandlers();
+  registerWindowHandlers();
 }
