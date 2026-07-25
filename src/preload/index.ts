@@ -16,6 +16,8 @@ import {
   type CryptoOpenArgs,
   type CryptoOpenResult,
   type CryptoSaveEncryptedArgs,
+  type DialogPickFolderArgs,
+  type EditorMenuCommandPayload,
   type EditorReportActiveArgs,
   type ExternalChangePayload,
   type IndexUpdatedPayload,
@@ -25,24 +27,31 @@ import {
   type MemoCreateArgs,
   type MemoDeleteArgs,
   type MemoDuplicateArgs,
+  type MemoGetPropertiesArgs,
   type MemoMoveArgs,
+  type MemoProperties,
   type MemoReadArgs,
   type MemoReadWithEncodingArgs,
   type MemoRenameArgs,
+  type MemoRevealInFolderArgs,
   type MemoSaveArgs,
   type MetaRecoveredPayload,
   type OpErrorPayload,
   type PreloadApi,
   type SearchGlobalArgs,
   type SearchHistoryAddArgs,
+  type ShowPropertiesPayload,
   type TabCreateArgs,
+  type TabOpenFolderArgs,
   type TabOpenTreeArgs,
   type TabRegisterArgs,
   type TabRemoveArgs,
   type TabRenameArgs,
   type TabReorderArgs,
   type TrashFallbackPayload,
-  type TreeUpdateStructureArgs
+  type TreeUpdateStructureArgs,
+  type WindowSetAlwaysOnTopArgs,
+  type WindowSetOpenAtLoginArgs
 } from '@shared/ipc-contract';
 import type {
   AppSettingsPatch,
@@ -60,6 +69,17 @@ const api: PreloadApi = {
   app: {
     getInfo: (): Promise<AppInfo> => ipcRenderer.invoke(IpcChannels.app.getInfo)
   },
+  window: {
+    setAlwaysOnTop: (args: WindowSetAlwaysOnTopArgs): Promise<Result<void>> =>
+      ipcRenderer.invoke(IpcChannels.window.setAlwaysOnTop, args),
+    setOpenAtLogin: (args: WindowSetOpenAtLoginArgs): Promise<Result<void>> =>
+      ipcRenderer.invoke(IpcChannels.window.setOpenAtLogin, args),
+    getOpenAtLogin: (): Promise<Result<boolean>> => ipcRenderer.invoke(IpcChannels.window.getOpenAtLogin)
+  },
+  dialog: {
+    pickFolder: (args?: DialogPickFolderArgs): Promise<Result<string | null>> =>
+      ipcRenderer.invoke(IpcChannels.dialog.pickFolder, args)
+  },
   tab: {
     list: (): Promise<Result<TabInfo[]>> => ipcRenderer.invoke(IpcChannels.tab.list),
     register: (args: TabRegisterArgs): Promise<Result<TabInfo>> => ipcRenderer.invoke(IpcChannels.tab.register, args),
@@ -68,7 +88,8 @@ const api: PreloadApi = {
       ipcRenderer.invoke(IpcChannels.tab.openTree, args),
     rename: (args: TabRenameArgs): Promise<Result<void>> => ipcRenderer.invoke(IpcChannels.tab.rename, args),
     remove: (args: TabRemoveArgs): Promise<Result<void>> => ipcRenderer.invoke(IpcChannels.tab.remove, args),
-    reorder: (args: TabReorderArgs): Promise<Result<void>> => ipcRenderer.invoke(IpcChannels.tab.reorder, args)
+    reorder: (args: TabReorderArgs): Promise<Result<void>> => ipcRenderer.invoke(IpcChannels.tab.reorder, args),
+    openFolder: (args: TabOpenFolderArgs): Promise<Result<void>> => ipcRenderer.invoke(IpcChannels.tab.openFolder, args)
   },
   memo: {
     read: (args: MemoReadArgs): Promise<Result<MemoReadResult>> => ipcRenderer.invoke(IpcChannels.memo.read, args),
@@ -80,7 +101,11 @@ const api: PreloadApi = {
     delete: (args: MemoDeleteArgs): Promise<Result<void>> => ipcRenderer.invoke(IpcChannels.memo.delete, args),
     duplicate: (args: MemoDuplicateArgs): Promise<Result<MemoInfo>> =>
       ipcRenderer.invoke(IpcChannels.memo.duplicate, args),
-    move: (args: MemoMoveArgs): Promise<Result<void>> => ipcRenderer.invoke(IpcChannels.memo.move, args)
+    move: (args: MemoMoveArgs): Promise<Result<void>> => ipcRenderer.invoke(IpcChannels.memo.move, args),
+    getProperties: (args: MemoGetPropertiesArgs): Promise<Result<MemoProperties>> =>
+      ipcRenderer.invoke(IpcChannels.memo.getProperties, args),
+    revealInFolder: (args: MemoRevealInFolderArgs): Promise<Result<void>> =>
+      ipcRenderer.invoke(IpcChannels.memo.revealInFolder, args)
   },
   tree: {
     updateStructure: (args: TreeUpdateStructureArgs): Promise<Result<void>> =>
@@ -148,6 +173,16 @@ const api: PreloadApi = {
       const listener = (_event: Electron.IpcRendererEvent, payload: OpErrorPayload): void => handler(payload);
       ipcRenderer.on(IpcEvents.opError, listener);
       return () => ipcRenderer.removeListener(IpcEvents.opError, listener);
+    },
+    onShowProperties: (handler: (payload: ShowPropertiesPayload) => void): (() => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, payload: ShowPropertiesPayload): void => handler(payload);
+      ipcRenderer.on(IpcEvents.showProperties, listener);
+      return () => ipcRenderer.removeListener(IpcEvents.showProperties, listener);
+    },
+    onEditorMenuCommand: (handler: (payload: EditorMenuCommandPayload) => void): (() => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, payload: EditorMenuCommandPayload): void => handler(payload);
+      ipcRenderer.on(IpcEvents.editorMenuCommand, listener);
+      return () => ipcRenderer.removeListener(IpcEvents.editorMenuCommand, listener);
     }
   }
 };
