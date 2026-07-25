@@ -3,8 +3,7 @@ import { ipc } from './ipc';
 import { useTheme } from './theme/useTheme';
 import { createOpenMemoState, resolveEffectiveEol, withUpdatedHash, type OpenMemoState } from './editor/eolKeeper';
 import { DEFAULT_EDITOR_SETTINGS, type EditorSettings, type EditorStats } from './editor/codeMirrorSetup';
-import { AUTO_RENAME_DEBOUNCE_MS, buildAutoRenameCandidate, computeFirstNonEmptyLine } from './editor/autoRename';
-import { CodeMirrorEditor, type RevealTarget } from './components/Editor/CodeMirrorEditor';
+import { CodeMirrorEditor, type CodeMirrorEditorHandle, type RevealTarget } from './components/Editor/CodeMirrorEditor';
 import type { DetectedLink } from './editor/links';
 import { TabBar } from './components/TabBar/TabBar';
 import { Tree } from './components/Tree/Tree';
@@ -12,12 +11,14 @@ import { NameInputDialog } from './components/dialogs/NameInputDialog';
 import { ConfirmDialog } from './components/dialogs/ConfirmDialog';
 import { ConflictDialog } from './components/dialogs/ConflictDialog';
 import { PasswordDialog, type PasswordDialogMode, type PasswordDialogSubmitValues } from './components/dialogs/PasswordDialog';
+import { PropertiesDialog } from './components/dialogs/PropertiesDialog';
 import { SearchPanel } from './components/Search/SearchPanel';
 import { StatusBar } from './components/StatusBar/StatusBar';
 import { SettingsDialog } from './components/Settings/SettingsDialog';
-import { EMPTY_SELECTION, type SelectionState } from './store/selection';
+import { EMPTY_SELECTION, selectSingle, type SelectionState } from './store/selection';
 import {
   dropZoneToPosition,
+  findTreeNode,
   toMetaTree,
   updateTreeNode,
   type DropZone,
@@ -29,10 +30,13 @@ import type {
   AddPosition,
   AppInfo,
   ConflictPayload,
+  EditorMenuCommandPayload,
   EditorReportActiveArgs,
   ExternalChangePayload,
+  MemoProperties,
   MetaRecoveredPayload,
   OpErrorPayload,
+  ShowPropertiesPayload,
   TrashFallbackPayload
 } from '@shared/ipc-contract';
 import type { AppSettings, AppSettingsPatch, MetaTreeNode, SearchHit, TabInfo, TreeNode } from '@shared/models';
@@ -40,6 +44,21 @@ import type { AppSettings, AppSettingsPatch, MetaTreeNode, SearchHit, TabInfo, T
 const MIN_TREE_WIDTH = 160;
 const MAX_TREE_WIDTH = 600;
 const DEFAULT_TREE_WIDTH = 260;
+
+/**
+ * 新規メモの既定名を生成する（ユーザー要望: AutoReName廃止に伴い、名前入力ダイアログを挟まず
+ * 「新しいメモ」「新しいメモ(1)」…の形で即作成し、リネームしなければそのままにする）。
+ */
+function generateDefaultMemoName(existingNames: readonly string[]): string {
+  const taken = new Set(existingNames.map((n) => n.toUpperCase()));
+  const base = '新しいメモ';
+  if (!taken.has(base.toUpperCase())) return base;
+  for (let i = 1; i < 10000; i++) {
+    const candidate = `${base}(${i})`;
+    if (!taken.has(candidate.toUpperCase())) return candidate;
+  }
+  return `${base}(${Date.now()})`;
+}
 
 // Ctrl+ホイールでのフォントサイズ変更（DESIGN §2.3）の範囲・刻み幅。
 const MIN_FONT_SIZE = 10;
@@ -85,14 +104,25 @@ interface ConfirmDialogRequest {
   confirmLabel?: string;
   danger?: boolean;
   onConfirm: () => void;
+  /** キャンセル時に追加で行いたい処理があれば指定する（例: Promise の resolve）。
+   * 未指定の場合は従来通りダイアログを閉じるだけ（既存呼び出し元は挙動不変）。 */
+  onCancel?: () => void;
 }
 
 export function App() {
   const { theme, setTheme } = useTheme('light');
+  const [uiFontScale, setUiFontScale] = useState(1);
+  // 常時最前面表示（ユーザー要望）。セッション内のみ（設定への永続化はしない）。
+  const [alwaysOnTop, setAlwaysOnTop] = useState(false);
+  // Windowsログイン時の自動起動（ユーザー要望）。状態はOS（レジストリ）が真実源。
+  const [openAtLogin, setOpenAtLogin] = useState(false);
   const [treeWidth, setTreeWidth] = useState(DEFAULT_TREE_WIDTH);
   const [dragging, setDragging] = useState(false);
   const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
   const bodyRef = useRef<HTMLDivElement | null>(null);
+  // エディタ右クリックメニューの各種コマンド（元に戻す/変換/チェック等, ユーザー要望）を
+  // CodeMirror へ委譲するための ref。
+  const editorRef = useRef<CodeMirrorEditorHandle>(null);
 
   const [tabs, setTabs] = useState<TabInfo[]>([]);
   const [selectedTabId, setSelectedTabId] = useState<string | null>(null);
@@ -154,6 +184,8 @@ export function App() {
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [nameDialog, setNameDialog] = useState<NameDialogRequest | null>(null);
   const [confirmDialog, setConfirmDialog] = useState<ConfirmDialogRequest | null>(null);
+  // プロパティ画面（ユーザー要望）。表示対象の tabId を保持しておき「ファイルの場所を開く」で使う。
+  const [propertiesDialog, setPropertiesDialog] = useState<{ tabId: string; properties: MemoProperties } | null>(null);
   const [trashFallback, setTrashFallback] = useState<TrashFallbackPayload | null>(null);
   // 外部変更との競合（M4, DESIGN §3.3）。表示中はエディタ入力・保存をロックする。
   const [conflictInfo, setConflictInfo] = useState<{ tabId: string; memoName: string } | null>(null);
@@ -170,10 +202,15 @@ export function App() {
   // 平文メモの自動保存デバウンス（M7。既定値。settings:get 応答で上書き, DESIGN §2.6）。
   const plainAutosaveMsRef = useRef(DEFAULT_PLAIN_AUTOSAVE_MS);
   const plainAutosaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // AutoReName（M7, PLAN §5.9/Fix12）: 直近に判定した「最初の非空行」の値（変化検出の基準）と
-  // デバウンスタイマー。暗号化メモでは使わない（値は無視される）。
-  const autoRenameBaselineRef = useRef<string | null>(null);
-  const autoRenameTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // メモを開いた際にエディタへフォーカスを移すかどうか（既定 true）。ツリーの矢印キーによる
+  // 連続移動中だけ false で開き、フォーカスをツリー側に残す（ユーザー要望）。CodeMirrorEditor
+  // 側はこの値をマウント時に一度だけ読むため、消費後は次回の既定に戻す（下の useEffect）。
+  const [editorAutoFocus, setEditorAutoFocus] = useState(true);
+  // 未保存の変更を破棄するか確認するダイアログが表示中かどうか（requestCloseCurrentMemo）。
+  // 非ブロッキングな ConfirmDialog に変更した際、表示中に別のメモ/タブへの切替を重ねて
+  // 要求されても確認ダイアログを二重に出さないためのガード（ユーザー報告バグ対応。
+  // window.confirm はブロッキングだったため元々この心配が無かった）。
+  const pendingDiscardConfirmRef = useRef(false);
   // 同一メモのまま本文を強制的に再読込させるための世代カウンタ（M4）。CodeMirrorEditor は
   // 非制御コンポーネントで `initialContentLF` はマウント時のみ使用するため、外部変更の
   // 静かな反映・競合解決で本文を書き換える際は key に含めてこの値を進め、明示的に
@@ -193,10 +230,18 @@ export function App() {
       .catch((e: unknown) => console.error('app:getInfo failed', e));
 
     ipc
+      .getOpenAtLogin()
+      .then((res) => {
+        if (res.ok) setOpenAtLogin(res.value);
+      })
+      .catch((e: unknown) => console.error('window:getOpenAtLogin failed', e));
+
+    ipc
       .getSettings()
       .then((res) => {
         if (res.ok) {
           setTheme(res.value.theme);
+          setUiFontScale(res.value.uiFontScale ?? 1);
           setTreeWidth(res.value.window.treeWidth);
           setEditorSettings((prev) => ({ ...prev, ...res.value.editorDefaults }));
           setLinkSettings(res.value.links);
@@ -212,6 +257,21 @@ export function App() {
     void refreshTabs();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // UI（エディタ本文を除く）の文字サイズ倍率を CSS 変数として反映する（theme.css/App.css 側は
+  // `calc(Npx * var(--ui-font-scale, 1))` で参照する）。
+  useEffect(() => {
+    document.documentElement.style.setProperty('--ui-font-scale', String(uiFontScale));
+  }, [uiFontScale]);
+
+  // 起動時に前回開いていたメモを復元できるよう、メモを開くたびに settings へ記録する
+  // （ユーザー要望）。復元自体は openMemoDirect 定義後の別 effect で行う。
+  useEffect(() => {
+    if (!openMemo) return;
+    void ipc
+      .setSettings({ lastOpened: { tabId: openMemo.tabId, memoName: openMemo.memoName } })
+      .catch((e: unknown) => console.error('settings:set failed', e));
+  }, [openMemo?.tabId, openMemo?.memoName]);
 
   // evt:metaRecovered / evt:trashFallback / evt:opError 購読。
   useEffect(() => {
@@ -265,7 +325,7 @@ export function App() {
     }
   }, []);
 
-  // --- 平文メモの自動保存（M7, DESIGN §2.6「適度な自動保存」） / AutoReName（M7, PLAN §5.9/Fix12） ---
+  // --- 平文メモの自動保存（M7, DESIGN §2.6「適度な自動保存」） ---
 
   const clearPlainAutosaveTimer = useCallback((): void => {
     if (plainAutosaveTimerRef.current) {
@@ -274,16 +334,14 @@ export function App() {
     }
   }, []);
 
-  const clearAutoRenameTimer = useCallback((): void => {
-    if (autoRenameTimerRef.current) {
-      clearTimeout(autoRenameTimerRef.current);
-      autoRenameTimerRef.current = null;
-    }
-  }, []);
-
   /**
    * 現在開いているメモを安全に閉じてよいかを判定し、必要な後始末を行う。
-   * - 平文メモ: dirty なら window.confirm で破棄確認する（既存 M2 の挙動を維持）。
+   * - 平文メモ: dirty なら破棄確認ダイアログ（自作 ConfirmDialog）で確認する。
+   *   以前は window.confirm を使っていたが、ネイティブモーダル表示中にレンダラーの
+   *   JSスレッド/IME合成状態が同期停止し、キャンセル後にIME入力中の文字が入力不能になる
+   *   バグがあったため、他の確認ダイアログと同じ非ブロッキングな自作ダイアログに統一した
+   *   （ユーザー報告バグ対応）。非ブロッキング化に伴い、表示中に別の切替要求が重ねて来ても
+   *   確認ダイアログを二重に出さないよう `pendingDiscardConfirmRef` でガードする。
    * - 暗号化メモ: 無確認で破棄しない（DESIGN §2.9）。dirty なら crypto:saveEncrypted で
    *   自動保存してから crypto:lock でセッション鍵を破棄する（既定は自動保存を優先,
    *   PLAN §5.5 ロック手順1-2）。保存が失敗した場合（競合等）は中断し、呼び出し元は
@@ -295,12 +353,27 @@ export function App() {
     if (!om) return true;
 
     if (!om.encrypted) {
-      if (dirtyRef.current && !window.confirm('未保存の変更があります。破棄して別のメモを開きますか？')) {
-        return false;
+      if (dirtyRef.current) {
+        if (pendingDiscardConfirmRef.current) return false;
+        pendingDiscardConfirmRef.current = true;
+        const discard = await new Promise<boolean>((resolve) => {
+          setConfirmDialog({
+            title: '未保存の変更',
+            message: '未保存の変更があります。破棄して別のメモを開きますか？',
+            confirmLabel: '破棄して開く',
+            danger: true,
+            onConfirm: () => {
+              setConfirmDialog(null);
+              resolve(true);
+            },
+            onCancel: () => resolve(false)
+          });
+        });
+        pendingDiscardConfirmRef.current = false;
+        if (!discard) return false;
       }
-      // 切り替えが確定した時点で AutoReName/平文自動保存の保留タイマーを解除する（M7。
-      // キャンセルされた場合はここへ到達しないため、保留中の自動保存/リネームは温存される）。
-      clearAutoRenameTimer();
+      // 切り替えが確定した時点で平文自動保存の保留タイマーを解除する（M7。キャンセルされた
+      // 場合はここへ到達しないため、保留中の自動保存は温存される）。
       clearPlainAutosaveTimer();
       return true;
     }
@@ -326,7 +399,7 @@ export function App() {
       console.error('crypto:lock failed', lockRes.error);
     }
     return true;
-  }, [clearEncryptedAutosaveTimer, clearAutoRenameTimer, clearPlainAutosaveTimer]);
+  }, [clearEncryptedAutosaveTimer, clearPlainAutosaveTimer]);
 
   const performEncryptedAutosave = useCallback(async (): Promise<void> => {
     const om = openMemoRef.current;
@@ -400,49 +473,8 @@ export function App() {
     }, plainAutosaveMsRef.current);
   }, [clearPlainAutosaveTimer, performPlainAutosave]);
 
-  // AutoReName（M7, PLAN §5.9/Fix12, DESIGN §2.2）: 最初の非空行が実際に変化した場合のみ、
-  // 編集停止から AUTO_RENAME_DEBOUNCE_MS 後にサニタイズ+重複回避を経てリネームする。
-  // 暗号化メモは対象外（呼び出し側の handleEditorChange で除外する）。
-  const performAutoRename = useCallback(
-    async (tabId: string, oldName: string): Promise<void> => {
-      const om = openMemoRef.current;
-      if (!om || om.tabId !== tabId || om.memoName !== oldName || om.encrypted) return;
-      const conflict = conflictInfoRef.current;
-      if (conflict && conflict.tabId === tabId && conflict.memoName === oldName) return; // 解決中ロック。
-
-      const rawFirstLine = computeFirstNonEmptyLine(contentLFRef.current);
-      if (!rawFirstLine) return;
-      const candidate = buildAutoRenameCandidate(rawFirstLine, collectTreeNames(toMetaTree(tree)), oldName);
-      if (!candidate) return;
-
-      const res = await ipc.renameMemo({ tabId, oldName, newName: candidate });
-      if (!res.ok) {
-        // ベストエフォートの自動処理のため、ユーザーへは通知せず内部ログのみに留める
-        // （00-core-principles.md §10 と同様、レンダラ向けには詳細を出さない方針に倣う）。
-        console.error('AutoReName failed', res.error);
-        return;
-      }
-      setOpenMemo((prev) => (prev && prev.tabId === tabId && prev.memoName === oldName ? { ...prev, memoName: candidate } : prev));
-      reportActiveMemo({ tabId, memoName: candidate, dirty: dirtyRef.current });
-      await refreshTree(tabId);
-    },
-    [tree, reportActiveMemo, refreshTree]
-  );
-
-  const scheduleAutoRename = useCallback(
-    (tabId: string, oldName: string): void => {
-      clearAutoRenameTimer();
-      autoRenameTimerRef.current = setTimeout(() => {
-        autoRenameTimerRef.current = null;
-        void performAutoRename(tabId, oldName);
-      }, AUTO_RENAME_DEBOUNCE_MS);
-    },
-    [clearAutoRenameTimer, performAutoRename]
-  );
-
   useEffect(() => clearEncryptedAutosaveTimer, [clearEncryptedAutosaveTimer]);
   useEffect(() => clearPlainAutosaveTimer, [clearPlainAutosaveTimer]);
-  useEffect(() => clearAutoRenameTimer, [clearAutoRenameTimer]);
 
   // evt:conflict / evt:externalChange 購読（M4, DESIGN §3.3 / docs/milestones/M4-watch.md）。
   // 経路の分離厳守: 本 effect はツリー再取得・「編集中でない」開いているメモの静かな反映
@@ -504,10 +536,8 @@ export function App() {
         setDirty(false);
         setEditorStats(null);
         setReloadGeneration((g) => g + 1);
-        // 外部内容の静かな反映（M7）: 保留中の自動保存/AutoReName の判定基準を新しい本文へ引き直す。
+        // 外部内容の静かな反映（M7）: 保留中の自動保存タイマーを解除する。
         clearPlainAutosaveTimer();
-        clearAutoRenameTimer();
-        autoRenameBaselineRef.current = computeFirstNonEmptyLine(res.value.contentLF);
         reportActiveMemo({ tabId: om.tabId, memoName: om.memoName, dirty: false });
         setStatusMessage(`「${om.memoName}」の外部変更を反映しました。`);
       })();
@@ -517,7 +547,7 @@ export function App() {
       unsubscribeConflict();
       unsubscribeExternalChange();
     };
-  }, [refreshTree, reportActiveMemo, clearEncryptedAutosaveTimer, clearPlainAutosaveTimer, clearAutoRenameTimer]);
+  }, [refreshTree, reportActiveMemo, clearEncryptedAutosaveTimer, clearPlainAutosaveTimer]);
 
   // 競合ダイアログの解決アクション（M4）。
   const handleConflictKeepMine = useCallback(() => {
@@ -585,17 +615,13 @@ export function App() {
         setDirty(false);
         setEditorStats(null);
         setReloadGeneration((g) => g + 1);
-        // 外部内容の採用（M7）: 保留中の自動保存/AutoReName は古い本文を前提にしているため破棄し、
-        // 判定基準を採用後の本文へ引き直す。
+        // 外部内容の採用（M7）: 保留中の自動保存は古い本文を前提にしているため破棄する。
         clearPlainAutosaveTimer();
-        clearAutoRenameTimer();
-        autoRenameBaselineRef.current = computeFirstNonEmptyLine(res.value.contentLF);
         reportActiveMemo({ tabId, memoName, dirty: false });
         setStatusMessage(`「${memoName}」の外部変更を反映しました。`);
       } else {
         // 外部で削除されていた場合など。メモを閉じる。
         clearPlainAutosaveTimer();
-        clearAutoRenameTimer();
         setOpenMemo(null);
         setContentLF('');
         setDirty(false);
@@ -605,13 +631,31 @@ export function App() {
       }
       setConflictInfo(null);
     })();
-  }, [conflictInfo, openMemo, reportActiveMemo, clearEncryptedAutosaveTimer, clearPlainAutosaveTimer, clearAutoRenameTimer]);
+  }, [conflictInfo, openMemo, reportActiveMemo, clearEncryptedAutosaveTimer, clearPlainAutosaveTimer]);
 
   const handleToggleTheme = useCallback(() => {
     const next = theme === 'light' ? 'dark' : 'light';
     setTheme(next);
     void ipc.setSettings({ theme: next }).catch((e: unknown) => console.error('settings:set failed', e));
   }, [theme, setTheme]);
+
+  const handleChangeUiFontScale = useCallback((next: number) => {
+    setUiFontScale(next);
+    void ipc.setSettings({ uiFontScale: next }).catch((e: unknown) => console.error('settings:set failed', e));
+  }, []);
+
+  const handleToggleAlwaysOnTop = useCallback(() => {
+    setAlwaysOnTop((prev) => {
+      const next = !prev;
+      void ipc.setAlwaysOnTop({ enabled: next }).catch((e: unknown) => console.error('window:setAlwaysOnTop failed', e));
+      return next;
+    });
+  }, []);
+
+  const handleChangeOpenAtLogin = useCallback((enabled: boolean) => {
+    setOpenAtLogin(enabled);
+    void ipc.setOpenAtLogin({ enabled }).catch((e: unknown) => console.error('window:setOpenAtLogin failed', e));
+  }, []);
 
   // --- 設定画面（M7, docs/milestones/M7-polish.md）---
   // SettingsDialog 自体は IPC を呼ばず、すべて以下の onChange* 経由で App.tsx が settings:set を
@@ -695,7 +739,7 @@ export function App() {
   }, [refreshTree, reportActiveMemo, requestCloseCurrentMemo]);
 
   const openMemoByName = useCallback(
-    async (memoName: string, encrypted: boolean) => {
+    async (memoName: string, encrypted: boolean, focusEditor = true) => {
       if (!selectedTabId) return;
       if (!(await requestCloseCurrentMemo())) {
         return;
@@ -718,9 +762,7 @@ export function App() {
         setRevealTarget(null);
         setConflictInfo(null);
         setReloadGeneration(0);
-        // AutoReName（M7）: 新規に開いたメモの「最初の非空行」を判定基準として記録する
-        // （この直後に本文を変更していない限り発火しない）。
-        autoRenameBaselineRef.current = computeFirstNonEmptyLine(res.value.contentLF);
+        setEditorAutoFocus(focusEditor);
         reportActiveMemo({ tabId: selectedTabId, memoName, dirty: false });
       } else {
         setStatusMessage(`メモ読込エラー: ${res.error.message}`);
@@ -728,6 +770,13 @@ export function App() {
     },
     [selectedTabId, reportActiveMemo, requestCloseCurrentMemo]
   );
+
+  // editorAutoFocus は CodeMirrorEditor のマウント時に一度だけ消費される「単発の指示」なので、
+  // 反映後（openMemo 変化のたびに実行される本 effect は子のマウント effect より後に走る）は
+  // 次回の既定値である true に戻しておく（ツリーの矢印キー連続移動以外の全経路に影響しないため）。
+  useEffect(() => {
+    setEditorAutoFocus(true);
+  }, [openMemo]);
 
   // 全文検索の結果一覧からのジャンプ（M3-②）。ヒットしたタブ/メモへ切り替えてから、
   // 本文一致の場合は該当箇所を選択・スクロールする（revealTarget 経由、CodeMirrorEditor.tsx）。
@@ -769,7 +818,6 @@ export function App() {
       setRevealTarget(null);
       setConflictInfo(null);
       setReloadGeneration(0);
-      autoRenameBaselineRef.current = computeFirstNonEmptyLine(res.value.contentLF); // AutoReName（M7）。
       reportActiveMemo({ tabId: hit.tabId, memoName: hit.memoName, dirty: false });
       if (hit.matchField === 'body' && hit.matchStart !== undefined && hit.matchEnd !== undefined) {
         revealTokenRef.current += 1;
@@ -805,11 +853,31 @@ export function App() {
       setRevealTarget(null);
       setConflictInfo(null);
       setReloadGeneration(0);
-      autoRenameBaselineRef.current = computeFirstNonEmptyLine(res.value.contentLF); // AutoReName（M7）。
+      // 左ペインの選択も合わせる（ユーザー要望: 起動時復元/memo:リンク遷移でもツリー側の
+      // ハイライト・スクロール位置が追従するように。スクロール自体は Tree.tsx が
+      // openMemoName の変化を見て行う）。
+      setSelection(selectSingle(memoName));
       reportActiveMemo({ tabId, memoName, dirty: false });
     },
     [reportActiveMemo]
   );
+
+  // 起動時に前回開いていたメモを復元する（ユーザー要望）。タブ/メモが削除済み等で復元できない
+  // 場合はエラー表示せず黙って何もしない。暗号化メモの場合は openMemoDirect が自動でパスワード
+  // 入力ダイアログを開く（memo: リンク遷移と同じ挙動、developer 判断）。
+  useEffect(() => {
+    void (async () => {
+      const settingsRes = await ipc.getSettings();
+      if (!settingsRes.ok || !settingsRes.value.lastOpened) return;
+      const { tabId, memoName } = settingsRes.value.lastOpened;
+      const tabsRes = await ipc.listTabs();
+      if (!tabsRes.ok || !tabsRes.value.some((t) => t.id === tabId)) return;
+      await selectTab(tabId);
+      if (selectedTabIdRef.current !== tabId) return;
+      await openMemoDirect(tabId, memoName);
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // 本文中のリンク（CodeMirrorEditor.tsx の buildLinkExtension 経由）をクリックした際のハンドラ。
   const handleLinkClick = useCallback(
@@ -877,21 +945,14 @@ export function App() {
         reportActiveMemo({ tabId: om.tabId, memoName: om.memoName, dirty: true });
         if (om.encrypted) {
           // 暗号化メモの低頻度自動保存（DESIGN §2.6「編集停止から一定時間のデバウンス」, M6）。
-          // AutoReName は暗号化メモ対象外（DESIGN §2.2/§2.9, M6/M7）。
           scheduleEncryptedAutosave();
         } else {
           // 平文メモの自動保存（M7, DESIGN §2.6「適度な自動保存」）。
           schedulePlainAutosave();
-          // AutoReName（M7, PLAN §5.9/Fix12）: 最初の非空行が実際に変化した場合のみ発火する。
-          const firstLine = computeFirstNonEmptyLine(content);
-          if (firstLine.length > 0 && firstLine !== autoRenameBaselineRef.current) {
-            autoRenameBaselineRef.current = firstLine;
-            scheduleAutoRename(om.tabId, om.memoName);
-          }
         }
       }
     },
-    [reportActiveMemo, scheduleEncryptedAutosave, schedulePlainAutosave, scheduleAutoRename]
+    [reportActiveMemo, scheduleEncryptedAutosave, schedulePlainAutosave]
   );
 
   const handleEditorStats = useCallback((stats: EditorStats) => {
@@ -1019,8 +1080,6 @@ export function App() {
       if (!res.ok) {
         clearEncryptedAutosaveTimer();
         clearPlainAutosaveTimer();
-        clearAutoRenameTimer();
-        autoRenameBaselineRef.current = null;
         setOpenMemo(null);
         setContentLF('');
         setDirty(false);
@@ -1030,21 +1089,17 @@ export function App() {
         return;
       }
       if (newEncrypted) {
-        // 暗号化された（AutoReName 対象外へ移行, DESIGN §2.2/§2.9）。保留中の平文自動保存/
-        // AutoReName タイマーは実行時ガード（om.encrypted チェック）で安全に無視されるが、
-        // 明示的に解除しておく（M7, developer 判断）。
+        // 暗号化された。保留中の平文自動保存タイマーは実行時ガード（om.encrypted チェック）で
+        // 安全に無視されるが、明示的に解除しておく（M7, developer 判断）。
         clearPlainAutosaveTimer();
-        clearAutoRenameTimer();
-        autoRenameBaselineRef.current = null;
         setOpenMemo((prev) => (prev ? { ...prev, encrypted: true, lastKnownHash: res.value.hash } : prev));
       } else {
-        // 暗号化解除（平文へ復帰）。AutoReName の判定基準を復帰後の本文へ引き直す（M7）。
-        autoRenameBaselineRef.current = computeFirstNonEmptyLine(res.value.contentLF);
+        // 暗号化解除（平文へ復帰）。
         setOpenMemo(createOpenMemoState(tabId, memoName, res.value));
         setContentLF(res.value.contentLF);
       }
     },
-    [openMemo, reportActiveMemo, clearEncryptedAutosaveTimer, clearPlainAutosaveTimer, clearAutoRenameTimer]
+    [openMemo, reportActiveMemo, clearEncryptedAutosaveTimer, clearPlainAutosaveTimer]
   );
 
   const handleCryptoDialogSubmit = useCallback(
@@ -1145,6 +1200,40 @@ export function App() {
     [tree, persistTreeStructure]
   );
 
+  // 編集ロック切替（本文編集のみ禁止。リネーム/削除等ファイル操作は対象外, ユーザー要望）。
+  const handleRequestToggleLock = useCallback(
+    (memoName: string) => {
+      void persistTreeStructure(updateTreeNode(tree, memoName, (n) => ({ ...n, locked: !n.locked })));
+    },
+    [tree, persistTreeStructure]
+  );
+
+  // プロパティ画面（ユーザー要望）。ツリー右クリック（selectedTabId 前提）とエディタのネイティブ
+  // 右クリックメニュー（evt:showProperties、main 側が把握する現在アクティブなタブ指定）の
+  // 両方から呼ばれる共通処理。
+  const showPropertiesFor = useCallback(async (tabId: string, memoName: string) => {
+    const res = await ipc.getMemoProperties({ tabId, memoName });
+    if (res.ok) {
+      setPropertiesDialog({ tabId, properties: res.value });
+    } else {
+      setStatusMessage(`プロパティ取得エラー[${res.error.code}]: ${res.error.message}`);
+    }
+  }, []);
+
+  const handleRequestProperties = useCallback(
+    (memoName: string) => {
+      if (!selectedTabId) return;
+      void showPropertiesFor(selectedTabId, memoName);
+    },
+    [selectedTabId, showPropertiesFor]
+  );
+
+  useEffect(() => {
+    return ipc.onShowProperties((payload: ShowPropertiesPayload) => {
+      void showPropertiesFor(payload.tabId, payload.memoName);
+    });
+  }, [showPropertiesFor]);
+
   // --- 同一タブ内 DND（並べ替え・階層変更はメタのみ、コピーは memo:move） ---
 
   const handleLocalMove = useCallback(
@@ -1227,25 +1316,20 @@ export function App() {
   const handleRequestCreate = useCallback(
     (position: AddPosition, anchorMemoName?: string) => {
       if (!selectedTabId) return;
-      setNameDialog({
-        title: '新規メモ作成',
-        label: 'メモ名',
-        submitLabel: '作成',
-        onSubmit: (name) => {
-          setNameDialog(null);
-          void (async () => {
-            const res = await ipc.createMemo({ tabId: selectedTabId, name, position, anchorMemoName });
-            if (res.ok) {
-              setStatusMessage(`メモを作成しました: ${res.value.memoName}`);
-              await refreshTree(selectedTabId);
-            } else {
-              setStatusMessage(`メモ作成エラー[${res.error.code}]: ${res.error.message}`);
-            }
-          })();
+      const name = generateDefaultMemoName(collectTreeNames(toMetaTree(tree)));
+      void (async () => {
+        const res = await ipc.createMemo({ tabId: selectedTabId, name, position, anchorMemoName });
+        if (res.ok) {
+          setStatusMessage(`メモを作成しました: ${res.value.memoName}`);
+          await refreshTree(selectedTabId);
+          setSelection(selectSingle(res.value.memoName));
+          await openMemoByName(res.value.memoName, res.value.encrypted);
+        } else {
+          setStatusMessage(`メモ作成エラー[${res.error.code}]: ${res.error.message}`);
         }
-      });
+      })();
     },
-    [selectedTabId, refreshTree]
+    [selectedTabId, tree, refreshTree, openMemoByName]
   );
 
   const handleRequestRename = useCallback(
@@ -1278,22 +1362,6 @@ export function App() {
     [selectedTabId, openMemo, refreshTree, reportActiveMemo]
   );
 
-  const handleRequestDuplicate = useCallback(
-    (memoName: string) => {
-      if (!selectedTabId) return;
-      void (async () => {
-        const res = await ipc.duplicateMemo({ tabId: selectedTabId, memoName });
-        if (res.ok) {
-          setStatusMessage(`複製しました: ${res.value.memoName}`);
-          await refreshTree(selectedTabId);
-        } else {
-          setStatusMessage(`複製エラー[${res.error.code}]: ${res.error.message}`);
-        }
-      })();
-    },
-    [selectedTabId, refreshTree]
-  );
-
   const handleRequestDelete = useCallback(
     (memoNames: string[]) => {
       if (!selectedTabId || memoNames.length === 0) return;
@@ -1311,8 +1379,6 @@ export function App() {
               if (openMemo && memoNames.includes(openMemo.memoName)) {
                 clearEncryptedAutosaveTimer();
                 clearPlainAutosaveTimer();
-                clearAutoRenameTimer();
-                autoRenameBaselineRef.current = null;
                 setOpenMemo(null);
                 setContentLF('');
                 setDirty(false);
@@ -1330,7 +1396,7 @@ export function App() {
         }
       });
     },
-    [selectedTabId, openMemo, refreshTree, reportActiveMemo, clearEncryptedAutosaveTimer, clearPlainAutosaveTimer, clearAutoRenameTimer]
+    [selectedTabId, openMemo, refreshTree, reportActiveMemo, clearEncryptedAutosaveTimer, clearPlainAutosaveTimer]
   );
 
   const handleTrashFallbackConfirm = useCallback(() => {
@@ -1344,8 +1410,6 @@ export function App() {
         if (openMemo && payload.memoNames.includes(openMemo.memoName)) {
           clearEncryptedAutosaveTimer();
           clearPlainAutosaveTimer();
-          clearAutoRenameTimer();
-          autoRenameBaselineRef.current = null;
           setOpenMemo(null);
           setContentLF('');
           setDirty(false);
@@ -1358,15 +1422,15 @@ export function App() {
       }
       if (selectedTabId === payload.tabId) await refreshTree(payload.tabId);
     })();
-  }, [trashFallback, selectedTabId, openMemo, refreshTree, reportActiveMemo, clearEncryptedAutosaveTimer, clearPlainAutosaveTimer, clearAutoRenameTimer]);
+  }, [trashFallback, selectedTabId, openMemo, refreshTree, reportActiveMemo, clearEncryptedAutosaveTimer, clearPlainAutosaveTimer]);
 
   // --- タブ操作（PLAN §2.1） ---
 
   const handleRequestRegisterTab = useCallback(() => {
-    const folderPath = window.prompt('登録するフォルダの絶対パス');
-    if (!folderPath || !folderPath.trim()) return;
     void (async () => {
-      const res = await ipc.registerTab({ folderPath: folderPath.trim() });
+      const picked = await ipc.pickFolder();
+      if (!picked.ok || !picked.value) return;
+      const res = await ipc.registerTab({ folderPath: picked.value });
       if (res.ok) {
         setStatusMessage(`タブを登録しました: ${res.value.name}`);
         await refreshTabs();
@@ -1392,8 +1456,6 @@ export function App() {
   );
 
   const handleRequestCreateTab = useCallback(() => {
-    const parentDir = window.prompt('新規タブ（フォルダ）を作成する親フォルダの絶対パス');
-    if (!parentDir || !parentDir.trim()) return;
     setNameDialog({
       title: '新規タブ作成',
       label: 'タブ（フォルダ）名',
@@ -1401,7 +1463,8 @@ export function App() {
       onSubmit: (name) => {
         setNameDialog(null);
         void (async () => {
-          const res = await ipc.createTab({ parentDir: parentDir.trim(), name });
+          // parentDir 省略時はアプリ本体直下の data フォルダに作成される（ポータブル性優先）。
+          const res = await ipc.createTab({ name });
           if (res.ok) {
             setStatusMessage(`新規タブを作成しました: ${res.value.name}`);
             await refreshTabs();
@@ -1457,8 +1520,6 @@ export function App() {
               if (selectedTabId === tabId) {
                 clearEncryptedAutosaveTimer();
                 clearPlainAutosaveTimer();
-                clearAutoRenameTimer();
-                autoRenameBaselineRef.current = null;
                 setSelectedTabId(null);
                 setTree([]);
                 setOpenMemo(null);
@@ -1476,8 +1537,15 @@ export function App() {
         }
       });
     },
-    [tabs, selectedTabId, refreshTabs, reportActiveMemo, clearEncryptedAutosaveTimer, clearPlainAutosaveTimer, clearAutoRenameTimer]
+    [tabs, selectedTabId, refreshTabs, reportActiveMemo, clearEncryptedAutosaveTimer, clearPlainAutosaveTimer]
   );
+
+  const handleRequestOpenTabFolder = useCallback((tabId: string) => {
+    void (async () => {
+      const res = await ipc.openTabFolder({ tabId });
+      if (!res.ok) setStatusMessage(`フォルダを開けませんでした[${res.error.code}]: ${res.error.message}`);
+    })();
+  }, []);
 
   const handleReorderTabs = useCallback(
     (orderedTabIds: string[]) => {
@@ -1527,6 +1595,48 @@ export function App() {
   // `{ passive: false }` で登録し、確実に preventDefault する。エディタ枠は openMemo の
   // 有無で mount/unmount されるため（DOM ノードが差し替わるため）useEffect ではなく
   // callback ref でその都度リスナーを張り直す。
+  // フォントサイズ変更（clamp + settings:set 永続化のデバウンス）。Ctrl+ホイールと、エディタ
+  // 右クリックメニュー「書式」のフォントサイズ拡大/縮小/リセット（ユーザー要望）の両方から使う。
+  const applyFontSizeChange = useCallback((compute: (prev: number) => number) => {
+    setEditorSettings((prev) => {
+      const next = clampFontSize(compute(prev.fontSize));
+      if (next === prev.fontSize) return prev;
+      if (fontSizePersistTimer.current) clearTimeout(fontSizePersistTimer.current);
+      fontSizePersistTimer.current = setTimeout(() => {
+        void ipc
+          .setSettings({ editorDefaults: { fontSize: next } })
+          .catch((err: unknown) => console.error('settings:set (fontSize) failed', err));
+      }, FONT_SIZE_PERSIST_DEBOUNCE_MS);
+      return { ...prev, fontSize: next };
+    });
+  }, []);
+
+  // エディタ右クリックメニューの各種コマンド（ユーザー要望）。CodeMirror 内部状態を直接触る
+  // ものは editorRef 経由（textCommand）、それ以外は既存の設定変更ハンドラへ委譲する。
+  useEffect(() => {
+    return ipc.onEditorMenuCommand((payload: EditorMenuCommandPayload) => {
+      switch (payload.kind) {
+        case 'textCommand':
+          editorRef.current?.runTextCommand(payload.command);
+          return;
+        case 'setWrap':
+          handleChangeEditorSettingsFromDialog({ wrap: payload.wrap });
+          return;
+        case 'toggleLineNumbers':
+          handleChangeEditorSettingsFromDialog({ showLineNumbers: !editorSettings.showLineNumbers });
+          return;
+        case 'toggleWhitespace':
+          handleChangeEditorSettingsFromDialog({ showWhitespace: !editorSettings.showWhitespace });
+          return;
+        case 'fontSize':
+          if (payload.action === 'increase') applyFontSizeChange((size) => size + FONT_SIZE_STEP);
+          else if (payload.action === 'decrease') applyFontSizeChange((size) => size - FONT_SIZE_STEP);
+          else applyFontSizeChange(() => DEFAULT_EDITOR_SETTINGS.fontSize);
+          return;
+      }
+    });
+  }, [editorSettings.showLineNumbers, editorSettings.showWhitespace, handleChangeEditorSettingsFromDialog, applyFontSizeChange]);
+
   const setEditorWrapNode = useCallback((node: HTMLDivElement | null) => {
     if (editorWheelCleanup.current) {
       editorWheelCleanup.current();
@@ -1537,22 +1647,12 @@ export function App() {
     const handleWheel = (e: WheelEvent): void => {
       if (!e.ctrlKey) return;
       e.preventDefault();
-      setEditorSettings((prev) => {
-        const next = clampFontSize(prev.fontSize + (e.deltaY < 0 ? FONT_SIZE_STEP : -FONT_SIZE_STEP));
-        if (next === prev.fontSize) return prev;
-        if (fontSizePersistTimer.current) clearTimeout(fontSizePersistTimer.current);
-        fontSizePersistTimer.current = setTimeout(() => {
-          void ipc
-            .setSettings({ editorDefaults: { fontSize: next } })
-            .catch((err: unknown) => console.error('settings:set (fontSize) failed', err));
-        }, FONT_SIZE_PERSIST_DEBOUNCE_MS);
-        return { ...prev, fontSize: next };
-      });
+      applyFontSizeChange((size) => size + (e.deltaY < 0 ? FONT_SIZE_STEP : -FONT_SIZE_STEP));
     };
 
     node.addEventListener('wheel', handleWheel, { passive: false });
     editorWheelCleanup.current = () => node.removeEventListener('wheel', handleWheel);
-  }, []);
+  }, [applyFontSizeChange]);
 
   useEffect(
     () => () => {
@@ -1605,11 +1705,14 @@ export function App() {
         onRequestCreate={handleRequestCreateTab}
         onRequestRename={handleRequestRenameTab}
         onRequestRemove={handleRequestRemoveTab}
+        onRequestOpenFolder={handleRequestOpenTabFolder}
         onDropMemo={(destTabId, payload, copy) => void handleDropMemoOnTab(destTabId, payload, copy)}
         onDropExternalFolder={handleDropExternalFolder}
         theme={theme}
         onToggleTheme={handleToggleTheme}
         onRequestSearch={() => setShowSearchPanel(true)}
+        alwaysOnTop={alwaysOnTop}
+        onToggleAlwaysOnTop={handleToggleAlwaysOnTop}
       />
       <div className="app__body" ref={bodyRef}>
         <div className="app__pane app__tree" style={{ width: treeWidth }}>
@@ -1620,18 +1723,20 @@ export function App() {
               openMemoName={openMemo?.memoName ?? null}
               selection={selection}
               onSelectionChange={setSelection}
-              onOpenMemo={(memoName, encrypted) => void openMemoByName(memoName, encrypted)}
+              onOpenMemo={(memoName, encrypted, focusEditor) => void openMemoByName(memoName, encrypted, focusEditor)}
               onToggleExpand={handleToggleExpand}
               onRequestCreate={handleRequestCreate}
               onRequestRename={handleRequestRename}
-              onRequestDuplicate={handleRequestDuplicate}
               onRequestDelete={handleRequestDelete}
               onRequestSetLabel={handleRequestSetLabel}
               onRequestEncrypt={handleRequestEncrypt}
               onRequestDecrypt={handleRequestDecrypt}
               onRequestChangePassword={handleRequestChangePassword}
+              onRequestToggleLock={handleRequestToggleLock}
+              onRequestProperties={handleRequestProperties}
               onLocalMove={(names, anchor, zone) => void handleLocalMove(names, anchor, zone)}
               onLocalCopy={(names, anchor, zone) => void handleLocalCopy(names, anchor, zone)}
+              uiFontScale={uiFontScale}
             />
           ) : (
             <span className="app__tree-placeholder">タブを選択、または新規作成してください。</span>
@@ -1663,15 +1768,18 @@ export function App() {
               </div>
               <CodeMirrorEditor
                 key={`${openMemo.tabId}:${openMemo.memoName}:${reloadGeneration}`}
+                ref={editorRef}
                 initialContentLF={contentLF}
                 onChange={handleEditorChange}
                 onStats={handleEditorStats}
                 onSave={() => void handleSave()}
                 settings={editorSettings}
+                autoFocus={editorAutoFocus}
                 revealTarget={revealTarget}
                 readOnly={
                   (conflictInfo !== null && conflictInfo.tabId === openMemo.tabId && conflictInfo.memoName === openMemo.memoName) ||
-                  (cryptoDialog !== null && cryptoDialog.tabId === openMemo.tabId && cryptoDialog.memoName === openMemo.memoName)
+                  (cryptoDialog !== null && cryptoDialog.tabId === openMemo.tabId && cryptoDialog.memoName === openMemo.memoName) ||
+                  !!findTreeNode(tree, openMemo.memoName)?.locked
                 }
                 linkOpenTrigger={linkSettings.openTrigger}
                 onLinkClick={handleLinkClick}
@@ -1710,7 +1818,10 @@ export function App() {
           confirmLabel={confirmDialog.confirmLabel}
           danger={confirmDialog.danger}
           onConfirm={confirmDialog.onConfirm}
-          onCancel={() => setConfirmDialog(null)}
+          onCancel={() => {
+            confirmDialog.onCancel?.();
+            setConfirmDialog(null);
+          }}
         />
       )}
       {trashFallback && (
@@ -1721,6 +1832,15 @@ export function App() {
           danger
           onConfirm={handleTrashFallbackConfirm}
           onCancel={() => setTrashFallback(null)}
+        />
+      )}
+      {propertiesDialog && (
+        <PropertiesDialog
+          properties={propertiesDialog.properties}
+          onRevealInFolder={() =>
+            void ipc.revealMemoInFolder({ tabId: propertiesDialog.tabId, memoName: propertiesDialog.properties.memoName })
+          }
+          onClose={() => setPropertiesDialog(null)}
         />
       )}
       {conflictInfo && openMemo && conflictInfo.tabId === openMemo.tabId && conflictInfo.memoName === openMemo.memoName && (
@@ -1751,6 +1871,8 @@ export function App() {
         <SettingsDialog
           theme={theme}
           onToggleTheme={handleToggleTheme}
+          uiFontScale={uiFontScale}
+          onChangeUiFontScale={handleChangeUiFontScale}
           editorSettings={editorSettings}
           onChangeEditorSettings={handleChangeEditorSettingsFromDialog}
           linkSettings={linkSettings}
@@ -1761,6 +1883,8 @@ export function App() {
           onChangeEolPolicy={handleChangeEolPolicyFromDialog}
           shortcuts={shortcuts}
           onChangeShortcut={handleChangeShortcutFromDialog}
+          openAtLogin={openAtLogin}
+          onChangeOpenAtLogin={handleChangeOpenAtLogin}
           onClose={() => setShowSettingsDialog(false)}
         />
       )}
