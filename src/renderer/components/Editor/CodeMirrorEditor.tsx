@@ -8,10 +8,11 @@
 // メモ切り替え（`instanceKey` の変更）のたびに親側で React の `key` を変え、本コンポーネントを
 // アンマウント/再マウントさせる運用を前提とする（DESIGN §2.3「Undo履歴はメモ切り替えで破棄」を
 // EditorView の作り直しでそのまま満たす、実装をシンプルに保つ方針）。
-import { useEffect, useRef } from 'react';
+import { forwardRef, useEffect, useImperativeHandle, useRef } from 'react';
 import { EditorSelection, EditorState } from '@codemirror/state';
 import { EditorView } from '@codemirror/view';
 import type { AppSettings } from '@shared/models';
+import type { EditorTextCommand } from '@shared/ipc-contract';
 import {
   INITIAL_SELECTION,
   buildReadOnlyExtension,
@@ -25,7 +26,14 @@ import {
   type EditorSettings,
   type EditorStats
 } from '../../editor/codeMirrorSetup';
+import { buildCheckboxClickExtension } from '../../editor/checkboxClick';
 import { buildLinkExtension, type DetectedLink } from '../../editor/links';
+import { runTextCommand } from '../../editor/textCommands';
+
+/** 親（App.tsx）が ref 経由で呼べる命令的 API（ユーザー要望: 右クリックメニューの元に戻す/変換等）。 */
+export interface CodeMirrorEditorHandle {
+  runTextCommand: (command: EditorTextCommand) => void;
+}
 
 /**
  * 全文検索の結果ジャンプ（M3-②, docs/milestones/M3-search.md「結果一覧からのジャンプ」）用の
@@ -55,18 +63,21 @@ export interface CodeMirrorEditorProps {
   onLinkClick: (link: DetectedLink) => void;
 }
 
-export function CodeMirrorEditor({
-  initialContentLF,
-  onChange,
-  onStats,
-  onSave,
-  settings,
-  readOnly = false,
-  autoFocus = true,
-  revealTarget = null,
-  linkOpenTrigger,
-  onLinkClick
-}: CodeMirrorEditorProps) {
+export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, CodeMirrorEditorProps>(function CodeMirrorEditor(
+  {
+    initialContentLF,
+    onChange,
+    onStats,
+    onSave,
+    settings,
+    readOnly = false,
+    autoFocus = true,
+    revealTarget = null,
+    linkOpenTrigger,
+    onLinkClick
+  },
+  ref
+) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const viewRef = useRef<EditorView | null>(null);
   const compartmentsRef = useRef<EditorCompartments | null>(null);
@@ -108,6 +119,8 @@ export function CodeMirrorEditor({
           getOpenTrigger: () => linkOpenTriggerRef.current,
           onLinkClick: (link) => onLinkClickRef.current(link)
         }),
+        // 行頭チェックボックスのクリック直接トグル（ユーザー要望）。
+        buildCheckboxClickExtension(),
         ...initialCompartmentExtensions(compartments, settings),
         compartments.readOnly.of(buildReadOnlyExtension(readOnly))
       ]
@@ -168,5 +181,16 @@ export function CodeMirrorEditor({
     view.focus();
   }, [revealTarget]);
 
+  useImperativeHandle(
+    ref,
+    () => ({
+      runTextCommand: (command: EditorTextCommand) => {
+        const view = viewRef.current;
+        if (view) runTextCommand(view, command);
+      }
+    }),
+    []
+  );
+
   return <div className="cm-editor-host" ref={hostRef} />;
-}
+});
