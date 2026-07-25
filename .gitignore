@@ -9,6 +9,11 @@ out/
 build/
 release/
 
+# 新規タブ（フォルダ）の既定作成先。ユーザーの実データなのでリポジトリに含めない。
+/data/
+# アプリ設定（app-settings.json 等）の保存先。exe基準のポータブル設定（developer 判断）。
+/config/
+
 # Env / secrets
 .env
 .env.*
