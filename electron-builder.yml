@@ -1,5 +1,8 @@
 # electron-builder configuration (portable Windows distribution, finalized in M7 / PLAN §7 M7
-# "electron-builder ポータブル配布" / DESIGN §6). No code signing (out of v1 scope).
+# "electron-builder ポータブル配布" / DESIGN §6). No code signing (out of v1 scope). No custom
+# app icon asset in use (ユーザー判断でicon01/icon02運用を一旦取りやめ, developer 判断で
+# electron-builderの既定アイコンにフォールバック); icon01.png/icon02.pngは将来再検討用に
+# リポジトリには残す。
 appId: com.tabtreenote.app
 productName: TabTreeNote
 directories:
@@ -7,11 +10,7 @@ directories:
 files:
   - out/**/*
   - package.json
-  - icon01.png
 win:
   target: portable
   artifactName: ${productName}-${version}-portable.${ext}
-  # 実行ファイル（配布アイコン）本体のアイコン。ウィンドウのタイトルバー用アイコン
-  # （icon01.png、別素材）は main/index.ts の BrowserWindow.icon で個別に指定する（ユーザー要望）。
-  icon: icon02.png
 asar: true
