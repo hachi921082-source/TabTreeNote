@@ -64,10 +64,6 @@
 - **前回開いていたメモを起動時に自動で開く**（`AppSettings.lastOpened`）。タブ/メモが削除済みなら何もしない
 - リンクの既定クリック方式を`ctrlClick`→`singleClick`、確認ダイアログを既定OFFに変更（ユーザー要望）
 
-### アプリアイコン
-- **実行ファイル（配布アイコン）に`icon02.png`（256×256）を設定**（`electron-builder.yml`の`win.icon`）。electron-builderのWindowsアイコン要件（最低256×256）を満たさない`icon01.png`（32×32）は実行ファイルアイコンには使えなかった。
-- **ウィンドウのタイトルバー/タスクバーアイコンには別途`icon01.png`を指定**（ユーザー要望: 実行ファイルアイコンとは別素材にしたい）。`icon01.png`をパッケージに含める（`files`に追加）ことで`app.getAppPath()`経由で実行時に解決できるようにし、`BrowserWindow`生成時の`icon`オプションに指定。[index.ts](../src/main/index.ts) / [electron-builder.yml](../electron-builder.yml)
-
 ### UI全般
 - **UI文字サイズ設定**（`uiFontScale`, 80〜150%）を追加。エディタ本文以外（タブ・ツリー・ボタン・設定画面等）の文字サイズを一括調整。設定画面「外観」セクション
 - ダイアログ（名前入力/確認/パスワード/設定画面等）を**Escキーでキャンセル**できるように（`Modal.tsx`に集約）。「外部変更との競合」ダイアログのみ意図的にEsc無効のまま
