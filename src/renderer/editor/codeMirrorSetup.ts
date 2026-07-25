@@ -196,6 +196,12 @@ export function buildStaticExtensions(onChange: (contentLF: string) => void, onS
     { key: 'Shift-Tab', run: indentLess }
   ]);
 
+  // カーソル色をテーマの文字色に連動させる（ユーザー報告バグ: ダークモードで既定の黒カーソルが
+  // 背景に埋もれて全く見えなかった）。CSS変数参照のため、テーマ切替時もJS側の再設定は不要。
+  const cursorTheme = EditorView.theme({
+    '.cm-cursor, .cm-dropCursor': { borderLeftColor: 'var(--color-text)' }
+  });
+
   return [
     history(),
     drawSelection(),
@@ -203,6 +209,7 @@ export function buildStaticExtensions(onChange: (contentLF: string) => void, onS
     rectangularSelection(),
     EditorState.allowMultipleSelections.of(true),
     search({ top: true }),
+    cursorTheme,
     saveKeymap,
     autoIndentKeymap,
     tabKeymap,
