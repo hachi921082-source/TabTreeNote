@@ -4,10 +4,19 @@
 // M3 で tab:register/create/remove の完了点から全文検索インデックス経路①を配線した
 // （docs/milestones/M3-search.md）。tab:rename はフォルダの物理パスが変わるだけで tabId・
 // メモ名は不変（インデックスは tabId をキーにするため）なので更新不要。
-import { ipcMain, type IpcMainInvokeEvent } from 'electron';
-import { IpcChannels, IpcEvents, type IndexUpdatedPayload, type MetaRecoveredPayload, type TabRemoveArgs, type TabRenameArgs, type TabReorderArgs } from '@shared/ipc-contract';
+import { ipcMain, shell, type IpcMainInvokeEvent } from 'electron';
+import {
+  IpcChannels,
+  IpcEvents,
+  type IndexUpdatedPayload,
+  type MetaRecoveredPayload,
+  type TabOpenFolderArgs,
+  type TabRemoveArgs,
+  type TabRenameArgs,
+  type TabReorderArgs
+} from '@shared/ipc-contract';
 import type { Result, TabInfo, TreeSnapshot } from '@shared/models';
-import { ok, wrapHandler } from '../util/result';
+import { err, ok, wrapHandler } from '../util/result';
 import { createTab, getTabFolderPath, listTabs, openTabTree, registerTab, removeTab, renameTab, reorderTabs } from '../fs/tabService';
 import { indexTab, removeTabFromIndex } from '../search/searchIndex';
 import { addWatchedTab, removeWatchedTab, renameWatchedTab } from '../watch/watcher';
@@ -37,7 +46,7 @@ export function registerTabHandlers(): void {
   ipcMain.handle(
     IpcChannels.tab.create,
     wrapHandler(
-      async (event: IpcMainInvokeEvent, args: { parentDir: string; name: string }): Promise<Result<TabInfo>> => {
+      async (event: IpcMainInvokeEvent, args: { parentDir?: string; name: string }): Promise<Result<TabInfo>> => {
         const result = await createTab(args.parentDir, args.name);
         if (result.ok) {
           // 新規フォルダは通常空だが、走査を経路①の唯一の入口として一貫させる。
@@ -95,5 +104,16 @@ export function registerTabHandlers(): void {
     wrapHandler(
       (_event: IpcMainInvokeEvent, args: TabReorderArgs): Promise<Result<void>> => reorderTabs(args.orderedTabIds)
     )
+  );
+
+  ipcMain.handle(
+    IpcChannels.tab.openFolder,
+    wrapHandler(async (_event: IpcMainInvokeEvent, args: TabOpenFolderArgs): Promise<Result<void>> => {
+      const folder = getTabFolderPath(args.tabId);
+      if (!folder.ok) return folder;
+      const openError = await shell.openPath(folder.value);
+      if (openError) return err('NOT_FOUND', `開けませんでした: ${openError}`, folder.value);
+      return ok(undefined);
+    })
   );
 }
