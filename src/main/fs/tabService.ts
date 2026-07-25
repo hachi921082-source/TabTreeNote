@@ -6,8 +6,9 @@ import { promises as fs } from 'node:fs';
 import { basename, dirname, resolve } from 'node:path';
 import type { Result, TabInfo, TreeSnapshot } from '@shared/models';
 import { err, ok } from '../util/result';
-import { isLongPath, normalizeForCompare, validateName } from './pathSafety';
+import { isLongPath, normalizeForCompare, validateExistingName, validateName } from './pathSafety';
 import { getAppSettings, updateAppSettings } from '../settings/appSettings';
+import { defaultTabsRootDir } from './appDataRoot';
 import { loadTabMeta, type LoadedMeta } from './metaStore';
 import { registerSelfWrite } from '../watch/selfWriteRegistry';
 import { withRetry } from './retry';
@@ -56,7 +57,10 @@ export async function registerTab(folderPathRaw: string): Promise<Result<TabInfo
   }
 
   const name = basename(folderPath);
-  const nameCheck = validateName(name);
+  // 登録対象は既に実在するフォルダであり新規作成ではないため、前後空白等を理由に登録自体を
+  // 拒否しない（ユーザー報告バグ: フォルダ名に前後空白があると登録できない事象の確認・修正）。
+  // `validateName` の厳格な規則は `createTab`/`renameTab` の新規命名時のみ課す。
+  const nameCheck = validateExistingName(name);
   if (!nameCheck.ok) return nameCheck;
 
   const settings = getAppSettings();
@@ -74,12 +78,19 @@ export async function registerTab(folderPathRaw: string): Promise<Result<TabInfo
   return ok(tab);
 }
 
-/** 新規フォルダを作成しタブ登録する（`tab:create`）。名前サニタイズ+重複拒否。 */
-export async function createTab(parentDir: string, name: string): Promise<Result<TabInfo>> {
+/**
+ * 新規フォルダを作成しタブ登録する（`tab:create`）。名前サニタイズ+重複拒否。
+ * `parentDirRaw` 省略時はポータブル性を優先し、アプリ本体直下の `data` フォルダ
+ * （[[appDataRoot.ts]] `defaultTabsRootDir`）を既定の作成先として自動生成する（developer 判断）。
+ */
+export async function createTab(parentDirRaw: string | undefined, name: string): Promise<Result<TabInfo>> {
   const nameCheck = validateName(name);
   if (!nameCheck.ok) return nameCheck;
 
-  const resolvedParent = resolve(parentDir);
+  const resolvedParent = resolve(parentDirRaw ?? defaultTabsRootDir());
+  if (!parentDirRaw) {
+    await fs.mkdir(resolvedParent, { recursive: true });
+  }
   if (!(await folderExists(resolvedParent))) {
     return err('NOT_FOUND', `親フォルダが見つかりません: ${resolvedParent}`, resolvedParent);
   }
