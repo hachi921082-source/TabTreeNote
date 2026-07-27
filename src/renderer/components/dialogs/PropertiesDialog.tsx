@@ -23,7 +23,10 @@ function formatDateTime(ms: number): string {
 }
 
 export function PropertiesDialog({ properties, onRevealInFolder, onClose }: PropertiesDialogProps) {
-  const displayName = `${properties.memoName}${properties.encrypted ? '.txtenc' : '.txt'}`;
+  // 【v3 M10a】拡張子は `.txt`/`.md`/`.txtenc` の3種類になったため、決め打ちせず実際のファイル
+  // パス（真実源）から拡張子込みのファイル名を取り出す（取得失敗時のみ従来の決め打きへ後退）。
+  const displayName =
+    properties.filePath.split(/[\\/]/).pop() || `${properties.memoName}${properties.encrypted ? '.txtenc' : '.txt'}`;
 
   return (
     <Modal title="プロパティ" onClose={onClose}>
