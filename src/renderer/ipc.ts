@@ -8,9 +8,14 @@ import type {
   CryptoDecryptToPlainArgs,
   CryptoEncryptMemoArgs,
   CryptoLockArgs,
+  CryptoLockNodeArgs,
   CryptoOpenArgs,
   CryptoOpenResult,
+  CryptoRelockAllInTabArgs,
+  CryptoRelockNodeArgs,
   CryptoSaveEncryptedArgs,
+  CryptoUnlockNodeArgs,
+  CryptoUnlockNodeResult,
   DialogPickFolderArgs,
   EditorMenuCommandPayload,
   EditorReportActiveArgs,
@@ -19,6 +24,7 @@ import type {
   LinkOpenExternalArgs,
   LinkResolveMemoArgs,
   LinkResolveMemoResult,
+  MemoConvertFormatArgs,
   MemoCreateArgs,
   MemoDeleteArgs,
   MemoDuplicateArgs,
@@ -86,6 +92,7 @@ export const ipc = {
   moveMemo: (args: MemoMoveArgs): Promise<Result<void>> => window.api.memo.move(args),
   getMemoProperties: (args: MemoGetPropertiesArgs): Promise<Result<MemoProperties>> => window.api.memo.getProperties(args),
   revealMemoInFolder: (args: MemoRevealInFolderArgs): Promise<Result<void>> => window.api.memo.revealInFolder(args),
+  convertMemoFormat: (args: MemoConvertFormatArgs): Promise<Result<MemoInfo>> => window.api.memo.convertFormat(args),
 
   updateTreeStructure: (args: TreeUpdateStructureArgs): Promise<Result<void>> => window.api.tree.updateStructure(args),
 
@@ -110,6 +117,10 @@ export const ipc = {
   saveEncryptedMemo: (args: CryptoSaveEncryptedArgs): Promise<Result<SaveResult>> => window.api.crypto.saveEncrypted(args),
   changeMemoPassword: (args: CryptoChangePasswordArgs): Promise<Result<void>> => window.api.crypto.changePassword(args),
   lockMemo: (args: CryptoLockArgs): Promise<Result<void>> => window.api.crypto.lock(args),
+  lockNode: (args: CryptoLockNodeArgs): Promise<Result<void>> => window.api.crypto.lockNode(args),
+  unlockNode: (args: CryptoUnlockNodeArgs): Promise<Result<CryptoUnlockNodeResult>> => window.api.crypto.unlockNode(args),
+  relockNode: (args: CryptoRelockNodeArgs): Promise<Result<void>> => window.api.crypto.relockNode(args),
+  relockAllInTab: (args: CryptoRelockAllInTabArgs): Promise<Result<void>> => window.api.crypto.relockAllInTab(args),
 
   onMetaRecovered: (handler: (payload: MetaRecoveredPayload) => void): (() => void) =>
     window.api.events.onMetaRecovered(handler),
