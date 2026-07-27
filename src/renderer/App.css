@@ -234,6 +234,12 @@
   color: var(--color-text-muted);
 }
 
+/* v3 M8: ノードロック中(セッション無し)のプレースホルダ行。 */
+.tree-row__name--node-locked {
+  color: var(--color-text-muted);
+  font-style: italic;
+}
+
 /* --- 右クリックコンテキストメニュー（Tree/ContextMenu.tsx） --- */
 
 .context-menu {
@@ -832,6 +838,41 @@
   flex: 1 1 auto;
 }
 
+/* v3 M10c: ライブプレビュー編集中専用ツールバー（components/Editor/MarkdownToolbar.tsx）。
+   既存の app__editor-toolbar（保存/ロック等の共通ツールバー）の直下に表示する専用の第2段。 */
+.app__markdown-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+  border-bottom: 1px solid var(--color-border);
+  font-size: calc(12px * var(--ui-font-scale, 1));
+  background-color: var(--color-bg-pane);
+}
+
+.app__markdown-toolbar-label {
+  color: var(--color-text-muted);
+  font-weight: bold;
+}
+
+.app__markdown-toolbar-btn {
+  border: 1px solid var(--color-border);
+  background-color: var(--color-bg);
+  color: var(--color-text);
+  border-radius: 4px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+
+.app__markdown-toolbar-btn:hover {
+  border-color: var(--color-accent);
+}
+
+.app__markdown-toolbar-btn--active {
+  border-color: var(--color-accent);
+  background-color: var(--color-accent-soft, var(--color-bg-elevated));
+}
+
 /* --- CodeMirror 6 エディタ本体（components/Editor/CodeMirrorEditor.tsx, M3-①） --- */
 
 .cm-editor-host {
@@ -908,6 +949,18 @@
   color: var(--color-accent);
   text-decoration: underline;
   cursor: pointer;
+}
+
+/* v3 M10b: Markdownライブプレビュー装飾（editor/markdownDecorations.ts の md-decoration
+   ウィジェット。中身はサニタイズ済みHTMLをそのまま描画するため、装飾自体の見た目
+   （文字色/太字/文字サイズ）はインラインstyle属性側で持つ。ここでは画像がエディタ幅を
+   はみ出さないようにするサイズ制約のみ既定で与える, M10c 画像貼り付け機能向け）。 */
+.cm-editor-host .md-decoration img {
+  max-width: 100%;
+  /* v3 M10c: width/height 属性が手動で付与されていても縦横比が崩れないよう、高さは常に
+     幅から自動計算する（imagePaste.ts は既定で width/height を付与しないが、防御的に指定）。 */
+  height: auto;
+  vertical-align: middle;
 }
 
 .app__editor-placeholder {
