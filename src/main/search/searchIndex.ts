@@ -24,6 +24,27 @@ interface IndexEntry {
 const index = new Map<string, Map<string, IndexEntry>>();
 
 /**
+ * 【v3 M10a】Markdown本文から許可リストタグ（`MARKDOWN_ALLOWED_TAGS` = span/img,
+ * src/shared/constants.ts）を除去し、全文検索インデックス用のプレーンテキストへ変換する
+ * （DESIGNv3 §2.6 Q11「タグを除去してからインデックス対象にする」、マッチ判定はタグ除去後の
+ * プレーンテキスト基準の完全一致とする）。
+ * - `<span ...>`/`</span>`: タグ記号のみ除去し、内側のテキストは装飾対象の実文章として残す。
+ * - `<img ...>`: 画像は文章として意味を持たないため要素ごと除去する（自己終了/非終了いずれの
+ *   記法にも対応）。
+ * 本モジュールはメインプロセス側で DOM API を持たないため、DOMPurify 相当の厳密な HTML
+ * パーサは使わず正規表現ベースの簡易実装で足りる（マッチ位置への影響が主目的。ライブプレビュー
+ * 描画用の厳密なサニタイズは M10b の `markdownSanitize.ts`（DOMPurify）が別途担う）。
+ */
+export function stripMarkdownTags(text: string): string {
+  return text.replace(/<img\b[^>]*>/gi, '').replace(/<\/?span\b[^>]*>/gi, '');
+}
+
+/** インデックス格納用に、`.md` のみタグ除去してプレーンテキスト化する（v3 M10a）。 */
+function computeIndexedContent(format: 'plain' | 'markdown', contentLF: string): string {
+  return format === 'markdown' ? stripMarkdownTags(contentLF) : contentLF;
+}
+
+/**
  * 検索処理1回あたりに積み上げるヒット数の上限（安全弁）。DESIGN §4 が想定する
  * 数百〜数千メモ規模を大きく超える異常系（巨大コーパス・全行マッチする正規表現等）で
  * レンダラへ返す配列が無制限に肥大化しないようにする（developer 判断。仕様上の必須要件ではない）。
@@ -39,9 +60,20 @@ function getOrCreateTabMap(tabId: string): Map<string, IndexEntry> {
   return m;
 }
 
-/** 単一メモをインデックスへ反映する（経路①: 保存/作成成功の直後に呼ぶ）。 */
-export function updateMemo(tabId: string, memoName: string, encrypted: boolean, contentLF: string | null): void {
-  getOrCreateTabMap(tabId).set(memoName, { encrypted, contentLF: encrypted ? null : contentLF });
+/**
+ * 単一メモをインデックスへ反映する（経路①: 保存/作成成功の直後に呼ぶ）。
+ * `format`（既定 'plain', v3 M10a）: 'markdown' 指定時のみ `stripMarkdownTags` でタグ除去してから
+ * 格納する。暗号化メモ（`encrypted:true`）は `format` を無視し常に本文を格納しない。
+ */
+export function updateMemo(
+  tabId: string,
+  memoName: string,
+  encrypted: boolean,
+  contentLF: string | null,
+  format: 'plain' | 'markdown' = 'plain'
+): void {
+  const stored = encrypted || contentLF === null ? null : computeIndexedContent(format, contentLF);
+  getOrCreateTabMap(tabId).set(memoName, { encrypted, contentLF: stored });
 }
 
 /** インデックスからメモ1件を除去する（削除成功の直後に呼ぶ）。 */
@@ -96,7 +128,9 @@ export async function indexTab(tabId: string, folderPath: string): Promise<void>
       continue;
     }
     const res = await readMemo(folderPath, s.memoName);
-    tabMap.set(s.memoName, { encrypted: false, contentLF: res.ok ? res.value.contentLF : '' });
+    const contentLF = res.ok ? res.value.contentLF : '';
+    // 【v3 M10a】`.md` はタグ除去してからプレーンテキストとして索引化する（DESIGNv3 §2.6 Q11）。
+    tabMap.set(s.memoName, { encrypted: false, contentLF: computeIndexedContent(s.format, contentLF) });
   }
   index.set(tabId, tabMap);
 }
