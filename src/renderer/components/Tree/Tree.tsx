@@ -21,7 +21,15 @@ import type { TreeNode } from '@shared/models';
 import { rangeSelect, selectSingle, toggleSelection, type SelectionState } from '../../store/selection';
 import { ContextMenu, type ContextMenuItem } from './ContextMenu';
 import { TreeRow, BASE_ROW_HEIGHT } from './TreeRow';
-import { computeVirtualRange, flattenVisibleTree, MEMO_DND_MIME, type DropZone, type MemoDragPayload } from './treeView';
+import {
+  computeVirtualRange,
+  findTreeNodeInScope,
+  flattenVisibleTree,
+  isLockBoundaryMoveAllowed,
+  MEMO_DND_MIME,
+  type DropZone,
+  type MemoDragPayload
+} from './treeView';
 
 const LABEL_PRESETS: { name: string; color: string | null }[] = [
   { name: 'なし', color: null },
@@ -38,13 +46,20 @@ export interface TreeProps {
   selection: SelectionState;
   onSelectionChange: (next: SelectionState) => void;
   /** `focusEditor` 省略時（クリック等）は既定でエディタへフォーカス移動する。矢印キー連続移動の
-   * 間はツリー側にフォーカスを残したいため（ユーザー要望）、その場合のみ明示的に `false` を渡す。 */
-  onOpenMemo: (memoName: string, encrypted: boolean, focusEditor?: boolean) => void;
-  onToggleExpand: (memoName: string) => void;
-  onRequestCreate: (position: AddPosition, anchorMemoName?: string) => void;
-  onRequestRename: (memoName: string) => void;
-  onRequestDelete: (memoNames: string[]) => void;
-  onRequestSetLabel: (memoName: string, color: string | null) => void;
+   * 間はツリー側にフォーカスを残したいため（ユーザー要望）、その場合のみ明示的に `false` を渡す。
+   * `lockToken`（M9a-R2-01）: 対象行自身が保持する `lockToken`（行データそのものから取得できる
+   * ため取り違えようがない）。呼び出し元はこれを hint として `memoName` 文字列一致のみに頼らず
+   * 対象ノードを解決する。 */
+  onOpenMemo: (memoName: string, encrypted: boolean, focusEditor?: boolean, lockToken?: string) => void;
+  onToggleExpand: (memoName: string, lockToken?: string) => void;
+  /**
+   * v3 M10c: `format`（省略時 'plain'=`.txt`）。新規メモ作成時に「通常メモ」「Markdownメモ」を
+   * 選択できるUI（DESIGNv3 §2.4、docs/v3/milestones/M10c-markdown-toolbar-ui.md）。
+   */
+  onRequestCreate: (position: AddPosition, anchorMemoName?: string, anchorLockToken?: string, format?: 'plain' | 'markdown') => void;
+  onRequestRename: (memoName: string, lockToken?: string) => void;
+  onRequestDelete: (memoNames: string[], lockToken?: string) => void;
+  onRequestSetLabel: (memoName: string, color: string | null, lockToken?: string) => void;
   /** パスワードを設定して暗号化する（平文メモのみ, M6）。 */
   onRequestEncrypt: (memoName: string) => void;
   /** 暗号化を解除して平文へ戻す（暗号化メモのみ, M6）。 */
@@ -52,13 +67,33 @@ export interface TreeProps {
   /** パスワードを変更する（暗号化メモのみ, M6）。 */
   onRequestChangePassword: (memoName: string) => void;
   /** 編集ロックの切替（本文編集のみ禁止。リネーム/削除等ファイル操作は対象外, ユーザー要望）。 */
-  onRequestToggleLock: (memoName: string) => void;
+  onRequestToggleLock: (memoName: string, lockToken?: string) => void;
   /** プロパティ画面を開く（ユーザー要望）。 */
   onRequestProperties: (memoName: string) => void;
-  /** 同一タブ内の並べ替え・階層変更（ファイル移動不要, tree:updateStructure）。 */
-  onLocalMove: (draggedNames: string[], destAnchorMemoName: string, zone: DropZone) => void;
-  /** 同一タブ内コピー（実ファイル複製が必要, memo:move copy:true）。 */
-  onLocalCopy: (draggedNames: string[], destAnchorMemoName: string, zone: DropZone) => void;
+  /** v3 M8: サブツリーをロックする（対象ノード=起点。M6個別暗号化とは別物, DESIGNv3 §1）。 */
+  onRequestLockNode: (memoName: string) => void;
+  /** v3 M8: ロック中サブツリーを解除する（`memoName` は難読化トークン）。 */
+  onRequestUnlockNode: (memoName: string) => void;
+  /** 同一タブ内の並べ替え・階層変更（ファイル移動不要な場合は tree:updateStructure、ロック境界を
+   * 跨ぐ「外→内」移動は実ファイルの暗号化変換を伴うため memo:move, v3 M9b）。`anchorLockToken`
+   * はドロップ先アンカー行自身が保持する `lockToken`（M9a-R2-01 hint）。`srcLockToken` はドラッグ
+   * 元の行自身が保持する `lockToken`（v3 M9b、「一方通行の金庫」判定用 hint）。 */
+  onLocalMove: (
+    draggedNames: string[],
+    destAnchorMemoName: string,
+    zone: DropZone,
+    anchorLockToken?: string,
+    srcLockToken?: string
+  ) => void;
+  /** 同一タブ内コピー（実ファイル複製が必要, memo:move copy:true）。`srcLockToken`/`anchorLockToken`
+   * は onLocalMove と同じ意味（v3 M9b）。 */
+  onLocalCopy: (
+    draggedNames: string[],
+    destAnchorMemoName: string,
+    zone: DropZone,
+    anchorLockToken?: string,
+    srcLockToken?: string
+  ) => void;
   /** UI 文字サイズ倍率（設定画面「外観」）。行高（仮想化・DnD 判定に使う固定高）をこれに連動させる。 */
   uiFontScale: number;
 }
@@ -68,6 +103,10 @@ interface ContextMenuState {
   y: number;
   /** null = 行ではなく空白部分の右クリック（ユーザー要望: ツリーが空でもメモを作成できるように）。 */
   memoName: string | null;
+  /** M9a-R2-01: 右クリックされた行自身が保持する `lockToken`（行データそのものから取得、
+   * 取り違えようがない）。`memoName` の再検索（`flatRows.find` 等）に頼らずそのまま保持しておき、
+   * `buildContextMenuItems` の対象解決 hint として使う。 */
+  lockToken?: string;
 }
 
 export function Tree({
@@ -87,6 +126,8 @@ export function Tree({
   onRequestChangePassword,
   onRequestToggleLock,
   onRequestProperties,
+  onRequestLockNode,
+  onRequestUnlockNode,
   onLocalMove,
   onLocalCopy,
   uiFontScale
@@ -96,6 +137,9 @@ export function Tree({
   const [viewportHeight, setViewportHeight] = useState(400);
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [dragNames, setDragNames] = useState<string[] | null>(null);
+  // v3 M9b: ドラッグ元の行自身が保持する lockToken（掴んだ行そのもの、取り違えようがない）。
+  // 「一方通行の金庫」（DESIGNv3 §1.12）の事前拒否判定に使う。undefined = 通常領域からのドラッグ。
+  const [dragLockToken, setDragLockToken] = useState<string | undefined>(undefined);
   const [dropTarget, setDropTarget] = useState<{ memoName: string; zone: DropZone } | null>(null);
 
   const rowHeight = Math.round(BASE_ROW_HEIGHT * uiFontScale);
@@ -118,7 +162,16 @@ export function Tree({
         if (selection.selected.size !== 1) return;
         e.preventDefault();
         const [memoName] = selection.selected;
-        if (memoName) onRequestRename(memoName);
+        // M9a-R2-01 既知の限界: キーボード操作（F2）は特定の行への直接参照を持たないため、
+        // `flatRows.find` による memoName 一致検索（同名ノードが複数スコープに同時存在する
+        // 場合は取り違えうる, PLANv3 §7.3）に頼る。マウス操作（クリック/右クリック/ドラッグ）は
+        // 行データそのものから hint を取得するため、この限界の対象外（AGENT_LOG参照）。
+        const row = memoName ? flatRows.find((r) => r.memoName === memoName) : undefined;
+        // v3 M8: ロック中(セッション無し)ノードは実名が無いためF2リネーム対象外
+        // （右クリックメニューでも同様に非表示, buildContextMenuItems 参照）。
+        if (memoName && !row?.nodeLocked) {
+          onRequestRename(memoName, row?.lockToken);
+        }
         return;
       }
 
@@ -142,7 +195,10 @@ export function Tree({
       onSelectionChange(selectSingle(nextRow.memoName));
       // 矢印キーでの連続移動中はツリー側にフォーカスを残す（ユーザー要望: 移動のたびに右ペイン
       // へフォーカスが奪われると、そのまま↑/↓を押し続けられなくなるため）。
-      onOpenMemo(nextRow.memoName, nextRow.encrypted, false);
+      // v3 M8: ロック中(セッション無し)ノードは開こうとしない（handleRowClick と同様）。
+      // nextRow は flatRows 中の特定の行そのものなので、その lockToken をそのまま hint として渡す
+      // （M9a-R2-01）。
+      if (!nextRow.nodeLocked) onOpenMemo(nextRow.memoName, nextRow.encrypted, false, nextRow.lockToken);
 
       const rowTop = nextIndex * rowHeight;
       const rowBottom = rowTop + rowHeight;
@@ -177,7 +233,7 @@ export function Tree({
   }, []);
 
   const handleRowClick = useCallback(
-    (memoName: string, encrypted: boolean, e: ReactMouseEvent) => {
+    (memoName: string, encrypted: boolean, nodeLocked: boolean, lockToken: string | undefined, e: ReactMouseEvent) => {
       // F2 リネームはこのコンテナが DOM フォーカスを持っている必要がある（行クリック時点で
       // 明示的にフォーカスしておく。ユーザー要望）。
       containerRef.current?.focus();
@@ -190,42 +246,70 @@ export function Tree({
         return;
       }
       onSelectionChange(selectSingle(memoName));
-      onOpenMemo(memoName, encrypted);
+      // v3 M8: ロック中(セッション無し)ノードはクリックで開こうとしない（M6の「暗号化メモを
+      // クリックでパスワード入力ダイアログへ」という既存挙動と衝突するため。ロック解除は
+      // 右クリックメニュー「ロックを解除」専用の導線, DESIGNv3 §1.11）。
+      if (nodeLocked) return;
+      // クリックされた行そのものの lockToken を hint として渡す（M9a-R2-01、取り違えようがない）。
+      onOpenMemo(memoName, encrypted, undefined, lockToken);
     },
     [selection, visibleOrder, onSelectionChange, onOpenMemo]
   );
 
   const handleContextMenu = useCallback(
-    (memoName: string, e: ReactMouseEvent) => {
+    (memoName: string, lockToken: string | undefined, e: ReactMouseEvent) => {
       e.preventDefault();
       if (!selection.selected.has(memoName)) {
         onSelectionChange(selectSingle(memoName));
       }
-      setContextMenu({ x: e.clientX, y: e.clientY, memoName });
+      // 右クリックされた行そのものの lockToken を保持する（M9a-R2-01）。
+      setContextMenu({ x: e.clientX, y: e.clientY, memoName, lockToken });
     },
     [selection, onSelectionChange]
   );
 
   const handleDragStart = useCallback(
-    (memoName: string, e: ReactDragEvent) => {
+    (memoName: string, lockToken: string | undefined, nodeLocked: boolean | undefined, e: ReactDragEvent) => {
       const names = selection.selected.has(memoName) ? [...selection.selected] : [memoName];
       setDragNames(names);
-      const payload: MemoDragPayload = { srcTabId: tabId, memoNames: names };
+      // v3 M9b: 実際に掴んだ行そのものの lockToken を代表値として保持する（取り違えようがない）。
+      setDragLockToken(lockToken);
+      // reviewer指摘 M9b-R1-01: 掴んだ行自身が nodeLocked（未解除の🔒プレースホルダ）かどうかも
+      // 別途 payload へ含める（srcLockToken だけでは区別できないケースへの対処、treeView.ts
+      // MemoDragPayload.srcNodeLocked のコメント参照）。
+      const payload: MemoDragPayload = {
+        srcTabId: tabId,
+        memoNames: names,
+        srcLockToken: lockToken,
+        srcNodeLocked: nodeLocked || undefined
+      };
       e.dataTransfer.setData(MEMO_DND_MIME, JSON.stringify(payload));
       e.dataTransfer.effectAllowed = 'copyMove';
     },
     [selection, tabId]
   );
 
-  const handleRowDragOver = useCallback((memoName: string, zone: DropZone) => {
-    setDropTarget({ memoName, zone });
+  // v3 M8: ロック中(セッション無し)ノードは children が常に空でなければならない（DESIGNv3 §1.2/
+  // §1.6）。'child' ドロップ（=その配下へ入れる操作）だけは 'after'（兄弟として後ろへ）へ丸める。
+  // 'before'/'after'（ロック済みノード自体を並べ替える操作）は許可する（DESIGNv3 §1.1 の
+  // 「配下への」構造変更禁止はプレースホルダ自身の並び替えまでは制限しない）。
+  function clampZoneForLockedTarget(zone: DropZone, nodeLocked: boolean | undefined): DropZone {
+    return nodeLocked && zone === 'child' ? 'after' : zone;
+  }
+
+  const handleRowDragOver = useCallback((memoName: string, zone: DropZone, nodeLocked?: boolean) => {
+    setDropTarget({ memoName, zone: clampZoneForLockedTarget(zone, nodeLocked) });
   }, []);
 
   const handleRowDrop = useCallback(
-    (memoName: string, zone: DropZone, e: ReactDragEvent) => {
+    (memoName: string, zone: DropZone, e: ReactDragEvent, nodeLocked?: boolean, lockToken?: string) => {
       setDropTarget(null);
       const raw = e.dataTransfer.getData(MEMO_DND_MIME);
+      // ドラッグ状態はここでクリアする前に控えておく（v3 M9b の事前拒否判定・呼び出し元への
+      // hint 引き渡しに使う）。
+      const srcLockToken = dragLockToken;
       setDragNames(null);
+      setDragLockToken(undefined);
       if (!raw) return;
       let payload: MemoDragPayload;
       try {
@@ -235,55 +319,114 @@ export function Tree({
       }
       if (payload.srcTabId !== tabId) return; // タブ間ドロップは TabBar 側 (memo:move) が扱う。
       if (payload.memoNames.includes(memoName)) return; // 自分自身へのドロップは無視。
+      // v3 M9b: 「一方通行の金庫」の事前拒否（多層防御の2段目。1段目は TreeRow.tsx の
+      // canAcceptDrop による preventDefault 抑制。ネイティブ DnD の癖で万一ここへ到達しても
+      // 再検証する）。IPC側（memoHandlers.ts handleLockBoundaryMove）でも同一ルールを再検証する。
+      if (!isLockBoundaryMoveAllowed(srcLockToken, lockToken)) return;
+      const effectiveZone = clampZoneForLockedTarget(zone, nodeLocked);
       const copy = e.ctrlKey;
       if (copy) {
-        onLocalCopy(payload.memoNames, memoName, zone);
+        onLocalCopy(payload.memoNames, memoName, effectiveZone, lockToken, srcLockToken);
       } else {
-        onLocalMove(payload.memoNames, memoName, zone);
+        // ドロップ先アンカー行そのものの lockToken を hint として渡す（M9a-R2-01）。
+        // srcLockToken はドラッグ元行自身の lockToken hint（v3 M9b）。
+        onLocalMove(payload.memoNames, memoName, effectiveZone, lockToken, srcLockToken);
       }
     },
-    [tabId, onLocalMove, onLocalCopy]
+    [tabId, onLocalMove, onLocalCopy, dragLockToken]
   );
 
   const buildContextMenuItems = useCallback(
-    (memoName: string | null): ContextMenuItem[] => {
+    (memoName: string | null, lockToken: string | undefined): ContextMenuItem[] => {
       // 空白部分の右クリック（ユーザー要望）: ツリーが空でも「メモを作成」だけは常に出す。
+      // v3 M10c: 「通常メモ」「Markdownメモ」を選べるサブメニューにする（DESIGNv3 §2.4）。
       if (memoName === null) {
-        return [{ label: 'メモを作成', onSelect: () => onRequestCreate('last') }];
+        return [
+          {
+            label: 'メモを作成',
+            submenu: [
+              { label: '通常メモ', onSelect: () => onRequestCreate('last', undefined, undefined, 'plain') },
+              { label: 'Markdownメモ', onSelect: () => onRequestCreate('last', undefined, undefined, 'markdown') }
+            ]
+          }
+        ];
       }
       const multi = selection.selected.size > 1 && selection.selected.has(memoName);
       // M6: 暗号化/暗号化解除/パスワード変更は単一選択時のみ（rename/duplicate と同様の制約）。
-      const row = flatRows.find((r) => r.memoName === memoName);
+      // M9a-R2-01: `lockToken` は右クリックされた行そのものから ContextMenuState に保持しておいた
+      // hint（handleContextMenu 参照）。`flatRows.find((r) => r.memoName === memoName)`
+      // （文字列一致のみ）だと、同名ノードが複数スコープに同時存在する場合（PLANv3 §7.3）に
+      // 誤った行の情報を参照しうるため、scope-qualified な `findTreeNodeInScope` を使う。
+      const row = findTreeNodeInScope(tree, memoName, lockToken);
       const rowEncrypted = row?.encrypted ?? false;
       const rowLocked = row?.locked ?? false;
+      const rowNodeLocked = row?.nodeLocked ?? false;
+      // v3 M9a: ロック解除セッション配下（起点＋子孫、row.lockToken あり）は、M6 個別暗号化
+      // （暗号化解除/パスワード変更/暗号化する）・入れ子ロック（サブツリーをロック）・
+      // プロパティが今回のレンダラ配線の対象外（crypto:encryptMemo 等・memo:getProperties は
+      // lockContext を運べない、crypto:lockNode/unlockNode の入れ子ロックは別タスクの検討事項,
+      // AGENT_LOG参照）。誤操作でわかりにくい NOT_FOUND 等に繋がるため導線ごと隠す。
+      const rowInSession = !!row?.lockToken;
       // ユーザー要望: 前/後/子の3項目は「メモを作成」1つに統一し、常に後ろ（'after'）に追加する。
-      const items: ContextMenuItem[] = [{ label: 'メモを作成', onSelect: () => onRequestCreate('after', memoName) }];
+      // v3 M10c: 「通常メモ」「Markdownメモ」を選べるサブメニューにする（DESIGNv3 §2.4）。
+      const items: ContextMenuItem[] = [
+        {
+          label: 'メモを作成',
+          submenu: [
+            { label: '通常メモ', onSelect: () => onRequestCreate('after', memoName, lockToken, 'plain') },
+            { label: 'Markdownメモ', onSelect: () => onRequestCreate('after', memoName, lockToken, 'markdown') }
+          ]
+        }
+      ];
+
+      // v3 M8: ロック中(セッション無し)ノードは「🔒(ロック中)」プレースホルダであり、実名が無い
+      // ため名前変更/編集ロック/暗号化/ラベル/プロパティ等は一切意味を持たない（DESIGNv3 §1.2
+      // 「🔒以外の情報を一切見せない」）。単一選択時は「ロックを解除」のみを、複数選択が絡む
+      // 場合も削除だけを許可する（既存の削除フローがそのまま個別ファイル削除として扱える）。
+      if (rowNodeLocked) {
+        if (!multi) {
+          items.push({ label: 'ロックを解除', onSelect: () => onRequestUnlockNode(memoName), separatorBefore: true });
+        }
+        items.push({
+          label: '削除',
+          danger: true,
+          separatorBefore: true,
+          onSelect: () => onRequestDelete(multi ? [...selection.selected] : [memoName], lockToken)
+        });
+        return items;
+      }
+
       if (!multi) {
         items.push(
-          { label: '名前変更', onSelect: () => onRequestRename(memoName), separatorBefore: true },
+          { label: '名前変更', onSelect: () => onRequestRename(memoName, lockToken), separatorBefore: true },
           {
             label: rowLocked ? '編集ロックを解除' : '編集ロック',
-            onSelect: () => onRequestToggleLock(memoName)
+            onSelect: () => onRequestToggleLock(memoName, lockToken)
           }
         );
-        if (rowEncrypted) {
-          items.push(
-            { label: '暗号化を解除', onSelect: () => onRequestDecrypt(memoName), separatorBefore: true },
-            { label: 'パスワードを変更', onSelect: () => onRequestChangePassword(memoName) }
-          );
-        } else {
-          items.push({
-            label: 'パスワードを設定して暗号化',
-            separatorBefore: true,
-            onSelect: () => onRequestEncrypt(memoName)
-          });
+        if (!rowInSession) {
+          if (rowEncrypted) {
+            items.push(
+              { label: '暗号化を解除', onSelect: () => onRequestDecrypt(memoName), separatorBefore: true },
+              { label: 'パスワードを変更', onSelect: () => onRequestChangePassword(memoName) }
+            );
+          } else {
+            items.push({
+              label: 'パスワードを設定して暗号化',
+              separatorBefore: true,
+              onSelect: () => onRequestEncrypt(memoName)
+            });
+          }
+          // v3 M8: サブツリーをロック（対象配下にM6個別暗号化メモが混在する場合はIPC側で
+          // LOCK_CONTAINS_ENCRYPTED として拒否される, DESIGNv3 §1.10）。
+          items.push({ label: 'サブツリーをロック', onSelect: () => onRequestLockNode(memoName) });
         }
       }
       items.push({
         label: '削除',
         danger: true,
         separatorBefore: true,
-        onSelect: () => onRequestDelete(multi ? [...selection.selected] : [memoName])
+        onSelect: () => onRequestDelete(multi ? [...selection.selected] : [memoName], lockToken)
       });
       if (!multi) {
         items.push({
@@ -292,16 +435,18 @@ export function Tree({
           submenu: LABEL_PRESETS.map((preset) => ({
             label: preset.name,
             swatchColor: preset.color,
-            onSelect: () => onRequestSetLabel(memoName, preset.color)
+            onSelect: () => onRequestSetLabel(memoName, preset.color, lockToken)
           }))
         });
-        items.push({ label: 'プロパティ', onSelect: () => onRequestProperties(memoName) });
+        if (!rowInSession) {
+          items.push({ label: 'プロパティ', onSelect: () => onRequestProperties(memoName) });
+        }
       }
       return items;
     },
     [
+      tree,
       selection,
-      flatRows,
       onRequestCreate,
       onRequestRename,
       onRequestDelete,
@@ -310,6 +455,8 @@ export function Tree({
       onRequestDecrypt,
       onRequestChangePassword,
       onRequestToggleLock,
+      onRequestLockNode,
+      onRequestUnlockNode,
       onRequestProperties
     ]
   );
@@ -333,7 +480,10 @@ export function Tree({
         <div className="tree-spacer" style={{ height: range.paddingTop + range.paddingBottom + visibleRows.length * rowHeight }}>
           {visibleRows.map((row, i) => (
             <TreeRow
-              key={row.memoName}
+              // M9a-R2-01: memoName のみだと、ロック解除セッション配下はセッション単位でのみ
+              // 一意（PLANv3 §7.3）という設計上、同名ノードが同時に複数スコープに存在した際に
+              // React の key が重複し描画/イベントの取り違えを招く。lockToken を含めて一意にする。
+              key={`${row.lockToken ?? ''}:${row.memoName}`}
               row={row}
               top={range.paddingTop + i * rowHeight}
               rowHeight={rowHeight}
@@ -341,15 +491,19 @@ export function Tree({
               isOpenMemo={openMemoName === row.memoName}
               isDragging={dragNames?.includes(row.memoName) ?? false}
               dropZone={dropTarget?.memoName === row.memoName ? dropTarget.zone : null}
-              onClick={(e) => handleRowClick(row.memoName, row.encrypted, e)}
-              onContextMenu={(e) => handleContextMenu(row.memoName, e)}
-              onToggleExpand={() => onToggleExpand(row.memoName)}
-              onDragStart={(e) => handleDragStart(row.memoName, e)}
-              onDragOver={(_e, zone) => handleRowDragOver(row.memoName, zone)}
+              // v3 M9b: ドラッグ中でなければ常に許可（dragNames が null）。ドラッグ中は「一方通行の
+              // 金庫」判定（掴んだ行の dragLockToken → この行の lockToken）で可否を決める。
+              canAcceptDrop={!dragNames || isLockBoundaryMoveAllowed(dragLockToken, row.lockToken)}
+              onClick={(e) => handleRowClick(row.memoName, row.encrypted, row.nodeLocked ?? false, row.lockToken, e)}
+              onContextMenu={(e) => handleContextMenu(row.memoName, row.lockToken, e)}
+              onToggleExpand={() => onToggleExpand(row.memoName, row.lockToken)}
+              onDragStart={(e) => handleDragStart(row.memoName, row.lockToken, row.nodeLocked, e)}
+              onDragOver={(_e, zone) => handleRowDragOver(row.memoName, zone, row.nodeLocked)}
               onDragLeave={() => setDropTarget((prev) => (prev?.memoName === row.memoName ? null : prev))}
-              onDrop={(e, zone) => handleRowDrop(row.memoName, zone, e)}
+              onDrop={(e, zone) => handleRowDrop(row.memoName, zone, e, row.nodeLocked, row.lockToken)}
               onDragEnd={() => {
                 setDragNames(null);
+                setDragLockToken(undefined);
                 setDropTarget(null);
               }}
             />
@@ -367,7 +521,7 @@ export function Tree({
         <ContextMenu
           x={contextMenu.x}
           y={contextMenu.y}
-          items={buildContextMenuItems(contextMenu.memoName)}
+          items={buildContextMenuItems(contextMenu.memoName, contextMenu.lockToken)}
           onClose={() => setContextMenu(null)}
         />
       )}
