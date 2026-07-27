@@ -15,6 +15,11 @@ export interface TxtEncFile {
   eol: Eol;
   /** 任意のパスワードヒント。平文保存（UI 側で警告表示すること）。 */
   hint?: string;
+  /**
+   * 【v3 M10a】元ファイルの保存形式（DESIGNv3 §2.5 Q8、docs/data-model.md §3）。
+   * 省略時は 'plain'（後方互換。v1/M6 で作成された既存 `.txtenc` は本フィールドを持たない）。
+   */
+  format?: 'plain' | 'markdown';
   ciphertextB64: string;
 }
 
@@ -24,6 +29,8 @@ export interface BuildTxtEncFileParams {
   tagB64: string;
   eol: Eol;
   hint?: string;
+  /** 【v3 M10a】省略時/'plain' 指定時はヘッダへ書き出さない（後方互換の既定値と同じ表現に揃える）。 */
+  format?: 'plain' | 'markdown';
   ciphertextB64: string;
   kdf: KdfParams;
 }
@@ -43,6 +50,10 @@ export function buildTxtEncFile(params: BuildTxtEncFileParams): TxtEncFile {
   // 型上も optional であることを明確にする）。
   if (params.hint !== undefined && params.hint.length > 0) {
     file.hint = params.hint;
+  }
+  // 【v3 M10a】'markdown' のときのみ書き出す（'plain'/省略は既定値のため省略, hint と同じ流儀）。
+  if (params.format === 'markdown') {
+    file.format = 'markdown';
   }
   return file;
 }
@@ -78,6 +89,8 @@ export function parseTxtEncFile(buf: Buffer): TxtEncFile | null {
   }
   if (typeof v.ciphertextB64 !== 'string') return null;
   if (v.eol !== 'crlf' && v.eol !== 'lf' && v.eol !== 'cr') return null;
+  // 【v3 M10a】未知の値は破損/非対応形式として扱う（省略=undefinedのみ後方互換で許容, §2.5 Q8）。
+  if (v.format !== undefined && v.format !== 'plain' && v.format !== 'markdown') return null;
 
   return {
     magic: v.magic,
@@ -86,6 +99,7 @@ export function parseTxtEncFile(buf: Buffer): TxtEncFile | null {
     cipher: { algo: 'aes-256-gcm', ivB64: cipher.ivB64, tagB64: cipher.tagB64 },
     eol: v.eol,
     hint: typeof v.hint === 'string' ? v.hint : undefined,
+    format: v.format === 'markdown' ? 'markdown' : undefined,
     ciphertextB64: v.ciphertextB64
   };
 }
