@@ -13,9 +13,14 @@ import {
   type CryptoDecryptToPlainArgs,
   type CryptoEncryptMemoArgs,
   type CryptoLockArgs,
+  type CryptoLockNodeArgs,
   type CryptoOpenArgs,
   type CryptoOpenResult,
+  type CryptoRelockAllInTabArgs,
+  type CryptoRelockNodeArgs,
   type CryptoSaveEncryptedArgs,
+  type CryptoUnlockNodeArgs,
+  type CryptoUnlockNodeResult,
   type DialogPickFolderArgs,
   type EditorMenuCommandPayload,
   type EditorReportActiveArgs,
@@ -24,6 +29,7 @@ import {
   type LinkOpenExternalArgs,
   type LinkResolveMemoArgs,
   type LinkResolveMemoResult,
+  type MemoConvertFormatArgs,
   type MemoCreateArgs,
   type MemoDeleteArgs,
   type MemoDuplicateArgs,
@@ -105,7 +111,9 @@ const api: PreloadApi = {
     getProperties: (args: MemoGetPropertiesArgs): Promise<Result<MemoProperties>> =>
       ipcRenderer.invoke(IpcChannels.memo.getProperties, args),
     revealInFolder: (args: MemoRevealInFolderArgs): Promise<Result<void>> =>
-      ipcRenderer.invoke(IpcChannels.memo.revealInFolder, args)
+      ipcRenderer.invoke(IpcChannels.memo.revealInFolder, args),
+    convertFormat: (args: MemoConvertFormatArgs): Promise<Result<MemoInfo>> =>
+      ipcRenderer.invoke(IpcChannels.memo.convertFormat, args)
   },
   tree: {
     updateStructure: (args: TreeUpdateStructureArgs): Promise<Result<void>> =>
@@ -141,7 +149,14 @@ const api: PreloadApi = {
       ipcRenderer.invoke(IpcChannels.crypto.saveEncrypted, args),
     changePassword: (args: CryptoChangePasswordArgs): Promise<Result<void>> =>
       ipcRenderer.invoke(IpcChannels.crypto.changePassword, args),
-    lock: (args: CryptoLockArgs): Promise<Result<void>> => ipcRenderer.invoke(IpcChannels.crypto.lock, args)
+    lock: (args: CryptoLockArgs): Promise<Result<void>> => ipcRenderer.invoke(IpcChannels.crypto.lock, args),
+    lockNode: (args: CryptoLockNodeArgs): Promise<Result<void>> => ipcRenderer.invoke(IpcChannels.crypto.lockNode, args),
+    unlockNode: (args: CryptoUnlockNodeArgs): Promise<Result<CryptoUnlockNodeResult>> =>
+      ipcRenderer.invoke(IpcChannels.crypto.unlockNode, args),
+    relockNode: (args: CryptoRelockNodeArgs): Promise<Result<void>> =>
+      ipcRenderer.invoke(IpcChannels.crypto.relockNode, args),
+    relockAllInTab: (args: CryptoRelockAllInTabArgs): Promise<Result<void>> =>
+      ipcRenderer.invoke(IpcChannels.crypto.relockAllInTab, args)
   },
   events: {
     onMetaRecovered: (handler: (payload: MetaRecoveredPayload) => void): (() => void) => {
