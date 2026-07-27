@@ -19,7 +19,12 @@ const sharedAlias = {
  */
 function cspMetaPlugin(isDev: boolean): Plugin {
   const scriptSrc = isDev ? "script-src 'self' 'unsafe-eval'" : "script-src 'self'";
-  const csp = `default-src 'self'; ${scriptSrc}; style-src 'self' 'unsafe-inline'; object-src 'none'`;
+  // 【v3 M10b追記】img-src に data: を追加する。Markdownライブプレビュー（editor/
+  // markdownDecorations.ts）が `<img src="data:image/...;base64,...">` をサニタイズ済みHTMLとして
+  // 描画するため（MARKDOWN_IMAGE_SRC_PATTERN で data:image/... のみに絞り込み済み、外部URLは
+  // 許可しない, DESIGNv3 §2.3/§2.5。画像貼り付けUI自体はM10cスコープだが、サニタイズ+描画は
+  // M10bで実装するため、既存 .md ファイルに手動で埋め込まれた画像等も表示できるようにする）。
+  const csp = `default-src 'self'; ${scriptSrc}; style-src 'self' 'unsafe-inline'; img-src 'self' data:; object-src 'none'`;
 
   return {
     name: 'ttn-csp-meta',
