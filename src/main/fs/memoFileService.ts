@@ -3,7 +3,7 @@
 // フォルダ直下走査（リンク無視）もここに置く（metaStore/tabService から利用される）。
 import { promises as fs, type Dirent } from 'node:fs';
 import { join } from 'node:path';
-import { MEMO_EXT_ENCRYPTED, MEMO_EXT_PLAIN, TEMP_FILE_PREFIX, BACKUP_SUFFIX } from '@shared/constants';
+import { MEMO_EXT_ENCRYPTED, MEMO_EXT_MARKDOWN, MEMO_EXT_PLAIN, TEMP_FILE_PREFIX, BACKUP_SUFFIX } from '@shared/constants';
 import type { MemoCharCounts, MemoProperties } from '@shared/ipc-contract';
 import type { MemoReadResult, Result, SaveResult } from '@shared/models';
 import { err, ok } from '../util/result';
@@ -55,11 +55,18 @@ function checkMemoPathSafety(folderPath: string, memoName: string): Result<void>
 export interface ScannedMemo {
   memoName: string;
   encrypted: boolean;
+  /**
+   * 【v3 M10a】非暗号化時のみ意味を持つ拡張子種別（`.txt`='plain' / `.md`='markdown'）。
+   * 暗号化時（`encrypted:true`）は常に `'plain'` 固定で無視してよい（`.txtenc` は拡張子として
+   * markdown/plain を区別しない。区別は暗号化コンテナ内の `format` フィールドが担う, DESIGNv3 §2.5）。
+   */
+  format: 'plain' | 'markdown';
 }
 
 /**
- * フォルダ直下の `.txt`/`.txtenc` を走査する（直下のみ、シンボリックリンク/ジャンクション無視,
- * DESIGN §2.2）。一時ファイル・`.bak`・メタ JSON は対象外。
+ * フォルダ直下の `.txt`/`.md`/`.txtenc` を走査する（直下のみ、シンボリックリンク/ジャンクション無視,
+ * DESIGN §2.2）。`.md` は `.txt` と並ぶ「平文相当」の第三拡張子として認識する（v3 M10a、
+ * DESIGNv3 §2.4）。一時ファイル・`.bak`・メタ JSON は対象外。
  * タブ登録後にフォルダごとアプリ外で削除された場合（ユーザー報告のバグ: 起動時インデックス
  * 構築が例外で止まりアプリ自体が起動しなくなっていた）に備え、フォルダ不在/読取不可は
  * 「空フォルダ」として扱い、例外を投げない（呼び出し元の起動処理等を巻き込んで壊さないため）。
@@ -84,26 +91,49 @@ export async function scanTabFolder(folderPath: string): Promise<ScannedMemo[]> 
     if (!lstat.isFile()) continue;
 
     if (entry.name.endsWith(MEMO_EXT_ENCRYPTED)) {
-      result.push({ memoName: entry.name.slice(0, -MEMO_EXT_ENCRYPTED.length), encrypted: true });
+      result.push({ memoName: entry.name.slice(0, -MEMO_EXT_ENCRYPTED.length), encrypted: true, format: 'plain' });
+    } else if (entry.name.endsWith(MEMO_EXT_MARKDOWN)) {
+      result.push({ memoName: entry.name.slice(0, -MEMO_EXT_MARKDOWN.length), encrypted: false, format: 'markdown' });
     } else if (entry.name.endsWith(MEMO_EXT_PLAIN)) {
-      result.push({ memoName: entry.name.slice(0, -MEMO_EXT_PLAIN.length), encrypted: false });
+      result.push({ memoName: entry.name.slice(0, -MEMO_EXT_PLAIN.length), encrypted: false, format: 'plain' });
     }
   }
 
   return result;
 }
 
-/** 指定メモ名の実ファイルパスを解決する（`.txt`/`.txtenc` のどちらが存在するかを確認）。 */
+/** `format` に対応する非暗号化時の拡張子を返す（v3 M10a）。 */
+function plainExtOf(format: 'plain' | 'markdown'): string {
+  return format === 'markdown' ? MEMO_EXT_MARKDOWN : MEMO_EXT_PLAIN;
+}
+
+/**
+ * `findMemoFile`/`resolveMemoPath` の結果から、実ファイルの拡張子を復元する（v3 M10a）。
+ * rename/duplicate/move/copy が「元の拡張子（`.txt`/`.md`/`.txtenc`）をそのまま維持する」ことを
+ * 一箇所に集約する（各操作が個別に `encrypted ? MEMO_EXT_ENCRYPTED : MEMO_EXT_PLAIN` のように
+ * ハードコードすると `.md` メモがリネーム/移動/複製のたびに `.txt` へ化けてしまう欠落を防ぐ）。
+ */
+function extOfFound(found: { encrypted: boolean; format: 'plain' | 'markdown' }): string {
+  return found.encrypted ? MEMO_EXT_ENCRYPTED : plainExtOf(found.format);
+}
+
+/** 指定メモ名の実ファイルパスを解決する（`.txt`/`.md`/`.txtenc` のいずれが存在するかを確認）。 */
 export async function findMemoFile(
   folderPath: string,
   memoName: string
-): Promise<{ path: string; encrypted: boolean } | null> {
+): Promise<{ path: string; encrypted: boolean; format: 'plain' | 'markdown' } | null> {
   const plainPath = join(folderPath, `${memoName}${MEMO_EXT_PLAIN}`);
+  const markdownPath = join(folderPath, `${memoName}${MEMO_EXT_MARKDOWN}`);
   const encPath = join(folderPath, `${memoName}${MEMO_EXT_ENCRYPTED}`);
 
-  const [plainExists, encExists] = await Promise.all([pathExists(plainPath), pathExists(encPath)]);
-  if (plainExists) return { path: plainPath, encrypted: false };
-  if (encExists) return { path: encPath, encrypted: true };
+  const [plainExists, markdownExists, encExists] = await Promise.all([
+    pathExists(plainPath),
+    pathExists(markdownPath),
+    pathExists(encPath)
+  ]);
+  if (plainExists) return { path: plainPath, encrypted: false, format: 'plain' };
+  if (markdownExists) return { path: markdownPath, encrypted: false, format: 'markdown' };
+  if (encExists) return { path: encPath, encrypted: true, format: 'plain' };
   return null;
 }
 
@@ -231,7 +261,15 @@ export async function saveMemo(
   const nameCheck = validateExistingMemoNameForPath(folderPath, memoName);
   if (!nameCheck.ok) return nameCheck;
 
-  const targetPath = join(folderPath, `${memoName}${MEMO_EXT_PLAIN}`);
+  // 【v3 M10a】既存の実ファイル拡張子（`.txt`/`.md`）をそのまま保存先にする（以前は `.txt` 固定
+  // だったため `.md` メモを保存すると横に新しい `.txt` が生成される欠落があった）。未作成
+  // （初回保存前）の場合のみ、既存挙動どおり `.txt` を既定にする。暗号化済み（`.txtenc`）が
+  // 見つかった場合は誤って平文で上書きしないよう拒否する（このチャネルは平文専用, PLAN §1.4）。
+  const found = await findMemoFile(folderPath, memoName);
+  if (found?.encrypted) {
+    return err('NAME_INVALID', 'このメモは暗号化されています。暗号化用の保存チャネルを使用してください。', found.path);
+  }
+  const targetPath = found ? found.path : join(folderPath, `${memoName}${MEMO_EXT_PLAIN}`);
 
   if (expectedHash !== undefined) {
     const currentExists = await pathExists(targetPath);
@@ -255,12 +293,19 @@ export async function saveMemo(
   return ok({ savedHash });
 }
 
-/** 新規の空メモ `.txt` を作成する（重複チェックは呼び出し側=metaStore 連携側で実施）。 */
-export async function createEmptyMemoFile(folderPath: string, memoName: string): Promise<Result<void>> {
+/**
+ * 新規の空メモ（既定 `.txt`、`format:'markdown'` 指定時は `.md`, v3 M10a）を作成する
+ * （重複チェックは呼び出し側=metaStore 連携側で実施）。
+ */
+export async function createEmptyMemoFile(
+  folderPath: string,
+  memoName: string,
+  format: 'plain' | 'markdown' = 'plain'
+): Promise<Result<void>> {
   const nameCheck = validateMemoNameForPath(folderPath, memoName);
   if (!nameCheck.ok) return nameCheck;
 
-  const targetPath = join(folderPath, `${memoName}${MEMO_EXT_PLAIN}`);
+  const targetPath = join(folderPath, `${memoName}${plainExtOf(format)}`);
   await atomicWrite(targetPath, Buffer.alloc(0));
   return ok(undefined);
 }
@@ -279,7 +324,9 @@ export async function renameMemoFile(folderPath: string, oldName: string, newNam
   const found = await findMemoFile(folderPath, oldName);
   if (!found) return err('NOT_FOUND', `メモが見つかりません: ${oldName}`, folderPath);
 
-  const ext = found.encrypted ? MEMO_EXT_ENCRYPTED : MEMO_EXT_PLAIN;
+  // 【v3 M10a】元の拡張子（`.txt`/`.md`/`.txtenc`）をそのまま維持する（以前は encrypted のみで
+  // 判定していたため `.md` メモをリネームすると `.txt` へ化ける欠落があった）。
+  const ext = extOfFound(found);
   const newPath = join(folderPath, `${newName}${ext}`);
 
   registerSelfWrite(found.path, { kind: 'delete' });
@@ -305,7 +352,10 @@ export async function renameMemoFile(folderPath: string, oldName: string, newNam
 // ---------------------------------------------------------------------------
 
 /** `folderPath` 内の `memoName` の実ファイルパスを検証込みで解決する（存在しなければ NOT_FOUND）。 */
-async function resolveMemoPath(folderPath: string, memoName: string): Promise<Result<{ path: string; encrypted: boolean }>> {
+async function resolveMemoPath(
+  folderPath: string,
+  memoName: string
+): Promise<Result<{ path: string; encrypted: boolean; format: 'plain' | 'markdown' }>> {
   const nameCheck = validateExistingMemoNameForPath(folderPath, memoName);
   if (!nameCheck.ok) return nameCheck;
   const found = await findMemoFile(folderPath, memoName);
@@ -354,7 +404,8 @@ export async function duplicateMemoFile(
   const newNameCheck = validateExistingMemoNameForPath(folderPath, newName);
   if (!newNameCheck.ok) return newNameCheck;
 
-  const ext = found.value.encrypted ? MEMO_EXT_ENCRYPTED : MEMO_EXT_PLAIN;
+  // 【v3 M10a】元の拡張子（`.txt`/`.md`/`.txtenc`）をそのまま維持する。
+  const ext = extOfFound(found.value);
   const destPath = join(folderPath, `${newName}${ext}`);
 
   registerSelfWrite(destPath);
@@ -385,7 +436,8 @@ export async function moveMemoFileToFolder(
   const destCheck = validateExistingMemoNameForPath(destFolderPath, memoName);
   if (!destCheck.ok) return destCheck;
 
-  const ext = found.value.encrypted ? MEMO_EXT_ENCRYPTED : MEMO_EXT_PLAIN;
+  // 【v3 M10a】元の拡張子（`.txt`/`.md`/`.txtenc`）をそのまま維持する。
+  const ext = extOfFound(found.value);
   const destPath = join(destFolderPath, `${memoName}${ext}`);
 
   registerSelfWrite(found.value.path, { kind: 'delete' });
@@ -428,7 +480,8 @@ export async function copyMemoFileToFolder(
   const destCheck = validateExistingMemoNameForPath(destFolderPath, destMemoName);
   if (!destCheck.ok) return destCheck;
 
-  const ext = found.value.encrypted ? MEMO_EXT_ENCRYPTED : MEMO_EXT_PLAIN;
+  // 【v3 M10a】元の拡張子（`.txt`/`.md`/`.txtenc`）をそのまま維持する。
+  const ext = extOfFound(found.value);
   const destPath = join(destFolderPath, `${destMemoName}${ext}`);
 
   registerSelfWrite(destPath);
@@ -440,6 +493,44 @@ export async function copyMemoFileToFolder(
     throw e;
   }
   await refineUpsertFromDisk(destPath);
+  return ok(undefined);
+}
+
+/**
+ * 【v3 M10a】`.txt`⇔`.md`変換（`memo:convertFormat` ハンドラ本体）。拡張子のみリネームし、
+ * 本文は無変更のまま保持する（DESIGNv3 §2.4「本文へ手を加える必要は無い」）。暗号化メモ
+ * （`.txtenc`）は対象外（呼び出し側 IPC ハンドラでも事前に弾く想定だが、本関数単体でも
+ * 安全側に倒す）。既に目的の形式であれば no-op で成功を返す。
+ */
+export async function convertMemoFileFormat(
+  folderPath: string,
+  memoName: string,
+  targetFormat: 'plain' | 'markdown'
+): Promise<Result<void>> {
+  const found = await resolveMemoPath(folderPath, memoName);
+  if (!found.ok) return found;
+  if (found.value.encrypted) {
+    return err('NAME_INVALID', '暗号化メモは形式変換できません。先に暗号化を解除してください。', found.value.path);
+  }
+  if (found.value.format === targetFormat) {
+    return ok(undefined);
+  }
+
+  const newPath = join(folderPath, `${memoName}${plainExtOf(targetFormat)}`);
+  if (await pathExists(newPath)) {
+    return err('NAME_DUPLICATE', `変換先の拡張子で同名のファイルが既に存在します: ${memoName}`, newPath);
+  }
+
+  registerSelfWrite(found.value.path, { kind: 'delete' });
+  registerSelfWrite(newPath);
+  try {
+    await withRetry(() => fs.rename(found.value.path, newPath));
+  } catch (e) {
+    consumeSelfWrite(found.value.path);
+    consumeSelfWrite(newPath);
+    throw e;
+  }
+  await refineUpsertFromDisk(newPath);
   return ok(undefined);
 }
 
