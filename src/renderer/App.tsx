@@ -4,7 +4,9 @@ import { useTheme } from './theme/useTheme';
 import { createOpenMemoState, resolveEffectiveEol, withUpdatedHash, type OpenMemoState } from './editor/eolKeeper';
 import { DEFAULT_EDITOR_SETTINGS, type EditorSettings, type EditorStats } from './editor/codeMirrorSetup';
 import { CodeMirrorEditor, type CodeMirrorEditorHandle, type RevealTarget } from './components/Editor/CodeMirrorEditor';
+import { MarkdownToolbar } from './components/Editor/MarkdownToolbar';
 import type { DetectedLink } from './editor/links';
+import type { PendingImageInsert } from './editor/imagePaste';
 import { TabBar } from './components/TabBar/TabBar';
 import { Tree } from './components/Tree/Tree';
 import { NameInputDialog } from './components/dialogs/NameInputDialog';
@@ -17,10 +19,16 @@ import { StatusBar } from './components/StatusBar/StatusBar';
 import { SettingsDialog } from './components/Settings/SettingsDialog';
 import { EMPTY_SELECTION, selectSingle, type SelectionState } from './store/selection';
 import {
+  collapseSessionToPlaceholder,
   dropZoneToPosition,
+  findSessionRootNode,
   findTreeNode,
+  findTreeNodeInScope,
+  insertTreeNodeAtInScope,
+  removeTreeNodesByNamesInScope,
   toMetaTree,
   updateTreeNode,
+  updateTreeNodeInScope,
   type DropZone,
   type MemoDragPayload
 } from './components/Tree/treeView';
@@ -33,6 +41,7 @@ import type {
   EditorMenuCommandPayload,
   EditorReportActiveArgs,
   ExternalChangePayload,
+  LockContext,
   MemoProperties,
   MetaRecoveredPayload,
   OpErrorPayload,
@@ -58,6 +67,21 @@ function generateDefaultMemoName(existingNames: readonly string[]): string {
     if (!taken.has(candidate.toUpperCase())) return candidate;
   }
   return `${base}(${Date.now()})`;
+}
+
+/**
+ * v3 M8: `rootMemoName` 自身、またはその配下（子孫）に `targetMemoName` が含まれるか。
+ * サブツリーロック実行前に「現在開いているメモがロック対象に含まれないか」を確認するために使う
+ * （ロック実行は対象実ファイルを難読化名へリネーム+暗号化するため、開いたままだと開いている
+ * エディタが参照している旧ファイル名が消え、表示が破綻するのを防ぐ, developer 判断）。
+ */
+function treeNodeContains(nodes: readonly TreeNode[], rootMemoName: string, targetMemoName: string): boolean {
+  function walk(node: TreeNode): boolean {
+    if (node.memoName === targetMemoName) return true;
+    return node.children.some(walk);
+  }
+  const root = findTreeNode(nodes, rootMemoName);
+  return root ? walk(root) : false;
 }
 
 // Ctrl+ホイールでのフォントサイズ変更（DESIGN §2.3）の範囲・刻み幅。
@@ -216,6 +240,14 @@ export function App() {
   // 静かな反映・競合解決で本文を書き換える際は key に含めてこの値を進め、明示的に
   // 再マウントさせる（同時に Undo 履歴もリセットされるのが適切、内容が外部由来のため）。
   const [reloadGeneration, setReloadGeneration] = useState(0);
+
+  // --- v3 M10c: Markdownツールバー（ソース/プレビュー切替）---
+  // 既定はプレビュー表示（DESIGNv3 §2.1「ライブプレビュー方式をデフォルトにする」）。メモを
+  // 切り替えるたびに既定へ戻す（下の effect）。`openMemo.format!=='markdown'` の間は無関係。
+  const [previewMode, setPreviewMode] = useState(true);
+  useEffect(() => {
+    setPreviewMode(true);
+  }, [openMemo?.tabId, openMemo?.memoName, reloadGeneration]);
 
   // --- 全文検索（M3-②, docs/milestones/M3-search.md） ---
   const [showSearchPanel, setShowSearchPanel] = useState(false);
@@ -378,6 +410,33 @@ export function App() {
       return true;
     }
 
+    // 【v3 M9a】ロック解除セッション配下（om.lockToken あり）は実ファイルこそ .txtenc だが、
+    // M6 個別暗号化（sessionKeyStore）とは別物で、既にパスワード入力済みで開封済みのセッション
+    // （ノードロックのセッション自体は明示的な操作でのみ破棄される。自動再ロックはしない,
+    // DESIGNv3 §1.11）。そのため、ここではメモ切替に伴う「保存」だけ行い、`crypto:lock`（M6の
+    // 個別暗号化セッション鍵破棄）は呼ばない（対象が違うため誤り）。自動保存は
+    // `schedulePlainAutosave` 側（handleEditorChange）でスケジュールされるため、平文用タイマーを
+    // 解除する。
+    if (om.lockToken) {
+      clearPlainAutosaveTimer();
+      if (dirtyRef.current) {
+        const res = await ipc.saveMemo({
+          tabId: om.tabId,
+          memoName: om.memoName,
+          contentLF: contentLFRef.current,
+          eol: resolveEffectiveEol(om.eol, eolPolicyRef.current),
+          encoding: om.encoding,
+          expectedHash: om.lastKnownHash,
+          lockContext: { lockToken: om.lockToken }
+        });
+        if (!res.ok) {
+          setStatusMessage(`保存に失敗しました[${res.error.code}]: ${res.error.message}`);
+          return false;
+        }
+      }
+      return true;
+    }
+
     clearEncryptedAutosaveTimer();
     if (dirtyRef.current) {
       const res = await ipc.saveEncryptedMemo({
@@ -403,7 +462,9 @@ export function App() {
 
   const performEncryptedAutosave = useCallback(async (): Promise<void> => {
     const om = openMemoRef.current;
-    if (!om || !om.encrypted || !dirtyRef.current) return;
+    // 【v3 M9a】ロック解除セッション配下（om.lockToken あり）は M6 個別暗号化の低頻度自動保存
+    // 対象外（performPlainAutosave 側の lockContext 付き保存を使う）。
+    if (!om || !om.encrypted || om.lockToken || !dirtyRef.current) return;
     const conflict = conflictInfoRef.current;
     if (conflict && conflict.tabId === om.tabId && conflict.memoName === om.memoName) return; // 解決中ロック。
 
@@ -419,7 +480,7 @@ export function App() {
         prev && prev.tabId === om.tabId && prev.memoName === om.memoName ? withUpdatedHash(prev, res.value.savedHash) : prev
       );
       setDirty(false);
-      reportActiveMemo({ tabId: om.tabId, memoName: om.memoName, dirty: false });
+      reportActiveMemo({ tabId: om.tabId, memoName: om.memoName, dirty: false, format: om.format });
       setStatusMessage(`自動保存しました（${om.memoName}）`);
     } else if (res.error.code !== 'CONFLICT') {
       // CONFLICT は evt:conflict 経由の競合ダイアログに解決を委ねる（ここでは静かに諦める）。
@@ -440,7 +501,9 @@ export function App() {
   // plainDebounceMs、既定値より短い）。
   const performPlainAutosave = useCallback(async (): Promise<void> => {
     const om = openMemoRef.current;
-    if (!om || om.encrypted || !dirtyRef.current) return;
+    // 【v3 M9a】ロック解除セッション配下（om.lockToken あり）は encrypted===true だが、平文と
+    // 同じ `memo:save`（lockContext 付き）で自動保存する（M6 個別暗号化のセッション鍵とは無関係）。
+    if (!om || (om.encrypted && !om.lockToken) || !dirtyRef.current) return;
     const conflict = conflictInfoRef.current;
     if (conflict && conflict.tabId === om.tabId && conflict.memoName === om.memoName) return; // 解決中ロック。
 
@@ -450,14 +513,15 @@ export function App() {
       contentLF: contentLFRef.current,
       eol: resolveEffectiveEol(om.eol, eolPolicyRef.current),
       encoding: om.encoding,
-      expectedHash: om.lastKnownHash
+      expectedHash: om.lastKnownHash,
+      lockContext: om.lockToken ? { lockToken: om.lockToken } : undefined
     });
     if (res.ok) {
       setOpenMemo((prev) =>
         prev && prev.tabId === om.tabId && prev.memoName === om.memoName ? withUpdatedHash(prev, res.value.savedHash) : prev
       );
       setDirty(false);
-      reportActiveMemo({ tabId: om.tabId, memoName: om.memoName, dirty: false });
+      reportActiveMemo({ tabId: om.tabId, memoName: om.memoName, dirty: false, format: om.format });
       setStatusMessage(`自動保存しました（${om.memoName}）`);
     } else if (res.error.code !== 'CONFLICT') {
       // CONFLICT は evt:conflict 経由の競合ダイアログに解決を委ねる（ここでは静かに諦める）。
@@ -515,7 +579,10 @@ export function App() {
       }
 
       void (async () => {
-        if (om.encrypted) {
+        // 【v3 M9a】ロック解除セッション配下（om.lockToken あり）は M6 個別暗号化のセッション鍵
+        // （sessionKeyStore）を使っていないため crypto:lock は対象外。平文と同じ静かな読み直しで
+        // 扱う（lockContext 付き memo:read）。
+        if (om.encrypted && !om.lockToken) {
           // 暗号化メモは memo:read で本文を取得できない（contentLF:'' が返る仕様）ため、
           // handleConflictAdoptExternal と同様にセッション鍵を破棄して閉じ、再度パスワード
           // 入力での開き直しを促す（空文字での静かな上書きによるデータ消失を防ぐ, レビュー指摘対応）。
@@ -529,16 +596,22 @@ export function App() {
           setStatusMessage(`「${om.memoName}」は外部で変更されました。開き直してください。`);
           return;
         }
-        const res = await ipc.readMemo({ tabId: om.tabId, memoName: om.memoName });
+        const res = await ipc.readMemo({
+          tabId: om.tabId,
+          memoName: om.memoName,
+          lockContext: om.lockToken ? { lockToken: om.lockToken } : undefined
+        });
         if (!res.ok) return;
-        setOpenMemo(createOpenMemoState(om.tabId, om.memoName, res.value));
+        // v3 M10b: 外部内容の静かな反映では拡張子（Markdown属性）自体は変わらないため、直前の
+        // om.format をそのまま引き継ぐ（docs/v3/milestones/M10b-markdown-live-preview.md §0.7）。
+        setOpenMemo(createOpenMemoState(om.tabId, om.memoName, res.value, om.lockToken, om.format));
         setContentLF(res.value.contentLF);
         setDirty(false);
         setEditorStats(null);
         setReloadGeneration((g) => g + 1);
         // 外部内容の静かな反映（M7）: 保留中の自動保存タイマーを解除する。
         clearPlainAutosaveTimer();
-        reportActiveMemo({ tabId: om.tabId, memoName: om.memoName, dirty: false });
+        reportActiveMemo({ tabId: om.tabId, memoName: om.memoName, dirty: false, format: om.format });
         setStatusMessage(`「${om.memoName}」の外部変更を反映しました。`);
       })();
     });
@@ -560,7 +633,9 @@ export function App() {
       // ダイアログで明示的に選んだ意図的な上書きであり、既存の memo:save 競合チェックの
       // バイパスは本ケースに限定される（DESIGN §3.3）。暗号化メモは crypto:saveEncrypted を使う
       // （M6。セッション鍵は開封時のまま維持されているため引き続き保存できる）。
-      const res = openMemo.encrypted
+      // 【v3 M9a】ロック解除セッション配下（openMemo.lockToken あり）は M6 個別暗号化とは別物
+      // なので、平文と同じ memo:save（lockContext 付き）を使う。
+      const res = openMemo.encrypted && !openMemo.lockToken
         ? await ipc.saveEncryptedMemo({
             tabId: openMemo.tabId,
             memoName: openMemo.memoName,
@@ -574,12 +649,13 @@ export function App() {
             contentLF,
             eol: resolveEffectiveEol(openMemo.eol, eolPolicyRef.current),
             encoding: openMemo.encoding,
-            expectedHash: undefined
+            expectedHash: undefined,
+            lockContext: openMemo.lockToken ? { lockToken: openMemo.lockToken } : undefined
           });
       if (res.ok) {
         setOpenMemo(withUpdatedHash(openMemo, res.value.savedHash));
         setDirty(false);
-        reportActiveMemo({ tabId: openMemo.tabId, memoName: openMemo.memoName, dirty: false });
+        reportActiveMemo({ tabId: openMemo.tabId, memoName: openMemo.memoName, dirty: false, format: openMemo.format });
         setStatusMessage(`保存しました（${openMemo.memoName}）`);
       } else {
         setStatusMessage(`保存エラー[${res.error.code}]: ${res.error.message}`);
@@ -592,7 +668,9 @@ export function App() {
     if (!conflictInfo) return;
     const { tabId, memoName } = conflictInfo;
     void (async () => {
-      if (openMemo?.encrypted) {
+      // 【v3 M9a】ロック解除セッション配下（openMemo.lockToken あり）は M6 個別暗号化のセッション鍵
+      // ではないため crypto:lock は対象外。平文と同じ静かな読み直しで扱う（lockContext 付き）。
+      if (openMemo?.encrypted && !openMemo.lockToken) {
         // 暗号化メモは memo:read で本文を取得できない（M1 スコープの仕様通り本文非対応）ため、
         // 外部変更を採用する場合はセッション鍵を破棄して一旦閉じ、ユーザーに再度パスワード入力
         // での開き直しを求める（古い鍵のまま自動復号を試みて誤った結果を出さないための安全策,
@@ -608,16 +686,20 @@ export function App() {
         setConflictInfo(null);
         return;
       }
-      const res = await ipc.readMemo({ tabId, memoName });
+      const lockToken = openMemo?.tabId === tabId && openMemo.memoName === memoName ? openMemo.lockToken : undefined;
+      // v3 M10b: 外部内容の採用でも拡張子（Markdown属性）自体は変わらないため、直前の
+      // openMemo.format をそのまま引き継ぐ（docs/v3/milestones/M10b-markdown-live-preview.md §0.7）。
+      const format = openMemo?.tabId === tabId && openMemo.memoName === memoName ? openMemo.format : undefined;
+      const res = await ipc.readMemo({ tabId, memoName, lockContext: lockToken ? { lockToken } : undefined });
       if (res.ok) {
-        setOpenMemo(createOpenMemoState(tabId, memoName, res.value));
+        setOpenMemo(createOpenMemoState(tabId, memoName, res.value, lockToken, format));
         setContentLF(res.value.contentLF);
         setDirty(false);
         setEditorStats(null);
         setReloadGeneration((g) => g + 1);
         // 外部内容の採用（M7）: 保留中の自動保存は古い本文を前提にしているため破棄する。
         clearPlainAutosaveTimer();
-        reportActiveMemo({ tabId, memoName, dirty: false });
+        reportActiveMemo({ tabId, memoName, dirty: false, format });
         setStatusMessage(`「${memoName}」の外部変更を反映しました。`);
       } else {
         // 外部で削除されていた場合など。メモを閉じる。
@@ -726,6 +808,13 @@ export function App() {
     if (!(await requestCloseCurrentMemo())) {
       return;
     }
+    // 【v3 M9c】直前タブに紐づくノードロック解除セッションを一括破棄する（DESIGNv3 §1.11
+    // 「タブから離れたら即座にセッション破棄」）。順序厳守: dirty確認→保存/破棄確定（上の
+    // requestCloseCurrentMemo）→タブ切替（下の setSelectedTabId 等）→セッション破棄（ここ）。
+    // requestCloseCurrentMemo がキャンセルされた場合は上で return 済みのためセッションは
+    // 破棄されない。切替先が同一タブの場合（`tabId === selectedTabId`）は「離脱」に該当しない
+    // ため破棄しない。同一タブ内の別ノード操作でセッションを継続する既存仕様と整合させるため。
+    const prevTabId = selectedTabIdRef.current;
     setSelectedTabId(tabId);
     setSelection(EMPTY_SELECTION);
     setOpenMemo(null);
@@ -735,24 +824,46 @@ export function App() {
     setRevealTarget(null);
     setConflictInfo(null);
     reportActiveMemo(null);
+    if (prevTabId && prevTabId !== tabId) {
+      void ipc.relockAllInTab({ tabId: prevTabId }).catch((e: unknown) => console.error('crypto:relockAllInTab failed', e));
+    }
     await refreshTree(tabId);
   }, [refreshTree, reportActiveMemo, requestCloseCurrentMemo]);
 
   const openMemoByName = useCallback(
-    async (memoName: string, encrypted: boolean, focusEditor = true) => {
+    async (memoName: string, encrypted: boolean, focusEditor = true, lockToken?: string, formatHint?: 'plain' | 'markdown') => {
       if (!selectedTabId) return;
       if (!(await requestCloseCurrentMemo())) {
         return;
       }
-      if (encrypted) {
-        // 暗号化メモは開封にパスワードが必要（M6, crypto:open）。
+      // 【v3 M9a / M9a-R2-01】ロック解除セッション配下（起点＋子孫）は `TreeNode.lockToken` を
+      // 保持する（PLANv3 §1.3）。`memoName` の文字列一致のみでの自己解決（`findTreeNode`）は、
+      // 同名ノードが複数スコープに同時存在しうる（PLANv3 §7.3）ため行わない。呼び出し元
+      // （Tree.tsx の行クリック/矢印キー移動＝行データそのもの、または作成直後の明示指定）が
+      // 対象ノード自身の `lockToken` を hint として渡す前提にする（reviewer指摘 M9a-R2-01）。
+      if (encrypted && !lockToken) {
+        // 暗号化メモ（ロックセッション配下ではない、M6 個別暗号化）は開封にパスワードが必要
+        // （crypto:open）。ロックセッション配下は既にパスワード入力済みで開封済みのため
+        // パスワードダイアログを経由しない。
         setCryptoDialog({ mode: 'unlockToOpen', tabId: selectedTabId, memoName });
         setCryptoDialogError(null);
         return;
       }
-      const res = await ipc.readMemo({ tabId: selectedTabId, memoName });
+      const res = await ipc.readMemo({
+        tabId: selectedTabId,
+        memoName,
+        lockContext: lockToken ? { lockToken } : undefined
+      });
       if (res.ok) {
-        setOpenMemo(createOpenMemoState(selectedTabId, memoName, res.value));
+        // v3 M10b: 現在のツリー状態（クリックされた行そのものが由来のスナップショット、
+        // §0.7「平文メモ、およびロック解除セッション配下メモ」の判定方針）から Markdown 属性を
+        // 引く。scope-qualified（同名ノードが複数スコープに同時存在しうるため, PLANv3 §7.3）。
+        // 【v3 M10c】`formatHint` 指定時はそちらを優先する。作成直後（handleRequestCreate）は
+        // `tree` state の更新が同一イベントハンドラ内でまだコミットされておらず、この時点で
+        // `findTreeNodeInScope` を引いても新規ノードが見つからない（stale closure）ため、
+        // 呼び出し元が作成時に指定した format をそのまま渡せるようにする。
+        const format = formatHint ?? findTreeNodeInScope(tree, memoName, lockToken)?.format;
+        setOpenMemo(createOpenMemoState(selectedTabId, memoName, res.value, lockToken, format));
         setContentLF(res.value.contentLF);
         setDirty(false);
         setEditorStats(null);
@@ -763,12 +874,12 @@ export function App() {
         setConflictInfo(null);
         setReloadGeneration(0);
         setEditorAutoFocus(focusEditor);
-        reportActiveMemo({ tabId: selectedTabId, memoName, dirty: false });
+        reportActiveMemo({ tabId: selectedTabId, memoName, dirty: false, format });
       } else {
         setStatusMessage(`メモ読込エラー: ${res.error.message}`);
       }
     },
-    [selectedTabId, reportActiveMemo, requestCloseCurrentMemo]
+    [selectedTabId, tree, reportActiveMemo, requestCloseCurrentMemo]
   );
 
   // editorAutoFocus は CodeMirrorEditor のマウント時に一度だけ消費される「単発の指示」なので、
@@ -810,7 +921,11 @@ export function App() {
         setStatusMessage(`メモ読込エラー: ${res.error.message}`);
         return;
       }
-      setOpenMemo(createOpenMemoState(hit.tabId, hit.memoName, res.value));
+      // v3 M10b: 全文検索ヒットはセッション配下を対象外とする既存仕様（DESIGNv3 §1.7 Q1）のため
+      // scope-qualified lookup は不要。best-effort（tabId をまたぐ直後のジャンプでは tree が
+      // 直前タブのまま一瞬ずれ得るが、装飾描画のみに影響する非致命的な事項, §0.7 developer裁量）。
+      const format = findTreeNode(tree, hit.memoName)?.format;
+      setOpenMemo(createOpenMemoState(hit.tabId, hit.memoName, res.value, undefined, format));
       setContentLF(res.value.contentLF);
       setDirty(false);
       setEditorStats(null);
@@ -818,13 +933,13 @@ export function App() {
       setRevealTarget(null);
       setConflictInfo(null);
       setReloadGeneration(0);
-      reportActiveMemo({ tabId: hit.tabId, memoName: hit.memoName, dirty: false });
+      reportActiveMemo({ tabId: hit.tabId, memoName: hit.memoName, dirty: false, format });
       if (hit.matchField === 'body' && hit.matchStart !== undefined && hit.matchEnd !== undefined) {
         revealTokenRef.current += 1;
         setRevealTarget({ from: hit.matchStart, to: hit.matchEnd, token: revealTokenRef.current });
       }
     },
-    [selectTab, reportActiveMemo, requestCloseCurrentMemo]
+    [selectTab, tree, reportActiveMemo, requestCloseCurrentMemo]
   );
 
   // --- リンク機能（M5, DESIGN §2.8）: memo: 遷移 / URL・mailto・ファイルパスの外部起動 ---
@@ -845,7 +960,9 @@ export function App() {
         setCryptoDialogError(null);
         return;
       }
-      setOpenMemo(createOpenMemoState(tabId, memoName, res.value));
+      // v3 M10b: `memo:` リンク遷移も handleJumpToHit と同じ best-effort（§0.7 developer裁量）。
+      const format = findTreeNode(tree, memoName)?.format;
+      setOpenMemo(createOpenMemoState(tabId, memoName, res.value, undefined, format));
       setContentLF(res.value.contentLF);
       setDirty(false);
       setEditorStats(null);
@@ -857,9 +974,9 @@ export function App() {
       // ハイライト・スクロール位置が追従するように。スクロール自体は Tree.tsx が
       // openMemoName の変化を見て行う）。
       setSelection(selectSingle(memoName));
-      reportActiveMemo({ tabId, memoName, dirty: false });
+      reportActiveMemo({ tabId, memoName, dirty: false, format });
     },
-    [reportActiveMemo]
+    [tree, reportActiveMemo]
   );
 
   // 起動時に前回開いていたメモを復元する（ユーザー要望）。タブ/メモが削除済み等で復元できない
@@ -942,8 +1059,10 @@ export function App() {
       setDirty(true);
       const om = openMemoRef.current;
       if (om) {
-        reportActiveMemo({ tabId: om.tabId, memoName: om.memoName, dirty: true });
-        if (om.encrypted) {
+        reportActiveMemo({ tabId: om.tabId, memoName: om.memoName, dirty: true, format: om.format });
+        // 【v3 M9a】ロック解除セッション配下（om.lockToken あり）は M6 個別暗号化の低頻度自動保存
+        // ではなく、平文と同じ自動保存（lockContext 付き memo:save）を使う。
+        if (om.encrypted && !om.lockToken) {
           // 暗号化メモの低頻度自動保存（DESIGN §2.6「編集停止から一定時間のデバウンス」, M6）。
           scheduleEncryptedAutosave();
         } else {
@@ -968,7 +1087,9 @@ export function App() {
     // 手動保存は保留中の自動保存タイマーを無効化する（二重保存を避ける, M6/M7）。
     clearEncryptedAutosaveTimer();
     clearPlainAutosaveTimer();
-    const res = openMemo.encrypted
+    // 【v3 M9a】ロック解除セッション配下（openMemo.lockToken あり）は M6 個別暗号化とは別物なので、
+    // 平文と同じ memo:save（lockContext 付き）を使う。
+    const res = openMemo.encrypted && !openMemo.lockToken
       ? await ipc.saveEncryptedMemo({
           tabId: openMemo.tabId,
           memoName: openMemo.memoName,
@@ -982,22 +1103,101 @@ export function App() {
           contentLF,
           eol: resolveEffectiveEol(openMemo.eol, eolPolicyRef.current),
           encoding: openMemo.encoding,
-          expectedHash: openMemo.lastKnownHash
+          expectedHash: openMemo.lastKnownHash,
+          lockContext: openMemo.lockToken ? { lockToken: openMemo.lockToken } : undefined
         });
     if (res.ok) {
       setOpenMemo(withUpdatedHash(openMemo, res.value.savedHash));
       setDirty(false);
-      reportActiveMemo({ tabId: openMemo.tabId, memoName: openMemo.memoName, dirty: false });
+      reportActiveMemo({ tabId: openMemo.tabId, memoName: openMemo.memoName, dirty: false, format: openMemo.format });
       setStatusMessage(`保存しました（${openMemo.memoName}）`);
     } else {
       setStatusMessage(`保存エラー[${res.error.code}]: ${res.error.message}`);
     }
   }, [openMemo, contentLF, dirty, conflictInfo, reportActiveMemo, clearEncryptedAutosaveTimer, clearPlainAutosaveTimer]);
 
+  // v3 M10c: 画像貼り付け/ドロップがサイズ警告閾値を超えた場合（CodeMirrorEditor.tsx →
+  // editor/imagePaste.ts から委譲される）。実際に検出したサイズ（約◯MB）を明記した確認ダイアログを
+  // 表示し（DESIGNv3 §2.6「警告メッセージには実際に検出した画像サイズを明記する」）、続行時のみ
+  // `request.insert()` を呼ぶ（既存の `ConfirmDialog` を流用、閾値以下の場合はこのコールバック自体
+  // 呼ばれず直接挿入される）。
+  const handleImagePasteRequest = useCallback((request: PendingImageInsert) => {
+    const mb = (request.sizeBytes / (1024 * 1024)).toFixed(1);
+    setConfirmDialog({
+      title: '画像を挿入',
+      message: `この画像は約${mb}MBです。挿入すると動作が重くなる可能性があります。挿入しますか？`,
+      confirmLabel: '挿入',
+      onConfirm: () => {
+        setConfirmDialog(null);
+        request.insert();
+      }
+    });
+  }, []);
+
+  // 【v3 M10c, reviewer指摘 M10c-R1-01 対応】貼り付け/ドロップされた画像がサニタイズ許可リスト外
+  // の形式（bmp/svg等）だった場合、挿入自体を行わず（imagePaste.ts側で既に判定済み）ユーザーへ
+  // 理由を明示する。
+  const handleUnsupportedImagePaste = useCallback(() => {
+    setStatusMessage('この画像形式はサポートされていません（対応形式: png, jpg, jpeg, gif, webp）。');
+  }, []);
+
+  // v3 M10c: `.txt`⇔`.md`変換（DESIGNv3 §2.4、docs/v3/milestones/M10c-markdown-toolbar-ui.md）。
+  // `.md`→`.txt`のみ、本文中の装飾タグ(`<span`)/画像データURI(`data:image/`)の有無を正規表現で
+  // 検出し、検出時のみ確認ダイアログを表示する（DESIGNv3 §2.4「検出しなかった場合は無警告で
+  // 変換してよい」）。`.txt`→`.md`は本文へ手を加える必要が無いため無警告。
+  const handleConvertFormat = useCallback(
+    (targetFormat: 'txt' | 'md') => {
+      if (!openMemo || !selectedTabId) return;
+      // ボタン自体を非表示にする想定だが、防御的に対象外ケースを弾く（M10a: 暗号化メモ・ノード
+      // ロックセッション配下メモは memo:convertFormat の対象外）。
+      if (openMemo.encrypted || openMemo.lockToken) return;
+      const tabId = selectedTabId;
+      const memoName = openMemo.memoName;
+      const doConvert = async (): Promise<void> => {
+        const res = await ipc.convertMemoFormat({ tabId, memoName, targetFormat });
+        if (res.ok) {
+          const newFormat: 'plain' | 'markdown' = targetFormat === 'md' ? 'markdown' : 'plain';
+          setOpenMemo((prev) => (prev && prev.tabId === tabId && prev.memoName === memoName ? { ...prev, format: newFormat } : prev));
+          // Compartment 経由のプレビュー描画は `markdown` prop の値（マウント時固定）に依存するため、
+          // format が変わった場合は再マウントして反映させる（既存の外部反映と同じ reloadGeneration
+          // パターン。本文=contentLF 自体は変換で変化しないためそのまま引き継がれる）。previewMode は
+          // 上の reloadGeneration 変化を見ている effect が既定値=true へ自動的にリセットする。
+          setReloadGeneration((g) => g + 1);
+          void refreshTree(tabId);
+          reportActiveMemo({ tabId, memoName, dirty: dirtyRef.current, format: newFormat });
+          setStatusMessage(targetFormat === 'md' ? 'Markdown形式（.md）に変換しました。' : '通常のテキスト形式（.txt）に変換しました。');
+        } else {
+          setStatusMessage(`変換エラー[${res.error.code}]: ${res.error.message}`);
+        }
+      };
+      if (targetFormat === 'txt') {
+        const hasDecorationOrImage = /<span[\s>]/i.test(contentLF) || /data:image\//i.test(contentLF);
+        if (hasDecorationOrImage) {
+          setConfirmDialog({
+            title: '.txtへ変換',
+            message: 'この操作を行うと、色などの装飾用タグや画像データがそのまま文字として表示されるようになります。続行しますか？',
+            confirmLabel: '続行',
+            danger: true,
+            onConfirm: () => {
+              setConfirmDialog(null);
+              void doConvert();
+            }
+          });
+          return;
+        }
+      }
+      void doConvert();
+    },
+    [openMemo, selectedTabId, contentLF, refreshTree, reportActiveMemo]
+  );
+
   // 「ロック」ボタン（暗号化メモを開封中のみ表示）: dirty なら自動保存してからセッション鍵を破棄し、
   // レンダラ側の CodeMirror ドキュメント/Undo 履歴も破棄する（厳格な履歴破棄, DESIGN §2.9）。
   const handleLockMemo = useCallback(async () => {
-    if (!openMemo || !openMemo.encrypted) return;
+    // 【v3 M9a】ロック解除セッション配下（openMemo.lockToken あり）はこの「ロック」ボタン
+    // （M6 個別暗号化の crypto:lock）の対象外。セッション自体はツリー側の「ロックを解除」操作
+    // 起点でのみ破棄される（自動再ロックはしない, DESIGNv3 §1.11）。
+    if (!openMemo || !openMemo.encrypted || openMemo.lockToken) return;
     const memoName = openMemo.memoName;
     if (!(await requestCloseCurrentMemo())) return;
     setOpenMemo(null);
@@ -1058,6 +1258,33 @@ export function App() {
     [selectedTabId, isOpenAndDirty]
   );
 
+  // --- v3 M8: ノードロック（DESIGNv3 §1、docs/v3/milestones/M8-node-lock-core.md） ---
+  // 既存M6の暗号化ダイアログ導線をそのまま流用する（DESIGNv3 §1.11）。dirty ガードは対象外
+  // （ロック対象は選択中のノード自体であり、現在開いているメモとは独立した操作のため）。
+  const handleRequestLockNode = useCallback(
+    (memoName: string) => {
+      if (!selectedTabId) return;
+      // 開いている(現在表示中の)メモがロック対象配下に含まれる場合は先に閉じてもらう
+      // （ロック実行で実ファイルが難読化名へリネーム+暗号化されるため, developer 判断）。
+      if (openMemo && openMemo.tabId === selectedTabId && treeNodeContains(tree, memoName, openMemo.memoName)) {
+        setStatusMessage('ロック対象のメモが開いています。先に閉じて（別のメモを開くかタブを切り替えて）からロックしてください。');
+        return;
+      }
+      setCryptoDialog({ mode: 'lockNode', tabId: selectedTabId, memoName });
+      setCryptoDialogError(null);
+    },
+    [selectedTabId, openMemo, tree]
+  );
+
+  const handleRequestUnlockNode = useCallback(
+    (memoName: string) => {
+      if (!selectedTabId) return;
+      setCryptoDialog({ mode: 'unlockNode', tabId: selectedTabId, memoName });
+      setCryptoDialogError(null);
+    },
+    [selectedTabId]
+  );
+
   const handleCryptoDialogCancel = useCallback(() => {
     setCryptoDialog(null);
     setCryptoDialogError(null);
@@ -1094,8 +1321,10 @@ export function App() {
         clearPlainAutosaveTimer();
         setOpenMemo((prev) => (prev ? { ...prev, encrypted: true, lastKnownHash: res.value.hash } : prev));
       } else {
-        // 暗号化解除（平文へ復帰）。
-        setOpenMemo(createOpenMemoState(tabId, memoName, res.value));
+        // 暗号化解除（平文へ復帰）。v3 M10b: 拡張子変換自体は起きない（DESIGNv3 §2.5「単なる
+        // テキストなので無改造で乗る」）ため、直前の openMemo.format（crypto:open 由来の値）を
+        // そのまま引き継ぐ（docs/v3/milestones/M10b-markdown-live-preview.md §0.7）。
+        setOpenMemo(createOpenMemoState(tabId, memoName, res.value, undefined, openMemo.format));
         setContentLF(res.value.contentLF);
       }
     },
@@ -1124,7 +1353,18 @@ export function App() {
           if (res.ok) {
             setCryptoDialog(null);
             setCryptoDialogError(null);
-            setOpenMemo({ tabId, memoName, eol: res.value.eol, encoding: 'utf-8', lastKnownHash: res.value.hash, encrypted: true });
+            // v3 M10b: M6個別暗号化を crypto:open で開封した場合、TreeNode.format は当該ノードが
+            // encrypted:true の間 undefined のままのため、CryptoOpenResult.format をローカル状態
+            // として保持する（§0.1/§0.7、docs/v3/milestones/M10b-markdown-live-preview.md）。
+            setOpenMemo({
+              tabId,
+              memoName,
+              eol: res.value.eol,
+              encoding: 'utf-8',
+              lastKnownHash: res.value.hash,
+              encrypted: true,
+              format: res.value.format
+            });
             setContentLF(res.value.contentLF);
             setDirty(false);
             setEditorStats(null);
@@ -1132,7 +1372,7 @@ export function App() {
             setRevealTarget(null);
             setConflictInfo(null);
             setReloadGeneration((g) => g + 1);
-            reportActiveMemo({ tabId, memoName, dirty: false });
+            reportActiveMemo({ tabId, memoName, dirty: false, format: res.value.format });
           } else {
             setCryptoDialogError(res.error.message);
           }
@@ -1145,6 +1385,38 @@ export function App() {
             setStatusMessage(`「${memoName}」の暗号化を解除しました。`);
             await refreshOpenMemoAfterCryptoOp(tabId, memoName, false);
             await refreshTree(tabId);
+          } else {
+            setCryptoDialogError(res.error.message);
+          }
+          return;
+        }
+        if (mode === 'lockNode') {
+          // v3 M8: サブツリーをロックする（起点=memoName の配下全体, DESIGNv3 §1）。
+          const res = await ipc.lockNode({ tabId, memoName, password: values.password ?? '', hint: values.hint });
+          if (res.ok) {
+            setCryptoDialog(null);
+            setStatusMessage('サブツリーをロックしました。');
+            await refreshTree(tabId);
+          } else {
+            setCryptoDialogError(res.error.message);
+          }
+          return;
+        }
+        if (mode === 'unlockNode') {
+          // v3 M8: ロック中サブツリーを復号しセッション開始する（`memoName` は難読化トークン）。
+          // 返却された `tree`（起点ノード自身を含む単一要素配列）で、ローカルツリー状態上の
+          // 🔒 プレースホルダをそのまま丸ごと差し替えて表示する（本マイルストーンのゴール:
+          // 「解除直後に返る TreeNode[] が正しく表示される」まで。配下の読み書き等セッション運用は
+          // M9 スコープ）。
+          const res = await ipc.unlockNode({ tabId, memoName, password: values.password ?? '' });
+          if (res.ok) {
+            setCryptoDialog(null);
+            setCryptoDialogError(null);
+            const revealed = res.value.tree[0];
+            if (revealed) {
+              setTree((prev) => updateTreeNode(prev, memoName, () => revealed));
+            }
+            setStatusMessage('ロックを解除しました。');
           } else {
             setCryptoDialogError(res.error.message);
           }
@@ -1171,10 +1443,42 @@ export function App() {
 
   // --- ツリー開閉/ラベル（tree:updateStructure, メタのみ更新） ---
 
+  /**
+   * `nextTree`（ローカルで既に反映済みの新しいツリー state）を永続化する。`lockTokenHint`
+   * は今回の変更の対象ノード自身が保持する `lockToken`（呼び出し元＝Tree.tsx の行データが
+   * 把握している値をそのまま渡す, M9a-R2-01）で、これが truthy な場合（v3 M9a のロック解除
+   * セッション配下）は、タブ直下の可視ツリー全体ではなくそのセッション自身に `lockContext`
+   * 付きで送る（PLANv3 §1.3/§5.3）。セッション配下の変更をタブ直下の通常呼び出しに混ぜて送ると、
+   * メイン側 `tree:updateStructure`（lockContext 省略時）はセッション実体をディスクの
+   * プレースホルダへ差し戻すだけで反映しない（M8/M9a既存実装、AGENT_LOG「sessionsByRealName」
+   * 参照）ため、都度この専用呼び出しが必要。
+   * 【M9a-R2-01】以前は対象ノードを `memoName` 文字列一致（`resolveLockContext`）で自己解決して
+   * いたが、ロック解除セッション配下はセッション単位でのみ一意（PLANv3 §7.3）のため、タブ直下・
+   * 他セッションに同名ノードが同時存在すると誤ったスコープを解決しかねなかった（reviewer指摘）。
+   * 呼び出し元が hint を明示することでこの取り違えを解消する。
+   */
   const persistTreeStructure = useCallback(
-    async (nextTree: TreeNode[]) => {
+    async (nextTree: TreeNode[], lockTokenHint: string | undefined) => {
       if (!selectedTabId) return;
       setTree(nextTree);
+      if (lockTokenHint) {
+        const lockContext: LockContext = { lockToken: lockTokenHint };
+        const root = findSessionRootNode(nextTree, lockTokenHint);
+        if (root) {
+          const res = await ipc.updateTreeStructure({
+            tabId: selectedTabId,
+            lockContext,
+            treeStructure: toMetaTree(root.children)
+          });
+          if (!res.ok) {
+            setStatusMessage(`ツリー更新エラー[${res.error.code}]: ${res.error.message}`);
+            if (res.error.code === 'LOCK_SESSION_NOT_FOUND') {
+              setTree((prev) => collapseSessionToPlaceholder(prev, lockTokenHint));
+            }
+          }
+          return;
+        }
+      }
       const res = await ipc.updateTreeStructure({ tabId: selectedTabId, treeStructure: toMetaTree(nextTree) });
       if (!res.ok) {
         setStatusMessage(`ツリー更新エラー[${res.error.code}]: ${res.error.message}`);
@@ -1185,16 +1489,20 @@ export function App() {
   );
 
   const handleToggleExpand = useCallback(
-    (memoName: string) => {
-      void persistTreeStructure(updateTreeNode(tree, memoName, (n) => ({ ...n, expanded: !n.expanded })));
+    (memoName: string, lockToken?: string) => {
+      void persistTreeStructure(
+        updateTreeNodeInScope(tree, memoName, lockToken, (n) => ({ ...n, expanded: !n.expanded })),
+        lockToken
+      );
     },
     [tree, persistTreeStructure]
   );
 
   const handleRequestSetLabel = useCallback(
-    (memoName: string, color: string | null) => {
+    (memoName: string, color: string | null, lockToken?: string) => {
       void persistTreeStructure(
-        updateTreeNode(tree, memoName, (n) => ({ ...n, label: { color, kind: n.label?.kind ?? null } }))
+        updateTreeNodeInScope(tree, memoName, lockToken, (n) => ({ ...n, label: { color, kind: n.label?.kind ?? null } })),
+        lockToken
       );
     },
     [tree, persistTreeStructure]
@@ -1202,8 +1510,11 @@ export function App() {
 
   // 編集ロック切替（本文編集のみ禁止。リネーム/削除等ファイル操作は対象外, ユーザー要望）。
   const handleRequestToggleLock = useCallback(
-    (memoName: string) => {
-      void persistTreeStructure(updateTreeNode(tree, memoName, (n) => ({ ...n, locked: !n.locked })));
+    (memoName: string, lockToken?: string) => {
+      void persistTreeStructure(
+        updateTreeNodeInScope(tree, memoName, lockToken, (n) => ({ ...n, locked: !n.locked })),
+        lockToken
+      );
     },
     [tree, persistTreeStructure]
   );
@@ -1237,8 +1548,102 @@ export function App() {
   // --- 同一タブ内 DND（並べ替え・階層変更はメタのみ、コピーは memo:move） ---
 
   const handleLocalMove = useCallback(
-    async (draggedNames: string[], destAnchorMemoName: string, zone: DropZone) => {
+    async (
+      draggedNames: string[],
+      destAnchorMemoName: string,
+      zone: DropZone,
+      anchorLockToken?: string,
+      srcLockToken?: string
+    ) => {
       if (!selectedTabId) return;
+
+      // 【v3 M9b・最重要】「一方通行の金庫」（DESIGNv3 §1.12）。ドラッグ元行自身の lockToken
+      // （srcLockToken、掴んだ行そのものの hint）が truthy で、かつドロップ先（anchorLockToken）
+      // と一致しない場合（内→外、または別ロック間）は拒否する。Tree.tsx の TreeRow（canAcceptDrop）
+      // /Tree.tsx（handleRowDrop）が既に事前ブロックしているはずだが、ここでも同一ルールを
+      // 再検証する（多層防御。IPC側 memoHandlers.ts の handleLockBoundaryMove が最終防衛線）。
+      if (srcLockToken && srcLockToken !== anchorLockToken) {
+        setStatusMessage('ロック解除中の場所から、外部または別のロックへは移動できません（一方通行の金庫）。');
+        return;
+      }
+
+      // 【v3 M9b】通常領域 → ロック解除セッション配下（「外→内」、許可、PLANv3 §5.4）。実ファイルの
+      // 暗号化変換（難読化名へのリネーム+暗号化, dest側nameMap/children/claimedTokensへの組込み）を
+      // 伴うため、既存の M9a セッション内 tree:updateStructure 専用経路では対応できず、
+      // memo:move（destLockContext 付き）へ委譲する。
+      if (anchorLockToken && !srcLockToken) {
+        const res = await ipc.moveMemo({
+          srcTabId: selectedTabId,
+          memoNames: draggedNames,
+          destTabId: selectedTabId,
+          destPosition: dropZoneToPosition(zone),
+          destAnchorMemoName,
+          copy: false,
+          destLockContext: { lockToken: anchorLockToken }
+        });
+        if (res.ok) {
+          // dest（セッション）側・src（タブ直下）側の両方が変わるため、tab:openTree を再取得する
+          // （既存セッションは reconcile が tabId 経由で展開表示を維持するため巻き戻らない, M8）。
+          await refreshTree(selectedTabId);
+        } else {
+          setStatusMessage(`移動エラー[${res.error.code}]: ${res.error.message}`);
+        }
+        return;
+      }
+
+      // 【v3 M9a / M9a-R2-01】ドロップ先アンカー行そのものが保持する lockToken（Tree.tsx の
+      // 行データから得た hint。ユーザーが実際にドロップした行そのものなので取り違えようがない）
+      // が truthy な場合（この時点で srcLockToken===anchorLockToken、つまり同一セッション内の
+      // 並べ替え。境界を跨がない, PLANv3 §5.4 表の最終行）、タブ直下の可視ツリー全体ではなく
+      // そのセッション自身へ lockContext 付きで送る（PLANv3 §1.3/§5.3）。以前はドラッグ対象+
+      // アンカー全ての `memoName` を `findTreeNode`（文字列一致のみ）で解決し、得られた
+      // lockToken 集合が単一かどうかで判定していたが、同名ノードが複数スコープに同時存在する
+      // 場合（PLANv3 §7.3）に誤ったスコープを解決しかねなかった（reviewer指摘 M9a-R2-01）。
+      // アンカーの hint を正として、ドラッグ対象各々は `findTreeNodeInScope` でこのスコープに
+      // 実在するものだけを対象にする（見つからないドラッグ対象＝別スコープの同名ノードを誤って
+      // 掴むよりは、移動せずスキップする方が安全）。
+      if (anchorLockToken) {
+        const root = findSessionRootNode(tree, anchorLockToken);
+        if (root) {
+          const metaChildren = toMetaTree(root.children);
+          for (const name of draggedNames) {
+            if (name === destAnchorMemoName || isDescendantOf(metaChildren, name, destAnchorMemoName)) {
+              setStatusMessage('選択したメモ自身またはその子孫へは移動できません。');
+              return;
+            }
+          }
+          let children: readonly TreeNode[] = root.children;
+          const movedNodes: TreeNode[] = [];
+          for (const name of draggedNames) {
+            const found = findTreeNodeInScope(children, name, anchorLockToken);
+            if (found) {
+              movedNodes.push(found);
+              children = removeTreeNodesByNamesInScope(children, new Set([name]), anchorLockToken);
+            }
+          }
+          const position = dropZoneToPosition(zone);
+          for (const node of orderForBatchInsert(movedNodes, position)) {
+            children = insertTreeNodeAtInScope(children, node, position, anchorLockToken, destAnchorMemoName);
+          }
+          const lockContext: LockContext = { lockToken: anchorLockToken };
+          const res = await ipc.updateTreeStructure({
+            tabId: selectedTabId,
+            lockContext,
+            treeStructure: toMetaTree(children)
+          });
+          if (res.ok) {
+            const finalChildren = children;
+            setTree((prev) => updateTreeNodeInScope(prev, root.memoName, root.lockToken, (n) => ({ ...n, children: finalChildren })));
+          } else {
+            setStatusMessage(`移動エラー[${res.error.code}]: ${res.error.message}`);
+            if (res.error.code === 'LOCK_SESSION_NOT_FOUND') {
+              setTree((prev) => collapseSessionToPlaceholder(prev, anchorLockToken));
+            }
+          }
+          return;
+        }
+      }
+
       const metaTree = toMetaTree(tree);
       for (const name of draggedNames) {
         if (name === destAnchorMemoName || isDescendantOf(metaTree, name, destAnchorMemoName)) {
@@ -1268,15 +1673,37 @@ export function App() {
   );
 
   const handleLocalCopy = useCallback(
-    async (draggedNames: string[], destAnchorMemoName: string, zone: DropZone) => {
+    async (
+      draggedNames: string[],
+      destAnchorMemoName: string,
+      zone: DropZone,
+      anchorLockToken?: string,
+      srcLockToken?: string
+    ) => {
       if (!selectedTabId) return;
+
+      // 【v3 M9b】「一方通行の金庫」（DESIGNv3 §1.12）。handleLocalMove と同じ判定
+      // （Tree.tsx の事前ブロックに続く多層防御。IPC側 handleLockBoundaryMove が最終防衛線）。
+      if (srcLockToken && srcLockToken !== anchorLockToken) {
+        setStatusMessage('ロック解除中の場所から、外部または別のロックへはコピーできません（一方通行の金庫）。');
+        return;
+      }
+
+      // srcLockToken===anchorLockToken（両方 undefined=通常領域どうし、または同一セッション内）
+      // ならそのまま lockContext を組み立てて memo:move へ渡す。「外→内」（srcLockToken 無し・
+      // anchorLockToken 有り）も同じ呼び出しで扱える（destLockContext のみ付与, PLANv3 §5.4）。
+      const srcLockContext: LockContext | undefined = srcLockToken ? { lockToken: srcLockToken } : undefined;
+      const destLockContext: LockContext | undefined = anchorLockToken ? { lockToken: anchorLockToken } : undefined;
+
       const res = await ipc.moveMemo({
         srcTabId: selectedTabId,
         memoNames: draggedNames,
         destTabId: selectedTabId,
         destPosition: dropZoneToPosition(zone),
         destAnchorMemoName,
-        copy: true
+        copy: true,
+        srcLockContext,
+        destLockContext
       });
       if (res.ok) {
         await refreshTree(selectedTabId);
@@ -1292,6 +1719,22 @@ export function App() {
   const handleDropMemoOnTab = useCallback(
     async (destTabId: string, payload: MemoDragPayload, copy: boolean) => {
       if (payload.srcTabId === destTabId) return; // 同一タブへのドロップはツリー内 DND 側で処理済み。
+      // 【v3 M9b】「一方通行の金庫」（DESIGNv3 §1.12）。TabBar へのドロップ先は常にタブ直下
+      // （`destPosition:'last'`、セッション配下を指定する手段がUI上存在しない=常に「通常領域」）
+      // のため、ドラッグ元がロック解除セッション配下（`payload.srcLockToken` truthy）の場合は
+      // 内→外の移動・コピーになり常に禁止（レンダラの事前拒否。IPC側 memoHandlers.ts の
+      // handleLockBoundaryMove でも同一ルールを再検証する二重防御）。
+      // 【reviewer指摘 M9b-R1-01】上記の `srcLockToken` はドラッグ元が「ロック解除セッション配下」
+      // であることしか示さない。ドラッグ元行自身が `nodeLocked`（未解除の🔒プレースホルダ、
+      // トップレベル/入れ子いずれも）の場合は `srcLockToken` が無い（もともと通常領域のスコープ）
+      // ため上のガードを素通りしてしまい、ロック中の中身をパスワード無しでタブ間へ物理移動できて
+      // しまう穴があった。`srcNodeLocked`（掴んだ行自身の nodeLocked フラグ）で別途拒否する
+      // （IPC側 memoHandlers.ts の plain v1 memo:move 経路でも `.lock` 保有ノードのタブ間移動を
+      // 再検証・拒否する二重防御を追加済み）。
+      if (payload.srcLockToken || payload.srcNodeLocked) {
+        setStatusMessage('ロック中のノードは別のタブへ移動・コピーできません（一方通行の金庫）。');
+        return;
+      }
       const res = await ipc.moveMemo({
         srcTabId: payload.srcTabId,
         memoNames: payload.memoNames,
@@ -1314,18 +1757,47 @@ export function App() {
   // --- メモ 追加位置/リネーム/複製/削除（PLAN §2.2） ---
 
   const handleRequestCreate = useCallback(
-    (position: AddPosition, anchorMemoName?: string) => {
+    (position: AddPosition, anchorMemoName?: string, anchorLockToken?: string, format?: 'plain' | 'markdown') => {
       if (!selectedTabId) return;
       const name = generateDefaultMemoName(collectTreeNames(toMetaTree(tree)));
+      // 【v3 M9a / M9a-R2-01】anchorLockToken は Tree.tsx の行データ（右クリックされたアンカー行
+      // そのもの）から得た hint。以前は `resolveLockContext`（`anchorMemoName` の文字列一致のみ）
+      // で自己解決していたが、同名ノードが複数スコープに同時存在する場合（PLANv3 §7.3）に誤った
+      // スコープを解決しかねなかった（reviewer指摘）。hint をそのまま使うことで解決する。
+      const lockContext: LockContext | undefined = anchorMemoName && anchorLockToken ? { lockToken: anchorLockToken } : undefined;
+      // v3 M10c: 新規メモ作成時の「通常メモ」「Markdownメモ」選択（DESIGNv3 §2.4）。未指定時は
+      // 既存動作通り 'plain'（.txt）。
+      const effectiveFormat: 'plain' | 'markdown' = format ?? 'plain';
       void (async () => {
-        const res = await ipc.createMemo({ tabId: selectedTabId, name, position, anchorMemoName });
+        const res = await ipc.createMemo({ tabId: selectedTabId, name, position, anchorMemoName, format, lockContext });
         if (res.ok) {
           setStatusMessage(`メモを作成しました: ${res.value.memoName}`);
-          await refreshTree(selectedTabId);
+          if (lockContext) {
+            // セッション配下: `tab:openTree` はセッションを認識しないため、refreshTree を挟まず
+            // ローカルで直接反映する（挟むと表示上セッションが閉じてしまう）。
+            const newNode: TreeNode = {
+              memoName: res.value.memoName,
+              encrypted: res.value.encrypted,
+              expanded: true,
+              children: [],
+              lockToken: lockContext.lockToken,
+              format: effectiveFormat
+            };
+            setTree((prev) => insertTreeNodeAtInScope(prev, newNode, position, lockContext.lockToken, anchorMemoName));
+          } else {
+            await refreshTree(selectedTabId);
+          }
           setSelection(selectSingle(res.value.memoName));
-          await openMemoByName(res.value.memoName, res.value.encrypted);
+          // 【v3 M10c】`formatHint` を明示的に渡す: 直上の `setTree`/`refreshTree` は React の
+          // 状態更新が非同期のため、この時点で `openMemoByName` 内部の `tree` はまだ更新前の
+          // スナップショットを参照する（stale closure）。作成時に確定している `effectiveFormat` を
+          // そのまま渡すことで、作成直後からライブプレビューが正しく有効になるようにする。
+          await openMemoByName(res.value.memoName, res.value.encrypted, true, lockContext?.lockToken, effectiveFormat);
         } else {
           setStatusMessage(`メモ作成エラー[${res.error.code}]: ${res.error.message}`);
+          if (lockContext && res.error.code === 'LOCK_SESSION_NOT_FOUND') {
+            setTree((prev) => collapseSessionToPlaceholder(prev, lockContext.lockToken));
+          }
         }
       })();
     },
@@ -1333,8 +1805,13 @@ export function App() {
   );
 
   const handleRequestRename = useCallback(
-    (oldName: string) => {
+    (oldName: string, lockToken?: string) => {
       if (!selectedTabId) return;
+      // 【v3 M9a / M9a-R2-01】lockToken は Tree.tsx の行データ（右クリックされた行そのもの）から
+      // 得た hint。以前は `resolveLockContext`（`oldName` の文字列一致のみ）で自己解決していたが、
+      // 同名ノードが複数スコープに同時存在する場合（PLANv3 §7.3）に誤ったスコープを解決しかねな
+      // かった（reviewer指摘）。hint をそのまま使うことで解決する。
+      const lockContext: LockContext | undefined = lockToken ? { lockToken } : undefined;
       setNameDialog({
         title: 'メモ名を変更',
         label: '新しいメモ名',
@@ -1344,16 +1821,26 @@ export function App() {
           setNameDialog(null);
           if (newName === oldName) return;
           void (async () => {
-            const res = await ipc.renameMemo({ tabId: selectedTabId, oldName, newName });
+            const res = await ipc.renameMemo({ tabId: selectedTabId, oldName, newName, lockContext });
             if (res.ok) {
               setStatusMessage(`リネームしました: ${oldName} → ${newName}`);
-              if (openMemo?.tabId === selectedTabId && openMemo.memoName === oldName) {
+              // openMemo.lockToken も一致することを確認し、別スコープの同名メモを誤って
+              // 「現在開いているメモ」として書き換えないようにする（M9a-R2-01）。
+              if (openMemo?.tabId === selectedTabId && openMemo.memoName === oldName && openMemo.lockToken === lockToken) {
                 setOpenMemo({ ...openMemo, memoName: newName });
-                reportActiveMemo({ tabId: selectedTabId, memoName: newName, dirty: dirtyRef.current });
+                reportActiveMemo({ tabId: selectedTabId, memoName: newName, dirty: dirtyRef.current, format: openMemo.format });
               }
-              await refreshTree(selectedTabId);
+              if (lockContext) {
+                // セッション配下: refreshTree を挟まずローカルで直接反映する（理由は create 参照）。
+                setTree((prev) => updateTreeNodeInScope(prev, oldName, lockToken, (n) => ({ ...n, memoName: newName })));
+              } else {
+                await refreshTree(selectedTabId);
+              }
             } else {
               setStatusMessage(`リネームエラー[${res.error.code}]: ${res.error.message}`);
+              if (lockContext && res.error.code === 'LOCK_SESSION_NOT_FOUND') {
+                setTree((prev) => collapseSessionToPlaceholder(prev, lockContext.lockToken));
+              }
             }
           })();
         }
@@ -1363,8 +1850,28 @@ export function App() {
   );
 
   const handleRequestDelete = useCallback(
-    (memoNames: string[]) => {
+    (memoNames: string[], lockToken?: string) => {
       if (!selectedTabId || memoNames.length === 0) return;
+      // 【v3 M9a-R2-01/R2-02】lockToken は Tree.tsx の行データ（右クリックされた行そのもの）から
+      // 得た hint。以前は `resolveLockContext(tree, memoNames[0])` で「先頭の対象」の文字列一致
+      // のみから自己解決していたため、(a) 同名ノードが複数スコープに同時存在する場合
+      // （PLANv3 §7.3）に誤ったスコープを解決しかねず（M9a-R2-01）、(b) バッチ内の対象が
+      // 一部だけ異なるスコープに属する（ロック解除中セッション内とタブ直下にまたがる）ケースの
+      // 均質性を検証していなかった（M9a-R2-02）。
+      // メイン側 deleteMemosInSession/memo:delete は対象外の名前を「拒否」ではなく「既に削除済み
+      // として成功扱い(no-op)」する実装のため、スコープ混在バッチを片方のスコープだけへ送ると、
+      // もう片方は実際には削除されないまま ok が返り、ローカルの removeTreeNodesByNamesInScope が
+      // 見た目上ツリーから消してしまう（実ファイルは無傷なのに UI 上「削除できた」ように誤表示
+      // され続ける）。そのため、`memoNames` 全体が hint と同一スコープ（scope-qualified lookup で
+      // 発見できる）かどうかを事前に検証し、1件でも属さなければ操作を中断する（reviewer指摘）。
+      const homogeneous = memoNames.every((n) => !!findTreeNodeInScope(tree, n, lockToken));
+      if (!homogeneous) {
+        setStatusMessage(
+          'ロック解除中セッション内とタブ直下など、異なる場所にまたがる削除は一度に行えません。同じ場所のメモだけを選択し直してください。'
+        );
+        return;
+      }
+      const lockContext: LockContext | undefined = lockToken ? { lockToken } : undefined;
       setConfirmDialog({
         title: 'メモを削除',
         message: `以下 ${memoNames.length} 件のメモをごみ箱へ送ります。よろしいですか？\n${memoNames.join(', ')}`,
@@ -1373,10 +1880,11 @@ export function App() {
         onConfirm: () => {
           setConfirmDialog(null);
           void (async () => {
-            const res = await ipc.deleteMemo({ tabId: selectedTabId, memoNames });
-            if (res.ok) {
-              setStatusMessage('削除しました。');
-              if (openMemo && memoNames.includes(openMemo.memoName)) {
+            const res = await ipc.deleteMemo({ tabId: selectedTabId, memoNames, lockContext });
+            const closeIfOpen = (): void => {
+              // openMemo.lockToken も一致することを確認し、別スコープの同名メモを誤って閉じない
+              // ようにする（M9a-R2-01）。
+              if (openMemo && memoNames.includes(openMemo.memoName) && openMemo.lockToken === lockToken) {
                 clearEncryptedAutosaveTimer();
                 clearPlainAutosaveTimer();
                 setOpenMemo(null);
@@ -1386,6 +1894,27 @@ export function App() {
                 setConflictInfo(null);
                 reportActiveMemo(null);
               }
+            };
+            if (lockContext) {
+              // 【v3 M9a】セッション配下: refreshTree を挟まずローカルで直接反映する（理由は
+              // create 参照）。evt:trashFallback 導線もセッション配下は配線されていない
+              // （developer報告済みスコープ外事項）ため、TRASH_FAILED も含め通常のエラーとして扱う。
+              if (res.ok) {
+                setStatusMessage('削除しました。');
+                closeIfOpen();
+                setSelection(EMPTY_SELECTION);
+                setTree((prev) => removeTreeNodesByNamesInScope(prev, new Set(memoNames), lockToken));
+              } else {
+                setStatusMessage(`削除エラー[${res.error.code}]: ${res.error.message}`);
+                if (res.error.code === 'LOCK_SESSION_NOT_FOUND') {
+                  setTree((prev) => collapseSessionToPlaceholder(prev, lockContext.lockToken));
+                }
+              }
+              return;
+            }
+            if (res.ok) {
+              setStatusMessage('削除しました。');
+              closeIfOpen();
               setSelection(EMPTY_SELECTION);
             } else if (res.error.code !== 'TRASH_FAILED') {
               // TRASH_FAILED は evt:trashFallback 経由の確認ダイアログ側で扱う。
@@ -1396,7 +1925,7 @@ export function App() {
         }
       });
     },
-    [selectedTabId, openMemo, refreshTree, reportActiveMemo, clearEncryptedAutosaveTimer, clearPlainAutosaveTimer]
+    [selectedTabId, tree, openMemo, refreshTree, reportActiveMemo, clearEncryptedAutosaveTimer, clearPlainAutosaveTimer]
   );
 
   const handleTrashFallbackConfirm = useCallback(() => {
@@ -1619,6 +2148,9 @@ export function App() {
         case 'textCommand':
           editorRef.current?.runTextCommand(payload.command);
           return;
+        case 'decoration':
+          editorRef.current?.runDecorationCommand(payload);
+          return;
         case 'setWrap':
           handleChangeEditorSettingsFromDialog({ wrap: payload.wrap });
           return;
@@ -1684,7 +2216,8 @@ export function App() {
       }
       if (matchesShortcut(e, shortcuts.lockCurrentMemo ?? DEFAULT_SHORTCUTS.lockCurrentMemo)) {
         const om = openMemoRef.current;
-        if (om && om.encrypted) {
+        // 【v3 M9a】ロック解除セッション配下は対象外（handleLockMemo 参照）。
+        if (om && om.encrypted && !om.lockToken) {
           e.preventDefault();
           void handleLockMemo();
         }
@@ -1723,7 +2256,9 @@ export function App() {
               openMemoName={openMemo?.memoName ?? null}
               selection={selection}
               onSelectionChange={setSelection}
-              onOpenMemo={(memoName, encrypted, focusEditor) => void openMemoByName(memoName, encrypted, focusEditor)}
+              onOpenMemo={(memoName, encrypted, focusEditor, lockToken) =>
+                void openMemoByName(memoName, encrypted, focusEditor, lockToken)
+              }
               onToggleExpand={handleToggleExpand}
               onRequestCreate={handleRequestCreate}
               onRequestRename={handleRequestRename}
@@ -1734,8 +2269,14 @@ export function App() {
               onRequestChangePassword={handleRequestChangePassword}
               onRequestToggleLock={handleRequestToggleLock}
               onRequestProperties={handleRequestProperties}
-              onLocalMove={(names, anchor, zone) => void handleLocalMove(names, anchor, zone)}
-              onLocalCopy={(names, anchor, zone) => void handleLocalCopy(names, anchor, zone)}
+              onRequestLockNode={handleRequestLockNode}
+              onRequestUnlockNode={handleRequestUnlockNode}
+              onLocalMove={(names, anchor, zone, anchorLockToken, srcLockToken) =>
+                void handleLocalMove(names, anchor, zone, anchorLockToken, srcLockToken)
+              }
+              onLocalCopy={(names, anchor, zone, anchorLockToken, srcLockToken) =>
+                void handleLocalCopy(names, anchor, zone, anchorLockToken, srcLockToken)
+              }
               uiFontScale={uiFontScale}
             />
           ) : (
@@ -1755,17 +2296,41 @@ export function App() {
                   {dirty ? ' *' : ''}
                 </span>
                 <span className="app__editor-meta">
-                  {openMemo.encrypted ? '🔒 暗号化' : `encoding: ${openMemo.encoding}`} / eol: {openMemo.eol}
+                  {/* v3 M9a: ロック解除セッション配下は「🔒 暗号化」ではなく専用表示にする
+                      （M6 個別暗号化の「ロック」ボタンはセッションには効かないため区別する）。 */}
+                  {openMemo.lockToken
+                    ? '🔒 ロック解除セッション'
+                    : openMemo.encrypted
+                      ? '🔒 暗号化'
+                      : `encoding: ${openMemo.encoding}`}{' '}
+                  / eol: {openMemo.eol}
                 </span>
                 <button type="button" onClick={() => void handleSave()} disabled={!dirty}>
                   保存
                 </button>
-                {openMemo.encrypted && (
+                {openMemo.encrypted && !openMemo.lockToken && (
                   <button type="button" onClick={() => void handleLockMemo()}>
                     ロック
                   </button>
                 )}
+                {/* v3 M10c: `.txt`→`.md`変換（DESIGNv3 §2.4）。暗号化メモ・ノードロックセッション
+                    配下は memo:convertFormat 対象外（M10a）のためボタン自体を出さない。
+                    `.md`→`.txt`はMarkdownToolbar側（下）に置く。 */}
+                {openMemo.format !== 'markdown' && !openMemo.encrypted && !openMemo.lockToken && (
+                  <button type="button" onClick={() => handleConvertFormat('md')} title="拡張子を .md に変換します（本文は変換しません）">
+                    Markdownに変換
+                  </button>
+                )}
               </div>
+              {/* v3 M10c: ライブプレビュー編集中専用ツールバー（`.md`メモのみ表示）。 */}
+              {openMemo.format === 'markdown' && (
+                <MarkdownToolbar
+                  previewMode={previewMode}
+                  onTogglePreview={() => setPreviewMode((prev) => !prev)}
+                  canConvertToTxt={!openMemo.encrypted && !openMemo.lockToken}
+                  onConvertToTxt={() => handleConvertFormat('txt')}
+                />
+              )}
               <CodeMirrorEditor
                 key={`${openMemo.tabId}:${openMemo.memoName}:${reloadGeneration}`}
                 ref={editorRef}
@@ -1779,10 +2344,16 @@ export function App() {
                 readOnly={
                   (conflictInfo !== null && conflictInfo.tabId === openMemo.tabId && conflictInfo.memoName === openMemo.memoName) ||
                   (cryptoDialog !== null && cryptoDialog.tabId === openMemo.tabId && cryptoDialog.memoName === openMemo.memoName) ||
-                  !!findTreeNode(tree, openMemo.memoName)?.locked
+                  // M9a-R2-01: openMemo.lockToken を scope hint に使い、別スコープの同名ノードの
+                  // 編集ロック状態を誤って参照しないようにする。
+                  !!findTreeNodeInScope(tree, openMemo.memoName, openMemo.lockToken)?.locked
                 }
                 linkOpenTrigger={linkSettings.openTrigger}
                 onLinkClick={handleLinkClick}
+                markdown={openMemo.format === 'markdown'}
+                previewMode={previewMode}
+                onImagePasteRequest={handleImagePasteRequest}
+                onUnsupportedImagePaste={handleUnsupportedImagePaste}
               />
             </div>
           ) : (
