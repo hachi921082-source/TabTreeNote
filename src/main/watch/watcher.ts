@@ -19,6 +19,7 @@ import {
   BACKUP_SUFFIX,
   META_FILE_NAME,
   MEMO_EXT_ENCRYPTED,
+  MEMO_EXT_MARKDOWN,
   MEMO_EXT_PLAIN,
   OS_JUNK_FILE_NAMES,
   TEMP_FILE_PREFIX,
@@ -98,9 +99,17 @@ async function processSettledEvent(path: string, type: RawEventType): Promise<vo
 
   let memoName: string;
   let encrypted: boolean;
+  // 【v3 M10a】`.md` も `.txt` と並ぶ「平文相当」の第三拡張子として認識する（scanTabFolder と
+  // 同じ対象範囲。未対応のままだと外部エディタ等での `.md` 編集がインデックス/競合判定に
+  // 一切反映されず、`.txt` と「全く同様に動作する」というM10aのゴールを満たさなくなる）。
+  let format: 'plain' | 'markdown' = 'plain';
   if (base.endsWith(MEMO_EXT_ENCRYPTED)) {
     memoName = base.slice(0, -MEMO_EXT_ENCRYPTED.length);
     encrypted = true;
+  } else if (base.endsWith(MEMO_EXT_MARKDOWN)) {
+    memoName = base.slice(0, -MEMO_EXT_MARKDOWN.length);
+    encrypted = false;
+    format = 'markdown';
   } else if (base.endsWith(MEMO_EXT_PLAIN)) {
     memoName = base.slice(0, -MEMO_EXT_PLAIN.length);
     encrypted = false;
@@ -115,7 +124,7 @@ async function processSettledEvent(path: string, type: RawEventType): Promise<vo
     updateMemoIndex(owner.tabId, memoName, true, null);
   } else {
     const res = await readMemo(owner.folderPath, memoName);
-    updateMemoIndex(owner.tabId, memoName, false, res.ok ? res.value.contentLF : '');
+    updateMemoIndex(owner.tabId, memoName, false, res.ok ? res.value.contentLF : '', format);
   }
   emit<IndexUpdatedPayload>(IpcEvents.indexUpdated, { tabId: owner.tabId });
 
