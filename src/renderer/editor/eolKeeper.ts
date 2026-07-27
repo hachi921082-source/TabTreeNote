@@ -16,17 +16,38 @@ export interface OpenMemoState {
   /** 直近の読み込み/保存時点における実ファイル全体のハッシュ（次回保存時の競合判定用, Fix4）。 */
   lastKnownHash: string;
   encrypted: boolean;
+  /**
+   * 【v3 M9a: レンダラ側配線】このメモがロック解除セッション配下（起点ノード自身を含む）にある
+   * 場合の `lockToken`（PLANv3 §1.3）。設定されている間は、`memo:read`/`memo:save` を
+   * `crypto:open`/`crypto:saveEncrypted`（M6 個別暗号化）ではなく `lockContext` 付きの通常チャネル
+   * で扱う（セッションはパスワード入力済みで既に開封されているため）。
+   */
+  lockToken?: string;
+  /**
+   * 【v3 M10b: レンダラ側配線】このメモがMarkdown（`.md`由来）かどうか。ライブプレビュー描画の
+   * 有効化判定に使う（`undefined`=不明、装飾なしのプレーンテキストとして扱う。
+   * docs/v3/milestones/M10b-markdown-live-preview.md §0.7）。
+   */
+  format?: 'plain' | 'markdown';
 }
 
 /** `memo:read`/`memo:readWithEncoding` の結果から `OpenMemoState` を作る。 */
-export function createOpenMemoState(tabId: string, memoName: string, readResult: MemoReadResult): OpenMemoState {
+export function createOpenMemoState(
+  tabId: string,
+  memoName: string,
+  readResult: MemoReadResult,
+  lockToken?: string,
+  format?: 'plain' | 'markdown'
+): OpenMemoState {
   return {
     tabId,
     memoName,
     eol: readResult.eol,
     encoding: readResult.encoding,
     lastKnownHash: readResult.hash,
-    encrypted: readResult.encrypted
+    encrypted: readResult.encrypted,
+    lockToken,
+    format
   };
 }
 
