@@ -1,511 +1,744 @@
 # AGENT_LOG.md
 
-TabTreeNote エージェント活動記録。詳細な指摘理由は reviewer の ReportFindings を参照。
+TabTreeNote エージェント活動記録(v3: M8以降)。詳細な指摘理由は reviewer の ReportFindings を参照。
 
-## reviewer — PLAN.md 静的レビュー（ラウンド1）
+> v1スコープ(PLAN.mdレビュー〜M0〜M7)の記録は [AGENT_LOG-v1-archive.md](AGENT_LOG-v1-archive.md) へ分離済み(2026-07-26、ファイル肥大化によるトークン消費削減のため)。v3作業では参照不要。
 
-対象: PLAN.md（designer 作成）を DESIGN.md と比較レビュー。実装コードは未着手。
+## developer — M8（ノードロック基盤）実装
 
-- R1-01 [Med] NG: §5.2 step6 atomicWrite の順序。旧→.bak リネームを temp 書込より先に行うと、target 不在の窓が temp 書込全体に広がる。temp 書込+fsync を先にして最後に世代スワップする順序を推奨。
-- R1-02 [Low] 要確認: 整合メモ#1（暗号フラグを拡張子 .txtenc に一本化）は技術的に妥当（DESIGN §3.2 堅牢性原則にむしろ整合）だが、DESIGN §2.9「メタにフラグのみ持たせる」の文言と字面が矛盾。DESIGN 側の記述更新で整合を取るべき（designer 案件）。
-- R1-03 [Low] NG: selfWriteRegistry への登録が §5.2/§5.3 の本文で memo パスのみ明示。.bak リネーム・メタ/設定 JSON のアトミック保存も登録対象（DESIGN §3.3 包括原則）。fs 層で一元登録する設計を明記推奨。
-- R1-04 [Low] NG: memo:delete のごみ箱失敗フォールバック再 invoke に「直接削除許可」を伝えるパラメータ/チャネルが未定義。引数に force フラグ等が必要。
-- R1-05 [Low] NG: crypto:saveEncrypted に expectedHash 相当が無く、暗号化メモ保存時の外部変更競合検出が平文 memo:save と非対称。
-- R1-06 [Low] OK(軽微): TreeSnapshot/MemoInfo/Label/AppSettings 等 IPC 戻り型が §4.4 未定義。load-bearing な型は定義推奨。
-- R1-07 [Info] OK: scrypt N=16384 は 2026 基準ではやや低め。ファイル記録で将来引き上げ可のため許容。既定を N=2^15〜2^16 も検討可。
-- 整合メモ#2〜#5: いずれも DESIGN の許容範囲内で妥当。ユーザー再確認を要する重大逸脱は無し。
+対象: v3 M8（ノード/サブツリー単位パスワードロックの基盤＝単発のロック/解除/再ロック）。`docs/v3/DESIGNv3.md` §1・`docs/v3/PLANv3.md` §2.1/§4/§5.1-5.3/§7.1/§7.7・`docs/v3/milestones/M8-node-lock-core.md` に基づき実装。M9（セッション中の構造変更・境界移動・タブ切替一括破棄）・M10（Markdown）は対象外。
 
-## reviewer — M0（足場）実装 静的レビュー（ラウンド1）
+- **着手前の設計差し戻し（本セッションの前段で発生済み・ユーザー報告経由）**: `docs/v3/milestones/M8-node-lock-core.md`/`PLANv3.md §4` の型スケッチ `TreeNode.locked?: true` が既存の編集ロック用 `TreeNode.locked?: boolean` と衝突する矛盾を発見し、designer 差し戻しにより `TreeNode.nodeLocked?: true` へ確定済み（`DESIGNv3.md` §1冒頭「フィールド名の確定」に正式反映済み）。本セッションはこの確定を前提に実装した。
+- **新規ファイル**: `src/main/crypto/obfuscatedNaming.ts`（128bit難読化ファイル名生成+衝突時再生成）、`src/main/crypto/nodeLockSessionStore.ts`（`(tabId, lockToken)`キーの常駐セッション。`buildOriginTreeNode`/`buildSessionTreeNodes` は `crypto:unlockNode` の返却値組立と `metaStore.reconcile` の再表示の両方から共用）、`src/main/crypto/nodeLock.ts`（`lockNode`/`unlockNode`/`relockNode` オーケストレーション）。
+- **`src/shared/models.ts`**: `NodeLock`/`NodeLockBlob`、`MetaTreeNode.lock?`、`TreeNode.nodeLocked?: true`/`lockToken?: string`、`ErrorCode` に `LOCK_CONTAINS_ENCRYPTED`/`LOCK_SESSION_NOT_FOUND` を追加（M8スコープの2件のみ。`LOCK_BOUNDARY_VIOLATION` はM9で追加予定）。
+- **`src/shared/ipc-contract.ts`**: `crypto:lockNode`/`unlockNode`/`relockNode` の3チャネル・引数/返却型・`PreloadApi.crypto` 拡張を追加。M8では `lockContext` 引数は扱わない（milestone doc通りM9スコープ）。
+- **`src/main/fs/metaStore.ts`**: `collectClaimedTokens`/`collectLockedNodesByName` を新設。`reconcile()` が `lock` 付きノードを「🔒(ロック中)」プレースホルダとして描画しつつ、`claimedTokens` を孤児判定から除外（PLANv3 §7.1 必須対応）。**実装補完（設計逸脱ではなく実装上の必然）**: `loadTabMeta`/`reconcile` に任意の `tabId` を追加し、`tab:openTree`（`tabService.openTabTree` のみ）から渡すことで、ロック解除セッションが既に張られているノードは次回の `tab:openTree` でも🔒へ巻き戻らず展開済み状態のまま返す（`nodeLockSessionStore` を単一の真実源とする）。他の `loadTabMeta` 呼び出し元（`memoHandlers.ts` 等）は `loaded.metaTree` のみ使用し `loaded.tree` は使わないため影響なし。
+- **`src/main/ipc/memoHandlers.ts`**: (1) `tree:updateStructure` — クライアント送信の `treeStructure`（`TreeNode`由来で`lock`フィールドを持てない）をそのまま保存すると既存のロックブロブが消失する問題、および `claimedTokens` 配下ファイルが実ファイル厳密一致チェックに引っかかりロック存在下では通常のツリー操作全てが失敗する問題を修正（現在ディスク上のメタから `lock` を再付与+children強制`[]`、`claimedTokens` を一致チェックから除外）。(2) `memo:move` — `destPosition==='child'` でロック中ノードを直接のアンカーに指定するケースをIPC境界でも拒否（`NAME_INVALID`。Tree.tsx側で既に`'after'`へ丸めているクライアント側対策と合わせた多層防御）。
+- **`src/main/ipc/cryptoHandlers.ts`**: `crypto:lockNode`/`unlockNode`/`relockNode` の3ハンドラを登録。`lockNode` 成功時のみ `evt:indexUpdated` を発火（`nodeLock.ts` 内で対象配下の実名を全文検索インデックスから除去済み＝平文がメモリへ残らない）。
+- **preload/renderer配線**: `src/preload/index.ts`・`src/renderer/ipc.ts` に3チャネル追加。`src/renderer/components/Tree/treeView.ts`（`FlatTreeRow.nodeLocked`/`lockToken`）、`TreeRow.tsx`（🔒(ロック中)表示、`memoName`を無視）、`Tree.tsx`（右クリック「サブツリーをロック」/「ロックを解除」、ロック中ノードはF2リネーム・クリックオープン・DND `'child'`ドロップを無効化してクライアント側でも多層防御）、`PasswordDialog.tsx`（`lockNode`/`unlockNode`モード追加。既存M6ダイアログのUI形状をそのまま流用、DESIGNv3 §1.11）、`App.tsx`（`handleRequestLockNode`/`handleRequestUnlockNode`・`handleCryptoDialogSubmit`拡張。ロック対象配下に現在開いているメモが含まれる場合は先に閉じるよう案内してからロック実行、`unlockNode`成功時は返却された単一要素`tree`でローカルツリー状態の🔒プレースホルダを丸ごと差し替え表示）。
+- **M8ゴールの範囲について**: milestone doc記載通り「解除直後に返るTreeNode[]が正しく表示される」までを実装。ロック解除セッション配下メモの作成/リネーム/削除等の構造変更、`lockContext`によるIPC拡張、タブ切替時セッション一括破棄（`crypto:relockAllInTab`）はM9スコープとして未実装（型・IPC共に追加していない）。
+- **既知の残存事項（対応不要と判断・reviewer確認を推奨）**: ロック中プレースホルダノードを削除した場合、配下の子孫の暗号化実ファイルは`claimedTokens`の対応表ごと失われディスク上に永久に孤立する（DESIGNv3 §1.7 Q3が既に許容する「メタ+.bak同時消失時の対応表喪失」と同水準のトレードオフと判断し、カスケード削除等の追加実装はしていない）。
+- 確認: `npx tsc --noEmit -p tsconfig.json`・`npx tsc --noEmit -p tsconfig.node.json` とも成功。`npx electron-vite build` 成功（`out/main/index.js` 103.18kB / `out/preload/index.js` 9.08kB / `out/renderer/assets/index-*.js` 1,014.01kB）。実行時動作検証（ロック/解除の実機確認）はtester範囲のため未実施。
+- コミット・プッシュは行っていない（作業ツリーへの変更のみ）。
 
-対象: M0 実装コード（package.json / tsconfig / electron.vite.config / src/main / src/preload / src/renderer / src/shared）。M0-scaffold.md・00-core-principles.md・data-model.md・PLAN §2/§3/§4 と照合。
+## reviewer — M8（ノードロック基盤）実装 静的レビュー（ラウンド1）
 
-- 全体: セキュリティ不変条件（contextIsolation/nodeIntegration/sandbox/preload 限定 API）は充足。models.ts/constants.ts/ipc-contract.ts は data-model.md/PLAN と整合。developer 確認依頼5点はいずれも設計妥当（app:getInfo 非 Result・依存バージョン・スプリッター in scope・PreloadApi 骨格）。ブロッキング指摘なし。
-- M0-R1-01 [Low] NG: index.html の CSP `script-src ... 'unsafe-eval'` が静的 meta のため本番ビルドにも同梱される。dev(HMR)専用の緩和のはずが production 出力にも残る。§10 のハード不変条件とは非矛盾だが、prod は unsafe-eval 不要のため dev 限定化を推奨。
-- M0-R1-02 [Low] 要確認: main/index.ts の setWindowOpenHandler が任意 URL を無検証で shell.openExternal へ委譲。M0 では発火経路なし（潜在）だが、リンク機能実装時に向け http/https/mailto 等のスキーム許可リスト化を推奨。
+対象: M8差分一式（nodeLock.ts/nodeLockSessionStore.ts/obfuscatedNaming.ts新規、metaStore.ts/memoHandlers.ts/cryptoHandlers.ts拡張、shared/models.ts・ipc-contract.ts、renderer側配線）。DESIGNv3 §1・PLANv3 §2.1/§4/§5.1-5.3/§7.1/§7.7・M8-node-lock-core.mdと照合。
 
-## reviewer — M0 低優先度指摘の反映確認（ラウンド1 差分）
+- M8-R1-01 [High] NG（1回目）: `tree:updateStructure`（memoHandlers.ts）が、ロック中ノードが1つでも存在すると**常に**`NOT_FOUND`（「ツリー構造が実ファイルと一致しません」）を返す。`scannedNames`は`claimedTokens`（起点ノード自身のトークンを含む）を実ファイル一覧から丸ごと除外するが、`flatNames`/`nameSet`は`finalStructure`（クライアントが返送する可視ツリー、ロック placeholder ノードの`memoName`=起点トークンを含む）をそのままフラット化するため除外されない。結果、起点トークンが`nameSet`には有るが`scannedNames`には無い状態になり`setsMatch`が恒常的にfalseになる。これはロック配下と無関係な操作（他ノードの開閉トグル・ラベル変更・編集ロック切替・DND並べ替え等）を含め、**そのタブの`tree:updateStructure`経由の更新すべてが以後失敗する**（`persistTreeStructure`のフォールバックで表示だけは`refreshTree`で復旧するが保存は常に失敗）。developer自身のログ記載（「claimedTokens配下ファイルが実ファイル厳密一致チェックに引っかかりロック存在下では通常のツリー操作全てが失敗する問題を修正」）の意図を、起点トークン自身については達成できていない。修正方針: `scannedNames`の除外対象を「子孫の難読化トークンのみ」（`claimedTokens`から各ロックノード自身の`memoName`を除いた集合）に絞り、起点トークン自身は通常の実ファイルと同様に一致チェック対象へ含める。
+- M8-R1-02 [Low] 要確認（ブロッキングではない）: `memo:move`は`destPosition==='child'`+ロック中ノードanchorを明示的に拒否する多層防御を追加しているが、同じ`insertNode`を使う`memo:create`ハンドラには対応する防御が無い。現行UIは常に`position:'after'`のみを送るため実UIからは到達不能だが、クラフトされたIPC呼び出し（`position:'child'`+`anchorMemoName=`ロックトークン）で`insertNode`がロック中ノードの`children`（常に`[]`であるべき, DESIGNv3 §1.2/§1.6）へ直接pushしてしまう。memo:moveと同水準の多層防御をmemo:createにも揃えることを推奨（任意対応）。
+- 良好点: `TreeNode.nodeLocked`/`MetaTreeNode.lock`と既存編集ロック`locked`は型上・使用箇所ともに衝突なし（(1)クリア）。`metaStore.reconcile`の孤児判定除外は`collectClaimedTokens`経由で正しく機能（(2)クリア）。`loadTabMeta`/`reconcile`への`tabId`追加（セッション展開の巻き戻り防止）は妥当な実装補完、`tab:openTree`以外の呼び出し元への影響もなし（(3)の該当項目クリア）。`nodeLock.ts`に鍵・パスワード・復号平文のログ出力・露出なし（(4)クリア）。難読化変換の書込み順序（新ファイルatomicWrite→fsync相当確認後に旧ファイルunlink）はPLANv3 §7.7通り（(5)クリア）。`lockNode`成功時に`removeMemoFromIndex`で全文検索インデックスから実名を除去済み（(6)クリア）。`lockContext`/`crypto:relockAllInTab`等M9スコープはIPC契約・型とも未追加を確認（(7)クリア）。
+- 判定: M8-R1-01（High）解消が必要。developer へ差し戻し（ラウンド1）。M8-R1-02は任意対応として申し送り。
 
-対象: src/renderer/index.html（静的CSP meta削除）, src/main/index.ts（registerContentSecurityPolicy / safeUrlScheme / ALLOWED_EXTERNAL_URL_SCHEMES）。
+## developer — M8-R1-01/M8-R1-02 対応（1回目の修正）
 
-- M0-R1-02 OK: スキーム許可リスト（http/https/mailto）で検証後のみ shell.openExternal、他は deny。URL.protocol は小文字正規化されSetと整合。安全化改善として妥当。合格判定は維持。
-- M0-R1-01 OK（1点tester確認依頼）: dev/prod でscript-src出し分けは正しい。ただし静的meta廃止により prod（loadFile=file://）でCSPが onHeadersReceived 経由のみになる。file:// リクエストで onHeadersReceived が発火しCSPヘッダが実際にレスポンスに載るかは実行時要確認（tester）。届かない場合prodがCSP無しに退行するリスクのため、DevToolsでのヘッダ存在/inline script遮断を検証。M0合格判定は覆さない。
+- **M8-R1-01対応**: `src/main/ipc/memoHandlers.ts`の`tree:updateStructure`に`descendantClaimedTokens`（`claimedTokens`から`lockedByName`のキー＝各ロックノード自身の`memoName`を除いた集合）を追加し、`scannedNames`の除外対象を`claimedTokens`から`descendantClaimedTokens`へ変更。これにより起点トークン自身は通常の実ファイルと同様に`nameSet`との突合対象へ含まれるようになった（`lockedByName`のキーは`nodeLock.ts`の`lockedNode.memoName = originToken`と一致するため、除外すべき「子孫のみ」を過不足なく特定できる）。`collectClaimedTokens`/`metaStore.reconcile`側は変更なし（reviewer確認済みの通り孤児判定除外は元々正しいため）。
+- **M8-R1-02対応（任意、対応する判断）**: `memo:create`ハンドラに、`memo:move`と同水準の多層防御を追加（`args.position==='child'`かつ`args.anchorMemoName`がロック中ノードの場合`NAME_INVALID`を返す）。`insertNode`呼び出し前に`collectLockedNodesByName(loaded.metaTree)`でチェック。
+- 確認: `npx tsc --noEmit -p tsconfig.json`・`npx tsc --noEmit -p tsconfig.node.json`とも成功。`npx electron-vite build`成功（`out/main/index.js` 103.61kB / `out/preload/index.js` 9.08kB / `out/renderer/assets/index-*.js` 1,014.01kB）。実行時動作検証は未実施（tester範囲）。
+- reviewer（M8-R1-01/M8-R1-02、いずれも1回目の修正）へ再レビュー依頼予定。コミット・プッシュは行っていない。
 
-## reviewer — M0-R1-01 再修正確認（ラウンド2 / 静的meta注入方式）
+## reviewer — M8-R1-01/M8-R1-02 修正確認（ラウンド2）
 
-対象: electron.vite.config.ts（cspMetaPlugin追加・defineConfig関数形式化）, src/main/index.ts（session/registerContentSecurityPolicy削除）, src/renderer/index.html（CSP meta削除・コメント化）。
+対象: src/main/ipc/memoHandlers.ts の tree:updateStructure（descendantClaimedTokens 追加）・memo:create（child+ロック中anchor拒否）。nodeLock.ts / metaStore.ts の該当箇所とトレース照合。
 
-- M0-R1-01 OK（解消）: CSPを onHeadersReceived 動的付与からビルド時静的meta注入（transformIndexHtml）へ変更。dev=script-src 'self' 'unsafe-eval' / prod=script-src 'self' で unsafe-eval を prod から確実に除外。前回 tester確認依頼にしていた file:// で CSP が載らない退行リスクは方式ごと消滅（developer の CDP実機確認と一致）。置換対象 `<meta charset="UTF-8" />` は index.html に実在し空振りなし。index.ts に session 残存参照なし、M0-R1-02 スキーム許可リストは維持。ブロッキング指摘なし。M0 は tester へ進行可。
-- 非ブロッキング留意（対応不要）: transformIndexHtml が charset文字列一致依存のため、将来 index.html の該当行改変で prod のCSP注入が無言で失われるフラグ性あり。個人プロジェクト規模では現状で許容。
+- M8-R1-01 OK（解消）: `lockedByName`（collectLockedNodesByName、キー=各ロックノード自身のmemoName）と`claimedTokens`（collectClaimedTokens、起点+子孫トークン全部）から`descendantClaimedTokens = claimedTokens - lockedByNameのキー`を算出し、`scannedNames`の除外対象をこちらへ変更。nodeLock.ts の`lockNode`で`flattenSubtree(originNode)`が起点ノード自身を含む配列を返し（34-38行目`out.push(node)`が先頭）、その全件（起点含む）についてトークンをclaimedTokensへpush（93-126行目）、かつロック済みMetaTreeNodeの`memoName = originToken`（159-160行目）と一致することをコードで確認。よって`descendantClaimedTokens`は起点トークンを含まない「子孫のみ」に正確に一致し、`scannedNames`から起点トークンが誤って除外される問題は解消。`finalStructure`側（クライアント送信のロックplaceholderノード、memoName=起点トークン）は`nameSet`に含まれ、`scannedNames`にも同トークンが残るため両者が一致するようになった。ロジックの正確性を確認、副作用（`claimedTokens`自体は無変更のため`collectClaimedTokens`/`metaStore.reconcile`側への影響なし）も確認。
+- M8-R1-02 OK（対応済み）: `memo:create`に`memo:move`（413-418行目付近と同一パターン）と同水準の多層防御を追加。`insertNode`呼び出し前、`args.position==='child'`かつ`args.anchorMemoName`が`collectLockedNodesByName(loaded.metaTree)`に存在する場合`NAME_INVALID`で拒否。位置・順序とも妥当。
+- 判定: ブロッキング指摘なし。M8-R1-01/M8-R1-02とも解消。developer への差し戻し不要。tester へ進行可。
 
-## tester — M0（足場）動作検証（ラウンド1）
+## tester — M8（ノードロック基盤）動作検証（ラウンド1）
 
-対象: reviewer M0-R1-01 ラウンド2 OK後のM0一式。npm install / typecheck / build / prod起動 / dev起動 / CSP実機確認 / UI基本動作を独立して再現確認。
+対象: reviewer M8 ラウンド2 OK後の一式。typecheck / build / IPC直叩き（CDP Runtime.evaluate経由でwindow.apiを直接呼び出し）によるロック/解除/再ロック・ツリー表示・DND/create多層防御・LOCK_CONTAINS_ENCRYPTED・全文検索除外を検証。
 
-- 結果: 全項目 OK。不具合なし。developer への差し戻しなし。
-- npm install: 成功（`up to date, audited 379 packages`。allow-scripts警告はelectron/esbuildのinstallスクリプト未承認の通知のみで動作に支障なし）。
+- 判定: **重大な不具合1件（High）を検出。developer への差し戻し（1回目）。**
 - typecheck: `tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json` エラーなし。
-- build: `electron-vite build` 成功。`out/main/index.js`、`out/preload/index.js`、`out/renderer/index.html`（+assets）を生成確認。
-- セキュリティ不変条件: src/main/index.ts のBrowserWindow webPreferencesで contextIsolation:true / nodeIntegration:false / sandbox:true をコード上確認。setWindowOpenHandlerのスキーム許可リスト（http/https/mailto）も維持確認。
-- prod起動: `unset ELECTRON_RUN_AS_NODE` 後 `./node_modules/.bin/electron.cmd . --remote-debugging-port=9333` でエラーなく起動。`Get-Process electron`でMainWindowTitle="TabTreeNote"確認。ログにDevTools listening行のみでエラーなし。
-- prod CSP実機確認: CDP Runtime.evaluateで`document.querySelector('meta[http-equiv="Content-Security-Policy"]')?.getAttribute('content')`を評価し `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; object-src 'none'`（unsafe-eval無し）を確認。out/renderer/index.htmlの静的contentとも一致。
-- dev起動: `npm run dev`（electron-vite dev, HMR）でエラーなく起動。`http://localhost:5173/`のHTMLに`script-src 'self' 'unsafe-eval'`を含むCSP metaタグを確認（curlで直接確認）。CDPでもwindow title="TabTreeNote"確認。
-- console/例外チェック: prod/dev双方でPage.reloadしながらRuntime.consoleAPICalled/Runtime.exceptionThrownを収集。prodは0件。devはVite HMR接続ログ・React DevTools案内・Electron標準の「Insecure CSP (unsafe-eval)」警告（Electron自身がpackaged後は出ないと明記する既知の開発時警告）のみで、type="error"や例外は0件。
-- UI基本動作: CDP経由でDOM操作。起動直後のステータスバーに`v0.1.0 / schema 1`（app:getInfo結果）表示を確認。テーマ切替ボタンをクリックし、`document.documentElement`のdata-theme属性がlight→dark、ボタン文言・ステータスバー文言も追随変化することを確認（スプリッタードラッグはpointer eventのCDP再現が煩雑なため未実施だが、コード上はpointermove/upハンドラの実装のみでクラッシュ要因なし。他項目の安定動作から問題なしと判断）。
-- 後片付け: 検証用electronプロセス（prod/dev）はPowerShellの`Stop-Process -Force`で終了済み。検証後`Get-Process electron`は0件を確認。
-- 外部サービスへの副作用: なし（すべてlocalhost/file://上での検証）。
-
-## reviewer — M1（ファイル層コア・平文）実装 静的レビュー（ラウンド1）
-
-対象: M1差分一式（src/main/fs/*, util/hash, watch/selfWriteRegistry, settings/appSettings, ipc/*, main/index.ts, preload, shared/ipc-contract, renderer/App.tsx ほか）。00-core-principles.md §1-§11 / data-model.md / M1-file-core.md と照合。
-
-- M1-R1-01 [Med] NG: memo:read/save/rename が memoName を validateName / isPathContained で確認せず `join(folderPath, memoName+ext)` に直結。pathSafety.isPathContained は定義のみで未使用。悪意/バグのあるレンダラから `..\..\` 相当の memoName でタブフォルダ外の任意ファイル読取・上書き（save の atomicWrite が .bak も生成）の余地。§10/§11 の閉じ込め意図に対する防御漏れ。要: fs 層で memoName 由来パスの検証・閉じ込め（+ isLongPath）を一元化。
-- M1-R1-02 [Low] NG: atomicWrite の catch で「旧target→.bak リネーム成功後」に2つ目の rename が全リトライ失敗すると temp を rm し、target 不在＋新データ喪失のまま .bak（旧内容）だけ残る。メモ .bak は自動復旧対象外のためUI上メモ消失に見える（クラッシュではなく通常失敗の経路）。要: swap 開始後の失敗時は .bak→target 復旧を試みる等。
-- M1-R1-03 [OK] developer確認#4（reconcile の子繰り上げ）: 妥当。実在する子メモ参照を失わず、usedNames 整合も取れている。data-model.md 未規定部分の発展的判断として許容。
-- M1-R1-04 [OK] developer確認#1-3,5-7: atomicWrite 世代スワップ順序＝§2準拠 / memo:create・rename 同期順序＝§3準拠（rename未登録フォールバックも妥当）/ selfWriteRegistry は登録一元化に収まりM4先取り過剰なし / Result<T>統一OK / textarea・window.prompt はM1暫定として許容。
-- セキュリティ: 鍵/PW/平文なし（M1）、内部ログに平文流出なし、preload限定公開・webPreferences不変条件維持。M1-R1-01以外に新規逸脱なし。
-
-## reviewer — M1 指摘修正確認（ラウンド2 / M1-R1-01・M1-R1-02）
-
-対象: memoFileService.ts（validateMemoNameForPath 新設・全公開関数の先頭検証・createEmptyMemoFile を Result<void> 化）, atomicWrite.ts（renamedToBak ロールバック）, memoHandlers.ts（create の Result 追従）。
-
-- M1-R1-01 OK（解消）: fs層の全公開エントリ（read/readWithEncoding/save/create/rename）先頭で validateName→join→isPathContained→isLongPath の多層検証。findMemoFile は未検証だが内部専用で全呼出元が検証済み。トラバーサル文字（\ / .. 末尾ピリオド）は validateName で拒否、閉じ込め併用で妥当。
-- M1-R1-02 OK（解消）: target→.bak 成功後の temp→target 失敗時に .bak→target をベストエフォート復元。二重失敗時は旧内容の .bak が残るのみでこれ以上の喪失なし。個人プロジェクト範囲で許容。
-- 非ブロッキング（Info・対応不要）: (1) validateMemoNameForPath の候補パスが常に .txt 固定のため .txtenc メモでは実パスが3字長く isLongPath 判定が最大3字過小。LONG_PATH は v1 非正式対応で許容。(2) findMemoFile は export だが自前検証なし。現状全呼出元が検証済みのため潜在のみ。
-- M1 は tester へ進行可。
-
-## tester — M1（ファイル層コア・平文）動作検証（ラウンド1）
-
-対象: reviewer M1 ラウンド2 OK後のM1一式。npm install / typecheck / build / prod起動 / IPC直叩き+DOM操作によるUIスモーク / パストラバーサル / 名前サニタイズ / 競合検出 / 復旧カスケード / 設定永続化 を独立して再現確認。
-
-- 結果: 全項目 OK。不具合なし。developer への差し戻しなし。
-- npm install: 成功（`up to date, audited 379 packages`。iconv-lite導入済み。allow-scripts警告のみで動作に支障なし）。
-- typecheck: `tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json` エラーなし。
-- build: `electron-vite build` 成功。`out/main/index.js`(30.11kB)/`out/preload/index.js`(1.90kB)/`out/renderer/index.html`+assets を生成確認。
-- prod起動: `electron . --remote-debugging-port=9333` でエラーなく起動。CDP(Runtime.consoleAPICalled/exceptionThrown)でPage.reload時のイベントを収集し0件（コンソールエラー・例外なし）。
-- 平文メモの開く/編集/保存（M1ゴール）: CDP経由で`window.api`を直接叩く形と、実際のDOM操作（タブクリック→メモ開く→textarea入力→保存ボタンクリック）の両方で確認。tab:register→memo:create→memo:read→memo:save→memo:read(再読込で内容一致)→アプリ再起動→tab:list/settings:get/tab:openTree/memo:readで再起動後もディスク永続化された内容・タブ登録・テーマ設定が復元されることを確認。UI操作でも保存ボタンがdirty時のみ活性化し、保存後にステータスバーへ「保存しました（〇〇）」表示、実ファイルへの反映を確認。
-- リネーム: `memo:rename`でファイル名変更・`tab:openTree`でツリー反映を確認。
-- 実ファイル生成確認: `.txt`本体、2回目のatomicWrite（create後のsave）で`memo1.txt.bak`（0バイト=create時点の空内容）生成、`.tabtreenote.json`と2回目のメタ保存（rename時）で`.tabtreenote.json.bak`生成を確認。
-- 競合検出: 1回保存済みの`expectedHash`（古いハッシュ）で再度`memo:save`を呼び、`CONFLICT`エラー（コード・メッセージ・pathのみでUNKNOWN内部情報の露出なし）を確認。
-- 名前サニタイズ: 予約名`CON`、禁止文字`?`を含む名前での`memo:create`が`NAME_INVALID`で拒否されることを確認。
-- パストラバーサル（M1-R1-01再修正確認）: `memoName`に実際のバックスラッシュを含む`..\..\evil`（JSON経由で正確にバックスラッシュ2文字×2を渡し、受信側でparsed argsとして`'..\\..\\evil'`であることを確認した上で検証）を`memo:read`/`memo:save`/`memo:create`/`memo:rename`全てに渡し、いずれも`NAME_INVALID`（使用できない文字）で拒否されることを確認。加えてタブフォルダ・その親・プロジェクトルート・ホーム直下を`find`で走査し`evil`という名前のファイルが一切生成されていないことを確認（bashのシェルクォート経由でバックスラッシュが握りつぶされる罠があり、一度`....evil`という別名のファイルを誤って作成してしまったが、これはトラバーサルではなく正当な名前としての通常のcreate/save成功であり閉じ込め違反ではないことを確認した上でテスト後片付け済み。念のためスラッシュ`../../evil`版でも別途`NAME_INVALID`拒否を確認）。
-- 重複拒否: `tab:register`の同一フォルダ二重登録・`memo:create`の同名メモがいずれも`NAME_DUPLICATE`で拒否されることを確認。
-- NOT_FOUND: 存在しない親フォルダへの`tab:register`/`tab:create`が`NOT_FOUND`を返すことを確認。
-- テーマ永続化: `settings:set`でtheme=darkに変更後、electronプロセスを`Stop-Process -Force`で終了し再起動、`settings:get`でtheme=darkが維持されていることを確認（`%APPDATA%\tabtreenote\app-settings.json`経由）。
-- メタ破損復旧カスケード（発展項目）: `.tabtreenote.json`を不正JSONに書き換え`.bak`は正常のまま`tab:openTree`を呼ぶと`.bak`から復旧し`evt:metaRecovered`（「直近のバックアップから復旧しました」）を受信。続けて`.bak`も不正JSONに書き換えて再度`tab:openTree`を呼ぶとフラット再生成され`evt:metaRecovered`（「メタ情報を再構築しました」）を受信。いずれもメモ本体`.txt`は無傷で内容維持されることを確認。
-- 後片付け: 検証用一時フォルダ（`%TEMP%\claude\tabtreenote-test`）・Electron userData（`%APPDATA%\tabtreenote`）を削除済み。検証後`Get-Process electron`は0件を確認。
-- 外部サービスへの副作用: なし（すべてローカルファイル操作・localhost CDPのみ）。
-
-## reviewer — M2（ツリーUI+メタ同期）実装 静的レビュー（ラウンド1）
-
-対象: M2差分一式（shared/nameSanitize・treeOps・ipc-contract, main/fs/trash・memoFileService・metaStore・tabService, main/ipc/*Handlers, preload, renderer/ipc・App・components/*）。00-core-principles.md §3/§4/§8/§10/§11・data-model.md・M2-tree-ui.md と照合。
-
-- M2-R1-01 [Med] NG（1回目）: App.tsx の未保存ガードが stale closure で無効化。`selectTab`（deps=[refreshTree] 安定）と `openMemoByName`（deps=[selectedTabId]）が `dirty` を依存に含めず、編集で `dirty=true` になっても関数は再生成されないため `if (dirty && !window.confirm(...))` が常に初期値 false 参照で発火しない。タブ切替・別メモを開く際に未保存編集が無確認で破棄される（M2に自動保存なし＝唯一の保護が失われる）データ損失。
-- M2-R1-02 [Low] NG（1回目）: 追加位置 'after' で複数ノードを一括挿入すると順序が反転。insertNode/insertTreeNode を同一アンカーに対しループ挿入する箇所（memoHandlers memo:move、App handleLocalMove）で、'after' のみ後続ノードがアンカー直後に割り込み [X,B,A] となる（'before'/'child' は順序維持）。複数選択DNDの並べ替え時に選択順と逆順になるUX不整合（機能破壊ではない）。
-- 同期順序/予約登録/パス検証: memo:delete/duplicate/move/tree:updateStructure/tab:rename/tab:remove とも §3 の①→②→③順を遵守（duplicate はファイル操作先行だが名前自動採番で検証先行の意図は満たす）。selfWrite 登録は trash/move/copy/duplicate/rename/direct-delete の全 fs 操作で漏れなし。duplicate/move/copy の新規パスも validateName＋isPathContained＋isLongPath を一貫適用。tree:updateStructure は実ファイル集合との厳密一致チェックで注入拒否。console.error は OSエラー/パスのみで機密漏洩なし（暗号はM6）。developer 補完#1-6 はいずれも設計妥当。
-- 判定: M2-R1-01（Med）解消が必要。developer へ差し戻し（ラウンド1）。
-
-## reviewer — M2 指摘修正確認（ラウンド2 / M2-R1-01・M2-R1-02）
-
-対象: App.tsx（dirtyRef 導入・selectTab/openMemoByName ガード）, shared/treeOps.ts（orderForBatchInsert 新設）, main/ipc/memoHandlers.ts（move/copy 両ループへ適用）。
-
-- M2-R1-01 OK（解消）: dirtyRef=useRef(dirty) 初期値正・useEffect([dirty]) 同期正。selectTab(140)/openMemoByName(155) とも dirtyRef.current を参照し、直接 dirty を読むガードの残存なし。UI 表示（633/638 の dirty）は state のまま=再描画目的で正しい。effect 同期はユーザー操作（非同期イベント）前に flush されるため競合なし。他コールバック（タブ削除・新規作成・終了）は元々ガード対象外で新規リグレッションなし。
-- M2-R1-02 OK（解消）: reverse-for-'after' をトレース検算。siblings=[Z] に [A,B] を 'after' 挿入時、逆順 [B,A] で反復すると [Z,A,B] となり選択順維持を確認。'before'（splice index）/'child'（push）/'last'（push）は順反復で順序維持。handleLocalMove・memo:move の移動用/コピー用両ループに適用済み、import・structuredClone・非破壊（[...nodes]）とも正。
-- M2-LATENT-01 [Low/Info] 潜在（対応任意）: orderForBatchInsert の doc は 'first' も順序維持と記すが、insertTreeNode 'first' は unshift のため一括挿入では順序反転する。ただし現行呼出は全て before/after/child（DropZone）または 'last' のみで 'first' は batch 経路に到達不能=実害なし。将来 'first' を一括挿入に使う場合の落とし穴。
-- 判定: M2-R1-01・M2-R1-02 とも解消。ブロッキング指摘なし。tester へ進行可。
-
-## tester — M2（ツリーUI+メタ同期）動作検証（ラウンド1）
-
-対象: reviewer M2 ラウンド2 OK後のM2一式。npm install / typecheck / build / prod起動 / IPC直叩き+実DOM操作（CDP Input/DOM/Runtime）によるツリーUI・複数選択・DND・名前ダイアログの動作検証を独立して再現確認。
-
-- 結果: 全項目 OK。不具合なし。developer への差し戻しなし。
-- npm install: 成功（`up to date, audited 379 packages`。allow-scripts警告のみで動作に支障なし）。
-- typecheck: `tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json` エラーなし。
-- build: `electron-vite build` 成功。`out/main/index.js`/`out/preload/index.js`/`out/renderer/index.html`+assets を生成確認。
-- prod起動: `--user-data-dir` で隔離した一時userDataを使い `electron . --remote-debugging-port=<port>` を計2回（別タスク用に別ポートで再起動）起動。CDP(Runtime.consoleAPICalled/exceptionThrown)を全操作中通して監視し、セッション全体を通じてconsoleエラー・例外0件（Page.reloadでの再検証時も0件）。
-- タブ操作: `tab:register`（既存フォルダ2件）、`tab:create`（新規フォルダ作成+登録、および親フォルダ不在での`NOT_FOUND`）、`tab:rename`（フォルダ実体も`TabB-renamed`へリネームされることをディスクで確認）、`tab:remove`（`deleteFolder:false`でフォルダ温存/`deleteFolder:true`でごみ箱送りされフォルダ消失をディスクで確認）、`tab:reorder`（`AppSettings.tabs`配列順の入れ替えを`tab:list`とディスク上`app-settings.json`の両方で確認）を全て確認。
-- ツリー表示・開閉・永続化: `tab:openTree`でメタ+実ファイル突合結果を確認。`tree:updateStructure`でノード開閉状態を変更し`.tabtreenote.json`へ反映、Electronプロセスを完全終了→`--user-data-dir`を維持して再起動後も`tab:list`の並び順・タブ名・ツリー開閉状態(`expanded:false`)が復元されることを確認。`tree:updateStructure`への実ファイル集合と不一致なツリー構造送信は`NOT_FOUND`で拒否されることも確認。
-- 複数選択（実DOM操作）: CDPの`Input.dispatchMouseEvent`でmodifiers(ctrl/shift)付きの本物のマウスイベントをツリー行に発火。通常クリックで単一選択→置換、Ctrl+クリックでトグル追加/除去、Shift+クリックでアンカーから対象までの範囲選択（8行全選択を確認）が正しく機能することをDOMの`.tree-row--selected`クラスで確認。
-- 追加位置（`memo:create`）: first/last/before/after/childの5パターンをIPC直叩きで実行し、`tab:openTree`のツリー順序が意図通り（子ネスト含む）であることを確認。
-- リネーム: `memo:rename`で実ファイル名変更+ツリー反映を確認。名前サニタイズ（予約名`CON`、禁止文字`?`）は`NAME_INVALID`で拒否。
-- 削除: `memo:delete`既定（ごみ箱送り）でファイル消失+メタ反映を確認。`forceDirect:true`再invoke経路（直接`fs.unlink`相当）もIPC直叩きで確認（ファイル消失+メタ反映）。
-- 複製: `memo:duplicate`を同一メモに対して2回実行し「〇〇のコピー」「〇〇のコピー (2)」と自動採番されること、元の直後（同階層）へ挿入されることを確認。
-- 移動・コピー: 同一タブ内移動（メタのみ変更・実ファイル不動をディスクで確認）、タブ間移動（実ファイルがフォルダ間で移動しメタも両タブぶん更新、宛先に同名衝突がある場合は`NAME_DUPLICATE`でバッチ全体拒否）、タブ間コピー（元は残り、名前衝突時は「〇〇のコピー」で自動改名）、同一タブ内コピー（衝突が無くても常に改名）を全てIPC直叩き+ディスク確認。複数ノード一括`after`移動でreviewer指摘M2-R1-02の選択順維持（反転しない）ことも実測で確認。
-- DND（実DOM操作）: ページ内で`DragEvent`+`DataTransfer`を構築し、対象行への`dragstart`→`dragover`→`drop`→`dragend`を実際に発火（`draggable`属性の存在も確認）。同一タブ内ドラッグ移動（`tree:updateStructure`経由、順序変更をDOM上で確認）、Ctrl+ドラッグでのコピー（`memo:move copy:true`経由、新規「のコピー」ファイル生成をDOM上で確認）を確認。TabBarへのドロップハンドラも同一タブ宛のケースで例外なく動作することを確認（複数タブでのクロスタブDND本体はIPC`memo:move`側で既に検証済みのため、UIハンドラの例外安全性の確認として実施）。
-- 名前サニタイズUX（`NameInputDialog`、実DOM操作）: 入力欄へのネイティブinputイベント発火で即時バリデーションメッセージ（禁止文字/予約名/前後空白/末尾ピリオドの4パターン）表示、置換候補ボタン「「bad-name」に修正する」のワンクリックでの値置換と送信ボタン活性化、を実DOM操作で確認。
-- 同期順序・世代管理: `.txt`本体、`.tabtreenote.json`とその`.bak`が各操作を通じて正しく生成/更新されることをディスク走査で確認。一時ファイル(prefix付き)の残留なしを確認。
-- 後片付け: 検証用一時フォルダ2件（scratchpad配下、リポジトリ外）・Electron userData（`--user-data-dir`で隔離、リポジトリ外）を削除済み。検証後`Get-Process electron`は0件を確認（2回の起動セッションとも終了確認済み）。
-- 外部サービスへの副作用: なし（すべてローカルファイル操作・localhost CDPのみ。実運用のAPIキー/Webhook等は使用していない）。
-
-## reviewer — M3-①（CodeMirror 6 統合）実装 静的レビュー（ラウンド1）
-
-対象: src/renderer/editor/codeMirrorSetup.ts（新規）, src/renderer/components/Editor/CodeMirrorEditor.tsx（新規）, src/renderer/App.tsx（textarea→CodeMirrorEditor置換ほか）, src/renderer/App.css, src/renderer/editor/eolKeeper.ts（コメントのみ）, package.json（CodeMirror個別パッケージ追加）。DESIGN §2.3/§2.4/§2.9/§6・PLAN §1.4/§4.4/§5.2 と照合。ブロッキング指摘なし。
-
-- 判定: **ブロッキング指摘なし。developer への差し戻し不要。**
-- M3R1-01 [Info] developer報告のスコープ判断4（行単位カット/コピー未実装）は事実誤認の可能性: node_modules 内 `@codemirror/view` の `handlers.copy = handlers.cut`（copiedRange関数）はコア組み込み動作で、選択範囲が空の場合は自動的にカーソル行を対象とする line-wise コピー/カットを行う（basicSetup非依存、常時有効）。追加実装なしで DESIGN §2.3「行単位の切り取り/コピー」を満たしている可能性が高い。tester に Ctrl+C/Ctrl+X（選択無し）でカーソル行がコピー/カットされることの実機確認を依頼し、確認できれば「未実装」ではなく「対応済み」として記録を訂正することを推奨（コード修正は不要、記録訂正のみ）。
-- M3R1-02 [Low/Info] 対応不要・M6向け留意: `key={tabId:memoName}` によるアンマウント/再マウント方式はメモ切替時のUndo履歴破棄（DESIGN §2.3）を正しく満たす。ただし M6 の「(再)ロック時もUndo履歴を厳格破棄」（DESIGN §2.9, PLAN §5.5）は同一メモのまま鍵のみ破棄するケースがあり得るため、ロック時に `openMemo` をnull化して一旦アンマウントする、またはkeyに世代番号を含める等の追加対応がM6実装時に必要になる。現時点のM3-①設計を壊すものではなく、M6着手時にdeveloperが意識すればよい。
-- スコープ判断1〜3・5（DEFAULT_WRAP_CHARS固定値／空白可視化Compartment・永続化フィールド無し／メモ毎editor設定の未配線／Ctrl+S配線漏れ解消）はいずれも妥当。PLAN/DESIGNのデータモデルに対応フィールドが無い範囲の合理的な既定値・縮小であり、設計原則（改行コード保持・Undo履歴スコープ・鍵管理境界）を壊すものではない。
-- DESIGN §2.3 必須注意（CM6のLF正規化対策）: `handleEditorChange` が `update.state.doc.toString()`（LF区切り）をそのまま `contentLF` として保持し、`memo:save`/`crypto:saveEncrypted` へ渡す経路（main側 `eol.restore` は今回未変更）と整合。eolKeeper.ts はロジック変更なし、コメント更新のみで実害なし。
-- セキュリティ: 本マイルストーンは平文メモのみ扱い、秘密情報のログ出力・ハードコードなし。`readOnly`/`autoFocus` props と `EditorView.editable`/`EditorState.readOnly` の組み合わせは将来のM6ロック表示・M4監視競合ロックに配線しやすい形になっている。
-- Reactの実装品質: uncontrolled設計（`initialContentLF`はマウント時のみ使用、以後は`onChange`通知のみ）、コールバックはref経由で最新版を参照（stale closure回避）、`view.destroy()`によるアンマウント時クリーンアップ、ネイティブwheelリスナーはcallback ref経由で張り替え+cleanup関数保持と問題なし。設定変更はCompartment経由のreconfigureで不要な再マウントを避けている。
-
-## developer — M3-①（CodeMirror 6 統合）実装
-
-対象: M3 を「① CodeMirror 6 統合」「② 全文検索本体（searchIndex/IPC/検索履歴/検索パネルUI）」に分割し、今回は①のみ実装。②は未着手（別セッション予定）。M0〜M2 のコードは作業ツリーに存在するが未コミット（ユーザー指示待ち）。
-
-- 新規: `src/renderer/editor/codeMirrorSetup.ts`（拡張構成一式。Compartment化=wrap/indent(tabWidth+softTab)/lineNumbers/whitespace/font、静的拡張=history/drawSelection/dropCursor/rectangularSelection/highlightActiveLine/search({top:true})+searchKeymap/defaultKeymap/historyKeymap/Mod-s保存/Enterオートインデント(insertNewlineKeepIndent, Prec.highest)/Tab(insertTab)・Shift-Tab(indentLess)、`computeEditorStats`（文字数/行数/カーソル行列/選択文字数））、`src/renderer/components/Editor/CodeMirrorEditor.tsx`（非制御Reactラッパ。`initialContentLF`はマウント時のみ使用、`onChange`/`onStats`はref経由で最新コールバックを呼ぶ、設定変更はCompartment経由でreconfigure、readOnly/autoFocus props用意（現状未使用=将来のM4ロック/M6暗号化表示向け））。
-- 変更: `src/renderer/App.tsx`（textarea→`CodeMirrorEditor`。key=`${tabId}:${memoName}`でメモ切替時に再マウント=Undo履歴リセット（DESIGN §2.3方針）。`editorSettings`state追加（初期値`DEFAULT_EDITOR_SETTINGS`、`settings:get`のeditorDefaultsで上書き）。`editorStats`stateとステータスバー表示追加。Ctrl+ホイールでのフォントサイズ変更（10-32px、`{passive:false}`ネイティブwheelリスナーをcallback ref経由でエディタ枠に張り、`editor__wrap`のmount/unmountに追従、500msデバウンスで`settings:set`永続化）。`handleSave`にdirtyガード追加（Ctrl+S誤爆防止）。メモ close/削除/タブ削除の各箇所へ`setEditorStats(null)`を追加）、`src/renderer/App.css`（`.cm-editor-host`とCodeMirror既定クラスをCSS変数テーマに合わせてオーバーライド、旧`.app__editor-textarea`削除）、`src/renderer/editor/eolKeeper.ts`（コメント更新のみ、ロジック変更なし）。
-- 依存追加: `@codemirror/state` `@codemirror/view` `@codemirror/commands` `@codemirror/language` `@codemirror/search`（`codemirror`メタパッケージ=basicSetupは使わず個別導入。コード補完/foldGutter等プレーンテキストに不要な機能を持ち込まないため）。
-- スコープ外/developer判断の既定値扱い（reviewer確認事項）:
-  1. 折り返し「文字数指定」はAppSettings/MemoEditorSettingsに文字数フィールドが無いため`DEFAULT_WRAP_CHARS=80`固定（`.cm-content{max-width:80ch}`近似）。M7で数値設定UIを追加する際にフィールド拡張が必要。
-  2. 空白/改行可視化トグルは永続フィールドが無いため`EditorSettings.showWhitespace`はコンポーネント内既定falseのみ（M7でUI配線予定、CodeMirror側は`highlightWhitespace`/`highlightTrailingWhitespace`のCompartmentとして実装済み）。
-  3. メモ毎`MemoEditorSettings`（wrap/font個別上書き）は今回未配線。`AppSettings.editorDefaults`（アプリ全体既定）のみ反映。
-  4. 行単位の切り取り/コピー（選択無しでのCtrl+X/Cが現在行を対象にする挙動）は未実装（選択ベースの通常のCut/Copyのみ）。DESIGN §2.3に列挙されているが今回のCodeMirror統合の主目的（検索/置換/正規表現/EOL維持/折返し/インデント/行番号/フォント）には含まれないと判断。
-  5. Ctrl+S保存ショートカットはDESIGN §2.6に既定として明記されていたがM1/M2のtextarea版には未配線だったため、今回エディタkeymap整備のついでに追加（スコープ拡張ではなく既存設計の配線漏れ解消）。
-- 確認: `npm install`後 `tsc --noEmit`（renderer/node両方）エラーなし、`electron-vite build`成功（`out/renderer/assets/index-*.js` 923KB、CodeMirror追加分の増分。chunk分割等の最適化はM7以降の課題として未対応）。`electron . --remote-debugging-port --user-data-dir=<隔離tmp>`起動時のログにエラーなし（起動可否のみの軽い確認。実際のCodeMirror動作検証はtester範囲）。検証用一時フォルダ・electronプロセスは後片付け済み。
-- reviewer/testerへの依頼時に上記5点（既定値扱い/未配線範囲）を明記し、設計逸脱ではなくM3を2分割した際の①スコープ内判断であることを伝える。
-
-## tester — M3-①（CodeMirror 6 統合）動作検証（ラウンド1）
-
-対象: reviewer M3-① ラウンド1（ブロッキング指摘なし）後の一式。npm install / typecheck / build / prod起動 / CDP実機操作（Input.dispatchKeyEvent・dispatchMouseEvent, Runtime.evaluate）による改行コード保持・検索置換・Undo履歴破棄・行単位カット/コピー・折返し/行番号/タブ幅/現在行ハイライト/フォントサイズ/ステータスバーを独立して再現確認。
-
-- 判定: **軽微な不具合1件（Medに近いLow）を記録のみで報告（差し戻しは行わない）。それ以外は全項目OK。developer への差し戻しは行わない。**
-- npm install: 成功（`up to date, audited 391 packages`。allow-scripts警告のみ）。
-- typecheck: `tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json` エラーなし。
-- build: `electron-vite build` 成功。`out/main/index.js`(45.39kB)/`out/preload/index.js`(3.03kB)/`out/renderer/assets/index-*.js`(923.15kB, CodeMirror込み)/css を生成確認。
-- prod起動: `--user-data-dir`で隔離したuserDataを使い`electron . --remote-debugging-port=9333`起動。ログは`DevTools listening`のみでエラーなし。CDP `Runtime.consoleAPICalled`/`Runtime.exceptionThrown`を全操作を通して監視（計約3分、2回に分けて監視）し、セッション全体でコンソールエラー・例外0件。
-- **改行コード保持（最重要, 実ファイルバイト列確認）**: CRLF/LF/CR各1件のメモ（`\r\n`/`\n`/`\r`混在なしで生成）をUIから開き（ステータスバーで`eol: crlf`/`eol: lf`/`eol: cr`検出を確認）、CDP実キー入力（`Input.dispatchKeyEvent`、windowsVirtualKeyCode付与でCM6のcontentEditableへ実際に文字挿入）で編集後Ctrl+S保存し、保存後ファイルを`xxd`で実バイト確認。3種とも元の改行コードが完全に維持（CRLFは`0d0a`、LFは`0a`のみ、CRは`0d`のみ、いずれも他方式への混入なし）されることを確認。CM6のLF正規化の影響を受けていないことを実ファイルレベルで確認。
-- 検索/置換パネル（Ctrl+F）: パネル自体の表示（next/previous/all/match case/regexp/by word/replace/replace all）、通常検索（3件マッチのハイライト`.cm-searchMatch`）、next移動での選択反映（ステータスバーの選択文字数・カーソル位置に反映、`.cm-searchMatch-selected`付与）、単一置換（`replace`ボタンで1件のみ置換）、全置換（`replaceAll`ボタンで残り全件置換）、正規表現検索（`re`チェックボックスON後`LI\w+\d`で3件正しくマッチ）を実機確認。
-- メモ切替時のUndo履歴破棄（DESIGN §2.3）: メモA（crlf-memo）で編集→保存→別メモへ切替→メモAへ戻り、Ctrl+Zを3回押しても内容が変化しないことを確認（新規EditorViewインスタンスとしてUndo履歴が空であることを確認）。同一メモ内でのCtrl+Zは正常に動作すること（直前入力の取り消し）も別途確認。
-- **行単位カット/コピー（reviewer情報提供M3R1-01の実機確認）**: `document.addEventListener('copy'/'cut', ..., false)`（bubbleフェーズ）でclipboardDataを捕捉した上で、選択なし（カーソルのみ）状態でCDP実キー入力によるCtrl+C/Ctrl+Xを実行。Ctrl+Cではカーソル行（`line2`）全文がclipboardDataにコピーされること、Ctrl+Xでは同様にカーソル行（`line3`）がカットされ実際にドキュメントから当該行が削除されることを確認。**「行単位の切り取り/コピー」はCodeMirror 6のコア機能により追加実装なしで対応済み**（developer報告の「未実装」は誤りと訂正。reviewerのM3R1-01推測どおり）。
-- 折返し/行番号/タブ幅/現在行ハイライト/フォントサイズ: 行番号ガター表示・`.cm-activeLine`（現在行ハイライト）付与・`.cm-content`の`white-space: break-spaces`（既定wrap='window'）を確認。Ctrl+ホイール（`wheel`イベント、`ctrlKey:true`、`{passive:false}`ネイティブリスナー経由）でフォントサイズが14px→15pxに変化し、`.cm-editor`の`computedStyle.fontSize`にも反映、500msデバウンス後`settings:get`の`editorDefaults.fontSize`へ永続化されることを確認。空白可視化（既定OFF）が実際に非表示（`.cm-highlightSpace`等0件）であることも確認。
-- ステータスバー: 文字数/行数/カーソル行:列/選択文字数/フォントサイズが編集・カーソル移動・選択操作のたびに追従更新されることを一連の操作を通して確認。
-- **[Low/中程度寄り] NG（記録のみ, 差し戻し不要と判断）: ソフトタブ設定（`softTab: true`既定）がカーソルのみ（選択なし）でのTabキー押下では効かない。** `codeMirrorSetup.ts`の`tabKeymap`は`{ key: 'Tab', run: insertTab }`（`@codemirror/commands`）を使用しているが、`insertTab`の実装（`node_modules/@codemirror/commands/dist/index.cjs` 1655行目）は選択範囲がある場合のみ`indentMore`（`indentUnit`＝スペース設定を尊重）を呼び、選択なしの場合は常にリテラルな`"\t"`文字を挿入する（`indentUnit`を無視）。実機確認: 選択なしでTab→ドキュメントに文字通りのタブ文字が挿入（softTab設定を無視）。行全体選択後にTab→期待通り4スペースへ正しくインデント（`indentMore`経由でindentUnit尊重）。**通常のカーソルのみでのTab入力（最も一般的な単一行インデント操作）でsoftTab設定が無効化される**ため、softTab=trueでもファイルに実タブ文字が混入し得る。CM6標準コマンドの仕様（indentUnit対応のソフトタブ挿入には`insertTab`ではなくカスタムコマンド or `indentUnit`参照の独自関数が必要）に起因。過去のreviewer合格判定（ブロッキング指摘なし）はこの挙動まで検証していなかった可能性が高い。**深刻度判断: EOL保持・データ破損等の致命的問題ではなく、タブ文字混入自体はプレーンテキストとして不正ではない（あくまでsoftTab設定が期待通り動かないUX上の不整合）ため、致命的とは判断せず差し戻しは行わない。記録として残し、developer/designerの今後の判断に委ねる。**
-- **[Info] 記録のみ（M3スコープ外・pre-existing、M3の回帰ではない）: 自動保存が未実装。** `AppSettings.editorDefaults`/`autosave`（`plainDebounceMs: 1500`等）は`src/main/settings/appSettings.ts`・`src/shared/models.ts`に定義済みだが、`src/renderer`側に自動保存のデバウンス保存ロジックは一切実装されていない（grep で該当実装なしを確認）。ただしAGENT_LOG既存記録（M2-R1-01, reviewer）で「M2に自動保存なし＝唯一の保護が失われる」と既に言及されており、M3-①以前から意図的に未実装（確認ダイアログによる保護が代替）として扱われてきた経緯があるため、**M3-①によるリグレッションではない**。今回の検証依頼文に「Ctrl+S、および自動保存が動くこと」とあったため確認したが、自動保存自体はM3-①のスコープ外（DESIGN §2.6の要件だが実装時期は未定）と判断し、差し戻しの対象にはしない。
+- build: `electron-vite build` 成功（`out/main/index.js` 103.61kB / `out/preload/index.js` 9.08kB / `out/renderer/assets/index-*.js` 1,014.01kB）。
+- **M8-T1-01 [High] NG: `crypto:unlockNode` 成功でロック解除セッションを展開表示した状態のタブで、それ以降に行う `tree:updateStructure`（トグル開閉・ラベル変更・DND並べ替え等、ロック対象と全く無関係な操作を含む）が常に`NOT_FOUND`（「ツリー構造が実ファイルと一致しません」）で失敗する。** 再現手順: Parent(→Child1→Grand1, Child2)のサブツリーを`crypto:lockNode`でロック→`crypto:unlockNode`で正しいパスワード解除（`tree`に実名の展開構造が正しく返る、`tab:openTree`再実行でも展開表示が巻き戻らないことは確認できた=申し送り事項(3)は正常）→この状態で無関係なノード「Other」の`expanded`をトグルしただけの`tree:updateStructure`（レンダラの`persistTreeStructure`が実際に送るのと同じ`toMetaTree()`変換を経た`treeStructure`）を送ると`NOT_FOUND`。**変更を一切加えない冪等な再送信でも同じく`NOT_FOUND`になることを確認済み**（トグル云々ではなく、セッション展開状態そのものが原因）。原因: `memoHandlers.ts`の`tree:updateStructure`は現在ディスク上のメタ（`lock`は起点トークン名がキー）から`lockedByName`を作り、クライアント送信の`treeStructure`中でこのキーと一致するノードにのみ`lock`を再付与する（`reattachLocks`）。しかし`crypto:unlockNode`成功後、レンダラのローカルツリー状態は当該ノードを`buildOriginTreeNode`が返す**実名**（`memoName: realMemoName`）のノードに丸ごと差し替える（`App.tsx`の`setTree(prev => updateTreeNode(prev, memoName, () => revealed))`、`memoName`は解除前のトークン指定だが差し替え後のノード自身の`memoName`は実名になる）ため、以後の`tree:updateStructure`が送る`treeStructure`にはこのノード（および子孫、いずれも実名）がトークンではなく実名で含まれる。`lockedByName`はトークンキーのため一致せず`reattachLocks`は「ロックなしの普通のノード」として通過させ、`lock`の再付与も children強制`[]`もされない。結果、`nameSet`（クライアント可視名=実名ベース）と`scannedNames`（実ファイル=ディスク上は依然としてトークン名の`.txtenc`のまま、`descendantClaimedTokens`除外で子孫トークンも除外済み）が一致せず恒常的に`NOT_FOUND`になる。`crypto:relockNode`でセッションを明示破棄（🔒プレースホルダへ復帰）すると同じ操作が正常に成功することも確認し、原因がセッション展開状態そのものであることを切り分け済み。**影響範囲: そのタブで一度でも`crypto:unlockNode`が成功すると、対象サブツリーと無関係な他ノードの開閉・ラベル変更・DND並べ替え・編集ロック切替など`tree:updateStructure`を経由するほぼ全ての通常操作がタブ全体で失敗し続ける**（`persistTreeStructure`の失敗時フォールバックは`refreshTree`で表示を戻すが、セッションは残ったままのため次回操作も同様に失敗する。回避手段はM8時点でUIに存在しない`crypto:relockNode`をIPC直叩きするか、アプリ再起動のみ）。reviewerラウンド1で発見・修正されたM8-R1-01（🔒プレースホルダ状態での`tree:updateStructure`恒常失敗）と発生箇所は同じ関数だが、**トリガー条件が異なる別の不具合**（M8-R1-01は「ロック中プレースホルダが存在するだけで発生」、本件は「ロック解除セッションが展開表示された後にのみ発生」）。修正方針案: `reattachLocks`が`lockedByName`（トークンキー）だけでなく、アクティブな`nodeLockSessionStore`のセッション（`realMemoName`/`lockToken`で識別できる展開済みノード）も認識し、対応するセッションの起点ノードを検出したら元のトークン名の`lock`ノードへ差し戻す（またはセッション配下の変更は`tree:updateStructure`の対象から除外し無視する）等の対応が必要。
+- 良好点（不具合なし）: (1) ロック実行（サブツリーロック→🔒表示、子非表示）: `Parent`(→`Child1`→`Grand1`, `Child2`)を`crypto:lockNode`すると起点ノードのみ難読化トークン名+`nodeLocked:true`+`children:[]`でツリーに現れ、子孫ファイルは孤児として一切露出しないことを`tab:openTree`で確認。(2) ロック解除（正しいPW）: 元のサブツリー構造（`Parent`→`Child1`→`Grand1`, `Child2`）が実名で正しく復元されることを確認。誤りPW: `DECRYPT_FAILED`（ヒント付きメッセージ）で拒否、ファイル改変なし。(3) セッション展開の巻き戻り防止: 解除後に`tab:openTree`を再実行しても🔒へ巻き戻らず展開表示が維持されることを確認（`crypto:relockNode`後は正しく🔒へ復帰することも確認）。(5) DND/作成の多層防御: `memo:move`（`destPosition:'child'`+ロック中ノードanchor）・`memo:create`（`position:'child'`+ロック中ノードanchor）とも`NAME_INVALID`で拒否を確認。(6) `LOCK_CONTAINS_ENCRYPTED`: 個別暗号化(`.txtenc`)済みの子を含むサブツリーを`crypto:lockNode`すると期待通り拒否されファイル変更なしを確認。(7) 全文検索除外: ロック前は名前/本文とも通常通りヒットする状態を確認した上で、ロック後は起点・子孫いずれの名前・本文も`search:global`（scope:'all'）でヒットしないことを確認（DESIGNv3 §1.7 Q1）。TreeRow.tsxの🔒表示（`🔒 (ロック中)`固定文言、`memoName`無視）もコード確認済み。
+- 副作用: なし。すべてscratchpad配下の一時フォルダ・`--user-data-dir`で隔離したuserDataでのローカル操作、およびlocalhost CDPのみ。実運用のAPIキー/Webhook等は使用していない。
 - 後片付け: 検証用一時フォルダ（scratchpad配下、リポジトリ外）・Electron userData（`--user-data-dir`で隔離、リポジトリ外）を削除済み。検証後`Get-Process electron`は0件を確認。
+
+## developer — M8-T1-01 対応（1回目の修正）
+
+対象: `src/main/ipc/memoHandlers.ts`の`tree:updateStructure`（`nodeLockSessionStore`からの`getNodeLockSession`インポート追加・`sessionsByRealName`逆引き構築・`reattachLocks`拡張）。
+
+- **M8-T1-01対応**: `lockedByName`（トークンキー）に加え、アクティブな`nodeLockSessionStore`のセッションを`sessionsByRealName`（実名 -> `{lockToken, locked}`）として逆引き構築。`lockedByName`（現在ディスク上のメタ、キー=各ロックノード自身のトークン名）を1件ずつ走査し、`getNodeLockSession(args.tabId, token)`が存在すればそのセッションの`realMemoName`をキーに`{lockToken: token, locked}`を登録する。`reattachLocks`にこの逆引きを追加参照させ、`n.memoName`が`lockedByName`（トークン一致）に無くても`sessionsByRealName`（実名一致）に有れば、`crypto:unlockNode`成功後のクライアント送信（実名ベース）と判断し、元のディスク上のトークン名+`lock`+`children:[]`（ロック placeholder）へ差し戻すようにした。tester指摘の修正方針案のうち「セッション配下の変更は無視する」側を採用（M8はロック解除セッション中の構造変更の永続化自体が対象外＝M9スコープのため、実名ノードを見つけたら常にディスク上の placeholder へ差し戻し、開閉・ラベル等の変更内容は反映しない）。`expanded`はクライアント送信値ではなくディスク上の`locked.expanded`（ロック時に`false`で固定、以後は編集不能のため不変）を使うよう変更（実名ノードは`buildOriginTreeNode`により常に`expanded:true`で送られてくるため、そのまま使うとplaceholderが展開扱いになってしまう。トークン一致側の既存パス`{expanded: n.expanded}`は変更なし＝元々の🔒プレースホルダはクライアントの送信値をそのまま使う既存挙動を維持）。
+- `descendantClaimedTokens`（子孫トークン除外集合）・`collectClaimedTokens`/`collectLockedNodesByName`（metaStore.ts側）は変更なし（reviewerラウンド2確認済みの通りM8-R1-01の解消状態は無変更のため影響なし）。
+- 確認: `npx tsc --noEmit -p tsconfig.json`・`npx tsc --noEmit -p tsconfig.node.json`とも成功。`npx electron-vite build`成功（`out/main/index.js` 104.14kB / `out/preload/index.js` 9.08kB / `out/renderer/assets/index-*.js` 1,014.01kB）。実行時動作検証は未実施（tester範囲）。
+- reviewer（tree:updateStructureの設計適合性・セキュリティへの影響確認として）へ確認を依頼した上で、tester（M8-T1-01に対する1回目の修正）へ再検証を依頼予定。コミット・プッシュは行っていない。
+
+## reviewer — M8-T1-01 修正確認（ラウンド1）
+
+対象: src/main/ipc/memoHandlers.ts の tree:updateStructure（sessionsByRealName 逆引き追加・reattachLocks 拡張）。nodeLockSessionStore.ts / nodeLock.ts / metaStore.ts / App.tsx / treeView.ts とトレース照合。
+
+- M8-T1-01 の解消自体は確認: `crypto:unlockNode` 成功後にクライアントが実名で送ってくるセッション起点ノードを `sessionsByRealName`（アクティブセッションのみ、`lockedByName` 経由で構築）で検出し、ディスク上のトークン名+`lock`+`children:[]` へ差し戻すロジックは正しくトレースできた。M8-R1-01/M8-R1-02（`descendantClaimedTokens`/`collectClaimedTokens`/`collectLockedNodesByName`、トークン直接一致パス）は無変更でリグレッションなし。セキュリティ（鍵/PW/復号平文の非ログ出力）も新規懸念なし。ネストしたロック（item4）はセッション一致時に children を丸ごと `[]` へ切り捨てるため `sessionsByRealName` と `lockedByName` の優先順位は実質衝突しない（`lockedByName` チェックが先で該当ケースはそもそも到達しない）ことを確認。
+- M8-T1-R1-01 [Med] NG: `sessionsByRealName` によるフォールバック一致がツリー上の**位置を考慮せず** `n.memoName` の文字列一致のみで行われる。一方 `memo:create`/`memo:rename` の重複チェック（`isMemoNameTaken`）はディスクスキャンのみを見ており、アクティブなロック解除セッションが可視化している実名（ディスク上には存在しない仮想的な名前）を重複対象として考慮しない。そのため、あるサブツリーを解除して実名（例:「Secret」）が展開表示されている間に、ユーザーが別の無関係なメモを同じ名前「Secret」で新規作成/リネームすることが妨げられずに成立してしまう。この状態で以後の `tree:updateStructure`（トグル開閉等、対象と無関係な操作を含む）を送ると、`reattachLocks` がセッションの本来のプレースホルダ位置と無関係な新規メモの両方を同じ `session.lockToken` へ書き換えてしまい、`flatNames` 内でトークン名が2重になり `NAME_DUPLICATE` で常に拒否される（データ破損はしないが、以後そのタブの `tree:updateStructure` 経由操作が拒否され続ける可用性バグ）。M8-T1-01自体は解消済みで致命的ではないが、同種の「セッション展開中の名前衝突」を扱う一貫した方針（位置ベースの照合、またはセッション実名を重複チェック対象に含める等）の検討を推奨。
+
+## developer — M8-T1-R1-01 対応（1回目の修正）
+
+対象: `src/main/ipc/memoHandlers.ts`の`isMemoNameTaken`（`extraNames`引数追加）・新設`collectActiveSessionRealNames`ヘルパー・`memo:create`/`memo:rename`ハンドラ（重複チェックへセッション実名を追加、チェック順序を`loadTabMeta`後へ変更）。
+
+- **M8-T1-R1-01対応**: reviewer提示の2案のうち「セッション実名を重複チェック対象に含める」側を採用。`isMemoNameTaken`に`extraNames?: ReadonlySet<string>`引数を追加し、ディスクスキャンでの一致に加えてこの集合とも`normalizeForCompare`で照合するようにした。新設`collectActiveSessionRealNames(tabId, metaTree)`は`collectLockedNodesByName(metaTree)`のトークン一覧を`getNodeLockSession(tabId, token)`で引き、アクティブなセッションの`realMemoName`のみを集める（`tree:updateStructure`のM8-T1-01対応で使った`sessionsByRealName`と同じ発想の逆引き）。`memo:create`/`memo:rename`の両ハンドラで、`loadTabMeta`呼び出しをチェックより前に移動した上で`isMemoNameTaken(folderPath, name, exclude, collectActiveSessionRealNames(tabId, loaded.metaTree))`を渡すことで、以後は「解除表示中の実名」と同じ名前での新規作成/リネームがNAME_DUPLICATEで直接拒否されるようになり、reviewer指摘の衝突経路自体が発生しなくなる。
+- **意図的にスコープ外とした範囲（developer判断）**: `memo:duplicate`（`pickAvailableName`によるディスク走査ベースの自動採番のみ）・`memo:move`（`destExistingNames`もディスクスキャンのみ）は今回変更していない。前者は複製元自体が既にディスク上でユニークな実名である必要があるため「複製結果がたまたまアクティブセッションの仮想実名と一致する」ケースは極めて稀（自動採番文字列が偶然一致する必要がある）、後者は「移動元に元々セッション実名と同名の実メモが存在し、かつそれを同一タブへ移動する」という更に限定的な状況でのみ発生し、いずれもreviewer指摘の再現手順（ユーザーが明示的にcreate/renameで同名を指定する経路）とは異なる。M8はロック解除セッション中の構造変更対応自体がM9スコープ（milestone doc）であり、残存する極小の経路は`tree:updateStructure`側の既存`NAME_DUPLICATE`セーフティネット（データ破損なし、UIは`refreshTree`で復旧可能）で許容範囲と判断した。M9でのセッション中構造変更対応時に併せて見直すのが妥当。
+- 確認: `npx tsc --noEmit -p tsconfig.json`・`npx tsc --noEmit -p tsconfig.node.json`とも成功。`npx electron-vite build`成功（`out/main/index.js` 104.83kB / `out/preload/index.js` 9.08kB / `out/renderer/assets/index-*.js` 1,014.01kB）。実行時動作検証は未実施（tester範囲）。
+- reviewer（M8-T1-R1-01に対する1回目の修正、元の指摘文を引用の上で同一エージェントへ継続送信）へ再確認を依頼予定。コミット・プッシュは行っていない。
+
+## reviewer — M8-T1-R1-01 修正確認（ラウンド1）
+
+対象: src/main/ipc/memoHandlers.ts の isMemoNameTaken（extraNames拡張）・collectActiveSessionRealNames（新設）・memo:create/memo:rename（loadTabMeta先行呼び出し+extraNames適用）。tree:updateStructureのsessionsByRealNameとトレース照合。
+
+- M8-T1-R1-01 OK（解消）: `collectActiveSessionRealNames`が`collectLockedNodesByName(metaTree)`のトークンをアクティブセッションで逆引きし`realMemoName`を収集、`memo:create`/`memo:rename`双方で`loadTabMeta`後にこれを`isMemoNameTaken`の`extraNames`として渡す実装を確認。報告した再現手順（アクティブセッションの実名と同名でのcreate/rename）が`NAME_DUPLICATE`で直接拒否され、`reattachLocks`が新規ノードとセッション本来の位置を同一トークンへ2重書き換えする経路（元指摘の核心）は発生しなくなることを確認。
+- 追加確認（自発的、指摘なし）: セッション「子孫」の実名（起点`realMemoName`ではなく`NodeLockBlob.children`内の名前）については`collectActiveSessionRealNames`は対象にしていないが、`tree:updateStructure`の`reattachLocks`は起点ノードが`sessionsByRealName`に一致した時点で`children:[]`を強制しクライアント送信済みの実子ノードを丸ごと破棄する実装のため、子孫実名がどこかで衝突しても`flatNames`/`scannedNames`不整合には発展しないことをコード上確認。機能的な欠陥ではなく対応不要。
+- `memo:duplicate`/`memo:move`のスコープ外判断（developer）: M8-node-lock-core.md「ロック解除セッション中の構造変更操作自体はM9スコープ」との整合性・発生条件の限定性から妥当と判断。
+- 判定: ブロッキング指摘なし。M8-T1-R1-01は解消。developer への差し戻し不要。tester へ進行可。
+
+## tester — M8-T1-01 修正確認（ラウンド2 / 再検証）
+
+対象: reviewer M8-T1-R1-01 ラウンド1 OK後の一式（`src/main/ipc/memoHandlers.ts` の `tree:updateStructure`（`sessionsByRealName` 逆引き）・`isMemoNameTaken`/`collectActiveSessionRealNames`（`memo:create`/`memo:rename`））。M8-T1-01（1回目の修正）に対する再検証。IPC直叩み（CDP `Runtime.evaluate` 経由でNode 24ネイティブ`WebSocket`による自作CDPクライアントで`window.api`を直接呼び出し）。
+
+- 判定: **全項目OK。不具合なし。developer への差し戻しなし。M8-T1-01（1回目の修正）は解消を確認。**
+- typecheck: `tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json` エラーなし。
+- build: `electron-vite build` 成功（`out/main/index.js` 104.83kB / `out/preload/index.js` 9.08kB / `out/renderer/assets/index-*.js` 1,014.01kB、developer報告のサイズと一致）。
+- **依頼1（元の再現手順の再実行）OK**: `Parent`(→`Child1`→`Grand1`, `Child2`)を`crypto:lockNode`→`crypto:unlockNode`（正しいPW、実名の展開構造を確認）→この状態で無関係な`Other`ノードの`expanded`のみをトグルした`tree:updateStructure`（`persistTreeStructure`が実際に送る`toMetaTree()`相当の構造）が`ok:true`で成功し、`tab:openTree`で`Other`の`expanded:false`が正しく永続化されていることを確認（以前は`NOT_FOUND`）。同一構造の**冪等な再送信を2回連続**しても両方`ok:true`で成功することも確認。
+- **依頼2（セッション展開中の連続無関係操作）OK**: セッション残存状態のまま、(a)`OtherB`へのラベル変更、(b)`OtherB`/`Other`のDND的並べ替え（root配列の順序入れ替え）、(c)`Other`の編集ロック(`locked`)切替、を3回連続で`tree:updateStructure`実行し全て`ok:true`。`tab:openTree`で3操作の結果（ラベル色・並び順・`locked:true`）が全て正しく永続化されていることを確認（セッションが残っている限り以後も毎回成功し続けることを確認）。
+- **依頼3（M8-T1-R1-01の実機確認）OK**: セッション展開中の実名「Parent」（起点ノードの`realMemoName`）と同名で`memo:create`/`memo:rename`（`Other`→`Parent`）を試み、いずれも`NAME_DUPLICATE`（「同名のメモが既に存在します: Parent」）で正しく拒否されることを確認。**追加確認（reviewer自発的確認事項の実機トレース）**: 一方で子孫の実名（`Child1`、`collectActiveSessionRealNames`は起点`realMemoName`のみを対象とし子孫は対象外）と同名の`memo:create`は`ok:true`で成立する（reviewerの想定通り）。この状態で`tree:updateStructure`を送っても`reattachLocks`がセッション一致時に`children:[]`を強制するため`flatNames`の重複判定には発展せず`ok:true`で成功することを実機で確認（新規メモ削除して後片付け済み）。
+- **依頼4（既存良好点の軽い再確認）OK・リグレッションなし**: (1)ロック実行（`Parent`ロック→難読化トークン+`nodeLocked:true`+`children:[]`で表示）、(2)誤りパスワードでの解除は`DECRYPT_FAILED`（実際に別パスワードで再現）、(5)DND/create多層防御（`memo:create`/`memo:move`とも`position/destPosition:'child'`+ロック中ノードanchorで`NAME_INVALID`を実機で再確認）、(6)`LOCK_CONTAINS_ENCRYPTED`（新規ノード「Container」配下に個別暗号化済み`OtherB`を`tree:updateStructure`で再配置後`crypto:lockNode`を試み、`LOCK_CONTAINS_ENCRYPTED`で拒否・ファイル変更なしを確認）、(7)全文検索除外（ロック中`Child2`本文がヒットせず、無関係な`Other`本文は通常通りヒットすることを確認）を全て再確認。新規リグレッションなし。
+- **依頼5（`crypto:relockNode`後の整合）OK**: セッションを`crypto:relockNode`で明示破棄後、`tab:openTree`で🔒プレースホルダへ正しく巻き戻ることを確認。破棄後に`tree:updateStructure`（プレースホルダの`expanded`は不変のため他ノード`OtherB`の`expanded`トグルのみ）を送ると通常通り`ok:true`で成功し永続化されることを確認（既存のトークン一致パス、M8-R1-01解消状態への回帰なし）。
+- 副作用: なし。すべてscratchpad配下の一時フォルダ・`--user-data-dir`で隔離したuserDataでのローカル操作、およびlocalhost CDP（Node 24ネイティブ`WebSocket`による自作クライアント、`ws`パッケージ未導入のため代替）のみ。実運用のAPIキー/Webhook等は使用していない。
+- 後片付け: 検証用一時フォルダ・自作CDPクライアントスクリプト・Electron userData（いずれもscratchpad配下、リポジトリ外）を削除済み。検証後`Get-Process electron`は0件を確認。
+
+
+## developer — M9a（ノードロック応用①: セッション中の構造変更・入れ子ロック）実装
+
+対象マイルストーン: docs/v3/milestones/M9a-node-lock-session-ops.md（M8完了済み前提）。
+
+- **`shared/ipc-contract.ts`**: 共通型`LockContext{lockToken:string}`を新設し、`MemoReadArgs`/`MemoSaveArgs`/`MemoCreateArgs`/`MemoRenameArgs`/`MemoDeleteArgs`/`MemoDuplicateArgs`/`TreeUpdateStructureArgs`/`CryptoLockNodeArgs`/`CryptoUnlockNodeArgs`へ任意引数`lockContext?`を追加（PLANv3 §2.2/§7.2）。`memo:move`は対象外（`srcLockContext`/`destLockContext`はM9bスコープ）。
+- **`crypto/nodeLockSessionStore.ts`**: `NodeLockSessionEntry`に`parentLockToken?: string`（入れ子ロックの親セッション参照, PLANv3 §7.4）を追加。`buildSessionTreeNodes`の「子孫用unlockNodeは未実装」という古いコメントをM9a実装後の内容へ更新。
+- **`crypto/nodeLock.ts`**: `lockNode`/`unlockNode`に`lockContext?`引数を追加し、指定時は親セッションの実行時構造(`entry.children`)上で起点ノードを探す分岐を実装（入れ子ロック、ファイル操作/ブロブ暗号化ロジック自体はM8のものを共用）。新設`persistNodeLockSession(tabId,lockToken)`: セッションのブロブを再暗号化(新IV)し、`claimedTokens`を`nameMap`+入れ子ロックの`claimedTokens`から都度再計算した上で、親を持たない（トップレベル）セッションならメタJSONへ直接アトミック保存、入れ子セッションなら親セッションの`children`内で更新後、親を再帰的に同処理へ渡す（祖先を辿り最終的に一度だけ`saveTabMeta`、DESIGNv3 §1.5「操作の都度、即座に再暗号化・アトミック保存」）。新設`readSessionMemoContent`/`writeSessionMemoContent`: セッション配下メモ本文（常に`.txtenc`）をセッション鍵で読み書きするヘルパー（`memo:read`/`memo:save`のlockContext分岐から利用）。
+- **`ipc/cryptoHandlers.ts`**: `lockNode`/`unlockNode`呼び出しへ`args.lockContext`をそのまま渡すよう変更。
+- **`ipc/memoHandlers.ts`**: `memo:read`/`memo:save`/`memo:create`/`memo:rename`/`memo:delete`/`memo:duplicate`/`tree:updateStructure`の各ハンドラ先頭に`args.lockContext`分岐を追加。分岐先の実処理は新設ヘルパー（`requireSession`/`isNameTakenInSession`/`createMemoInSession`/`renameMemoInSession`/`deleteMemosInSession`/`duplicateMemoInSession`/`updateStructureInSession`）に切り出し、対象セッションの`entry.children`/`nameMap`を実ファイル操作の都度更新→`persistNodeLockSession`で再暗号化保存する（PLANv3 §5.3）。名前重複チェックは`isNameTakenInSession`（`entry.nameMap`の全キーが対象＝タブ全体ではなくロック単位, PLANv3 §7.3。`nameMap`はセッション全深度でフラットな1つの対応表のためロック単位でも兄弟限定ではなく全深度が対象）。既存の`isMemoNameTaken`/`collectActiveSessionRealNames`（M8-T1-R1-01対応、lockContext省略時のセッション実名重複チェック）は変更していない。
+- 意図的にスコープ外とした事項: (a) `memo:delete`のセッション配下`TRASH_FAILED`時、`evt:trashFallback`ペイロードが`lockContext`を運べないため`forceDirect`再invoke導線は配線せずエラーを直接返すのみに留めた。(b) 親セッションを`crypto:relockNode`で破棄した際、入れ子の子セッションを自動カスケード破棄する処理は追加していない（`parentLockToken`がダングリングした子セッションへの以後の`persistNodeLockSession`は`LOCK_SESSION_NOT_FOUND`で安全に失敗する）。(c) レンダラ側の配線（`lockContext`を実際に組み立てて送る変更）はM9aのファイル一覧（`memoHandlers.ts`/`cryptoHandlers.ts`/`nodeLockSessionStore.ts`のみ）に含まれないため未着手。
+- 確認: `npm run typecheck`（`tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json`）エラーなし。`npx electron-vite build`成功（`out/main/index.js` 119.47kB / `out/preload/index.js` 9.08kB / `out/renderer/assets/index-*.js` 1,014.01kB）。実行時動作検証は未実施（tester範囲）。
+- reviewerへ静的レビューを依頼予定。コミット・プッシュは行っていない。
+
+## reviewer — M9a（ノードロック応用①: セッション中の構造変更・入れ子ロック）実装 静的レビュー（ラウンド1）
+
+対象: src/shared/ipc-contract.ts（LockContext新設・各Args拡張）, src/main/crypto/nodeLockSessionStore.ts（parentLockToken追加）, src/main/crypto/nodeLock.ts（lockNode/unlockNodeのlockContext分岐・persistNodeLockSession・readSessionMemoContent/writeSessionMemoContent）, src/main/ipc/memoHandlers.ts（各lockContext分岐ヘルパー）, src/main/ipc/cryptoHandlers.ts（lockNode/unlockNode呼出）。M9a-node-lock-session-ops.md「reviewer/testerへの申し送り」3点、DESIGNv3 §1.5/§1.11、PLANv3 §2.2/§5.3/§7.1-7.4と照合。
+
+- 申し送り1（クラッシュ耐性）OK: 全セッション用ヘルパー（createMemoInSession/renameMemoInSession/deleteMemosInSession/duplicateMemoInSession/updateStructureInSession、入れ子lockNode）とも構造変更の都度persistNodeLockSessionを呼びsaveTabMeta（atomicWrite内包）へ到達することを確認。バッチ化なし。
+- 申し送り2（入れ子ロックのlockContext解決チェーン）OK: findNodeが返すsiblingsが親セッションのchildren配列への生参照であることを確認した上で、lockNode入れ子確定時のnameMap削除（254-260行目付近）→persistNodeLockSessionの再帰（340行目付近、entry.parentLockTokenを辿り最終的に一度だけsaveTabMeta）→reencryptSessionBlobのclaimedTokens再計算（現在nameMapの値∪子孫lockノードのclaimedTokens再帰収集）の3点を多段ネスト（孫レベル）まで机上トレースし、親子のnameMap/claimedTokensの混同は確認できなかった。
+- 申し送り3（名前一意性スコープ）OK: isNameTakenInSessionがentry.nameMapの全キー（セッション全深度でフラット）を対象にする判断はNodeLockBlob.nameMapの型制約上妥当と判断。
+- M9a-R1-01 [Med] NG: `deleteMemosInSession`（memoHandlers.ts 219-270行目）が入れ子ロック済み子ノードへの削除操作をガードしていない。token未発見（＝ロック済みノードの実名はnameMapから既に除去済み）を「既に削除済みで成功」扱いし、removeNodeで該当プレースホルダをchildrenツリーから除去してしまうため、そのロック済みサブツリー自身の暗号化コンテナと配下claimedTokens全ファイルが以後どのメタ情報からも参照されない孤児として永久にディスク上へ残る（呼び出し元にはok:trueが返り気付けない）。同ファイル内のcreateMemoInSession/renameMemoInSessionが`collectLockedNodesByName(entry.children)`で同種のケースを明示ガードしているのと非対称。開発者へ差し戻し（1回目の指摘）。
+- セキュリティ（00-core-principles.md §10）: nodeLock.ts新設関数群に鍵・パスワード・復号平文のログ出力なし。memoHandlers.tsのconsole.error（249行目）もname/error objectのみで機密情報なし。
+- 既存M8ロジックの非重複: isMemoNameTaken/collectActiveSessionRealNames（M8-T1-R1-01対応）は無変更を確認。
+- 判定: M9a-R1-01（Med）1件のみ。developerへ差し戻し（ラウンド1）。
+
+## developer — M9a-R1-01 対応（1回目の修正）
+
+対象: src/main/ipc/memoHandlers.ts の `deleteMemosInSession`（219行目付近）。
+
+- 指摘: 対象名がセッションの `entry.nameMap` に無い（＝入れ子ロック済み子ノードのプレースホルダ、実名は既に nameMap から除去済み）場合に無条件で成功扱いし、`removeNode` がツリーから当該プレースホルダごと除去してしまい、そのロック済みサブツリーの暗号化コンテナ＋`lock.claimedTokens`配下の全ファイルが孤児として残る問題。
+- 対応: `deleteMemosInSession` の冒頭で `collectLockedNodesByName(entry.children)` により対象名を先にチェックし、ロック済みノードのトークンが `memoNames` に含まれる場合はバッチ全体を `NAME_INVALID`（「ロック中のノードは削除できません。」）で拒否するよう変更。`createMemoInSession`/`renameMemoInSession` と同じガードパターン・同じエラーコードに揃えた。ループ内の既存の「token未発見→成功扱い」分岐（外部で既に削除済み等の正当なケース）はロック済み判定を通過した名前のみに適用されるため変更していない。
+- 確認: `npm run typecheck` エラーなし。`npx electron-vite build` 成功（`out/main/index.js` 119.67kB / `out/preload/index.js` 9.08kB / `out/renderer/assets/index-*.js` 1,014.01kB）。実行時動作検証は未実施（tester範囲）。
+- reviewerへ再レビュー依頼（M9a-R1-01に対する1回目の修正である旨を明記）。コミット・プッシュは行っていない。
+
+## reviewer — M9a-R1-01 修正確認（ラウンド2）
+
+対象: src/main/ipc/memoHandlers.ts の `deleteMemosInSession`（1回目の修正）。
+
+- M9a-R1-01 OK（解消）: 実削除ループ前に `collectLockedNodesByName(entry.children)`（全深度再帰walk）で対象名を先にチェックし、1件でもロック済みノードのトークンと一致すればバッチ全体を`NAME_INVALID`で拒否。`createMemoInSession`/`renameMemoInSession`と同じガードパターン・同一エラーコードに揃い、指摘していた孤児化経路は解消。既存の「token未発見→成功扱い」ロジックはガード通過後の名前のみに適用され副作用なし。
+- 併せてM9a全体（createMemoInSession/renameMemoInSession/duplicateMemoInSession/updateStructureInSession/memo:read・saveのlockContext分岐/nodeLock.tsのlockNode・unlockNode・persistNodeLockSession/cryptoHandlers.ts）を再確認したが新規指摘なし。秘密情報のログ出力・ハードコードなし。
+- 判定: ブロッキング指摘なし。tester へ進行可。
+
+## tester — M9a（ノードロック応用①: セッション中の構造変更・入れ子ロック）動作検証（ラウンド1）
+
+対象: reviewer M9a ラウンド2 OK後の一式。renderer側のlockContext配線はM9aスコープ外（developer申告通り未着手）のため、IPC直叩き（CDP `Runtime.evaluate` 経由でNode 24ネイティブ`WebSocket`による自作CDPクライアントで`window.api`を直接呼び出し、`lockContext`を手動組み立て）で全10シナリオを検証。
+
+- **判定: 全項目OK。不具合なし。developer への差し戻しなし。**
+- typecheck: `tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json` エラーなし。
+- build: `electron-vite build` 成功（`out/main/index.js` 119.67kB / `out/preload/index.js` 9.08kB / `out/renderer/assets/index-*.js` 1,014.01kB、developer報告と一致）。
+- prod起動: `--user-data-dir`で隔離したuserDataを使い`electron . --remote-debugging-port=9333`起動。ログは`DevTools listening`のみでエラーなし（検証終了まで一貫）。
+- 準備: `Parent`(→`Child1`→`Grand1`, `Child2`), `Other`をタブ直下に作成→`crypto.lockNode`(Parent)→`crypto.unlockNode`でセッション開始しlockToken取得。
+- **依頼1（セッション配下の新規作成→保存→relock/unlock後も残存）OK**: `memo.create`(lockContext指定)→`memo.save`→`memo.read`で内容一致確認→`crypto.relockNode`→`crypto.unlockNode`(再オープン)後も`memo.read`で同一内容(`savedHash`一致)を確認。
+- **依頼2（リネーム→難読化ファイル名不変・表示名のみ変化）OK**: `memo.rename`前後でタブフォルダのファイル一覧（`.txtenc`群）を`ls`比較し完全一致（新規ファイル生成なし）。旧表示名での`memo.read`は`NOT_FOUND`、新表示名では読めることを確認。
+- **依頼3（削除→実ファイル削除・relock/unlock後もツリーから消失）OK**: `memo.delete`後に対応する`.txtenc`実ファイルがディスクから消失（`.bak`のみ残存、これは既存atomicWrite世代管理の一般挙動でM9a固有ではない）、`memo.read`は`NOT_FOUND`、relock→unlock後のツリーにも現れないことを確認。
+- **依頼4（複製）OK**: `memo.duplicate`で「Child2 のコピー」が自動採番生成され、内容が元と一致、元の直後（同階層）に挿入されることを確認。
+- **依頼5（起点ノード自身のリネーム→relock/unlock後も新名で表示）OK**: `memo.rename`(oldName=起点の実名)後、`crypto.relockNode`→`crypto.unlockNode`で新しい実名（`ParentRenamed`）がそのまま復元されることを確認。
+- **依頼6（入れ子ロック）OK**: セッション配下の`Child1`（さらに孫`Grand1`を持つ）を`crypto.lockNode`(lockContext指定)すると🔒プレースホルダ（`nodeLocked:true`, `children:[]`, 難読化トークン名）に変わり、親セッション側からは`Grand1`の内容が一切見えなくなることを`tab:openTree`で確認。誤ったパスワードでの`crypto.unlockNode`(lockContext指定)は`DECRYPT_FAILED`(ヒント付き)で拒否、正しいパスワードでは独立した新規`lockToken`が返り、その新セッション経由で`Grand1`の内容（ロック前に保存した秘密文字列）が正しく復号できることを確認。
+- **依頼7（最重要・M9a-R1-01の修正確認）OK**: 入れ子ロック済みの子ノード（表示名=難読化トークン）を親セッション側から`memo.delete`しようとすると`NAME_INVALID`（「ロック中のノードは削除できません。」）で明確に拒否され、`tab:openTree`で該当ノードが🔒プレースホルダのまま消えずに残っていることを確認。誤って「削除成功」と返り孤児化する経路は再現しなかった。
+- **依頼8（名前の一意性スコープ）OK**: タブ直下に既存の「Other」と同名、および親セッションの兄弟「Child2」と同名でも、**入れ子セッション**内での`memo.create`はいずれも成功（別スコープとして独立）。一方、**同一セッション（親）内**で既存の「Child2」と同名を`memo.create`すると`NAME_DUPLICATE`で正しく拒否されることを確認（M8-T1-R1-01のタブ全体/他セッション名との衝突チェックとは別物であることを実機で区別）。
+- **依頼9（都度アトミック保存の確認）OK**: 1回の`memo.rename`前後で`.tabtreenote.json`のMD5ハッシュが変化し`.tabtreenote.json.bak`が生成されることを確認（バッチ化されず操作の都度即座に保存されている）。
+- **依頼10（無効/失効lockTokenでの拒否）OK**: 存在しないダミーlockTokenで`memo.read`/`create`/`rename`/`delete`/`duplicate`/`tree.updateStructure`/`crypto.lockNode`/`crypto.unlockNode`の全8チャネルが`LOCK_SESSION_NOT_FOUND`で拒否されることを確認。加えて、`crypto.relockNode`でセッションを明示破棄した直後の同一lockTokenでの`memo.read`も同様に`LOCK_SESSION_NOT_FOUND`になることを確認（失効セッションの再利用を防止）。
+- console/例外チェック: 検証全体を通してElectronメインプロセスの標準出力ログに`DevTools listening`行以外のエラー出力なし。
+- 後片付け: 検証用一時フォルダ・Electron userData（scratchpad配下、リポジトリ外、`--user-data-dir`で隔離）を削除済み。検証後`Get-Process electron`は0件を確認。
 - 外部サービスへの副作用: なし（すべてローカルファイル操作・localhost CDPのみ。実運用のAPIキー/Webhook等は使用していない）。
+- 申し送り（対応不要）: developer報告の通りrenderer側の`lockContext`実配線はM9aスコープ外のため、UIクリック操作からは今回検証した機能に到達できない（本ラウンドはIPC直叩きのみで検証）。UI配線は別マイルストーンで別途動作検証が必要。
+
+## developer — M9a レンダラ側配線（`lockContext`自動付与）実装
+
+対象: tester M9a検証で判明した「レンダラにlockContext自動付与配線が無い」ギャップの追加実装。PLANv3 §1.3「レンダラの追加責務」、M9a-node-lock-session-ops.md、AGENT_LOG該当セクション（`sessionsByRealName`によるlock再付与ロジック含む）を確認した上で対応。
+
+- **`src/renderer/components/Tree/treeView.ts`**: `resolveLockContext`（`memoName`がロック解除セッション配下＝`TreeNode.lockToken`保持かを判定し`lockContext`を返す）、`findSessionRootNode`（指定`lockToken`の起点ノードを探す）、`collapseSessionToPlaceholder`（`LOCK_SESSION_NOT_FOUND`受領時、対象セッションの起点ノードだけをローカルで🔒プレースホルダへ戻す。他の開いている別セッションを巻き添えにしない）、`removeTreeNodesByNames`/`insertTreeNodeAt`（`TreeNode[]`版の非破壊remove/insert。`@shared/treeOps`はMetaTreeNode専用で`encrypted`/`lockToken`を保持できないため別実装）を新設。
+- **`src/renderer/editor/eolKeeper.ts`**: `OpenMemoState`/`createOpenMemoState`に`lockToken?: string`を追加（開いているメモがセッション配下かを保持し、M6個別暗号化の`sessionKeyStore`経路と区別するため）。
+- **`src/renderer/App.tsx`**: 以下の呼び出しへ`lockContext`/`lockToken`分岐を追加。
+  - `openMemoByName`（`memo:read`）: 対象がセッション配下ならパスワードダイアログを経由せず`lockContext`付きで直接開く。作成直後等`tree` stateがまだ反映されていない場合用に`explicitLockToken`引数を追加。
+  - 自動保存（`performPlainAutosave`/`performEncryptedAutosave`の分岐条件）・手動保存（`handleSave`）・競合解決（`handleConflictKeepMine`/外部変更の静かな反映effect/`handleConflictAdoptExternal`）・メモ切替時保存（`requestCloseCurrentMemo`）: セッション配下は全て`memo:save`/`memo:read`（`lockContext`付き）を使い、M6個別暗号化専用の`crypto:saveEncrypted`/`crypto:lock`（`sessionKeyStore`対象）へは分岐しないよう修正（既存コードはM8時点で`om.encrypted`のみで分岐しており、セッション配下（`encrypted`は常にtrue, PLANv3 §5.2）を誤って個別暗号化経路に流し込む地雷だった）。
+  - `handleRequestCreate`/`handleRequestRename`/`handleRequestDelete`（`memo:create`/`rename`/`delete`）: 対象/アンカーがセッション配下なら`lockContext`を付与し、成功時は`refreshTree`（`tab:openTree`はセッションを認識せず🔒プレースホルダに巻き戻ってしまう）を挟まずローカルで直接反映。`LOCK_SESSION_NOT_FOUND`時のみ`collapseSessionToPlaceholder`でその場を🔒表示へ戻す。
+  - `persistTreeStructure`（`handleToggleExpand`/`handleRequestSetLabel`/`handleRequestToggleLock`が経由）・`handleLocalMove`（同一タブ内DND）: 対象ノード（DNDはドラッグ対象+アンカー全て）が単一のセッション配下にある場合のみ、そのセッションの起点の`children`を`lockContext`付きで送る専用経路に分岐。一部だけセッション配下、または複数セッションにまたがる場合（境界跨ぎ）はM9aの想定外のため、安全側で従来のタブ直下呼び出しにフォールバックし、メイン側の実ファイル/nameMap厳密一致検証（既存の二重防御）に委ねる。
+- **`src/renderer/components/Tree/Tree.tsx`**: `buildContextMenuItems`で`row.lockToken`（既存フィールドだが従来未使用）に基づき、セッション配下ノードでは「暗号化を解除」「パスワードを設定して暗号化」「パスワードを変更」「サブツリーをロック」「プロパティ」を非表示化。理由: これらは`crypto:encryptMemo`/`decryptMemoToPlain`/`changePassword`/`memo:getProperties`（lockContextを運べない）と`crypto:lockNode`/`unlockNode`の入れ子ロック（今回のタスク範囲外、`lockContext`未配線）を呼ぶため、表示したままだと誤操作でわかりにくい`NOT_FOUND`等に繋がる。名前変更/編集ロック/削除/アイコン(ラベル)は上記で配線済みのため維持。
+- **意図的にスコープ外とした事項（reviewer/オーケストレーターへの申し送り）**:
+  1. `crypto:lockNode`/`crypto:unlockNode`自体の`lockContext`（入れ子ロックの起点操作）は今回の依頼文の対象7チャネルに含まれないため未着手。上記の通りメニュー非表示化で誤操作導線は塞いだ。
+  2. `memo:duplicate`はレンダラに呼び出し箇所が存在しない（同一タブ内複製は`memo:move`の`copy:true`で実現しておりM9bスコープ）ため、対応不要と判断（コード変更なし）。
+  3. `crypto:relockAllInTab`（タブ切替時のセッション一括破棄, PLANv3 §5.5）は別マイルストーン`M9c-node-lock-tab-switch.md`が明示的に担当するため未着手・現状レンダラから未呼び出しのまま（`selectTab`はセッションを破棄しない）。
+  4. `evt:externalChange`購読effect内の`if (payload.tabId === selectedTabIdRef.current) void refreshTree(...)`（対象タブへの外部変更通知のたびに無条件で`tab:openTree`を再取得）は、セッション自身の操作からは到達しない（自操作は`selfWriteRegistry`で除外される）が、真に外部（他プロセス/Explorer等）からタブ内の別ファイルが変更された場合、開いているセッションが表示上🔒に巻き戻る可能性が残る。頻度が低い既存来歴の経路（M8時点からある効果）であり、対応するには`refreshTree`自体を汎用的にマージ処理化する必要がありスコープが広がるため、今回は対応せず申し送りに留める。
+  5. `MemoGetPropertiesArgs`はそもそも型に`lockContext`が無く、M9a/PLANv3のどのIPC一覧にも含まれない。プロパティ機能をセッション配下で使えるようにするには新規の型拡張（設計判断）が要るため実装していない（メニュー非表示化のみ）。
+- 確認: `npm run typecheck`（`tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json`）エラーなし。`npx electron-vite build`成功（`out/main/index.js` 124.83kB / `out/preload/index.js` 9.08kB / `out/renderer/assets/index-*.js` 1,022.46kB）。実行時動作検証は未実施（tester範囲）。
+- reviewerへ静的レビューを依頼予定。コミット・プッシュは行っていない。
+
+## reviewer — M9a レンダラ側配線（`lockContext`自動付与）実装 静的レビュー（ラウンド1）
+
+対象: src/renderer/components/Tree/treeView.ts（resolveLockContext/findSessionRootNode/collapseSessionToPlaceholder/removeTreeNodesByNames/insertTreeNodeAt新設）, src/renderer/editor/eolKeeper.ts（lockToken追加）, src/renderer/App.tsx（各所lockContext/lockToken分岐）, src/renderer/components/Tree/Tree.tsx（buildContextMenuItemsのrowInSession分岐）。PLANv3 §1.3/§2.2/§5.3/§5.4、M9a-node-lock-session-ops.mdと照合。developer確認依頼5点すべてに回答。
+
+- M9a-R2-01 [Med] NG: `resolveLockContext`/`findTreeNode`/`findSessionRootNode`が`memoName`の文字列一致のみでノードを解決するため、タブ直下と開いているロック解除セッション、または複数セッション間で同名ノードが同時に存在するケース（PLANv3 §7.3で意図的に許容され、tester M9aラウンド1「依頼8」で実際に成功が確認済み＝再現性のある状態）で、意図した対象と異なるノードが操作されうる。具体的懸念: (1) `Tree.tsx`の`<TreeRow key={row.memoName}>`（395行目）は同名ノードが同時に可視化されるとReactのkey重複となり描画取り違えの温床になる、(2) `handleRequestRename`/`handleRequestSetLabel`/`handleToggleExpand`/`handleRequestToggleLock`/`handleLocalMove`/`handleRequestCreate`はいずれも同じfirst-match方式でロックコンテキスト解決とローカルツリー更新を行うため、ユーザーが選択した行と異なる同名ノード（別セッション/タブ直下）へ処理が適用されうる（例: 意図しないセッションのリネーム/構造変更）。生成直後の既定名は`collectTreeNames(toMetaTree(tree))`でツリー全体の可視名と重複しないよう採番されており当面のリスクは低減されているが、明示的なリネームで同名を作ることは妨げられていない。対応案: `lockToken`はセッションごとに一意なため、`(lockToken ?? タブ直下センチネル, memoName)`の複合キーで対象を解決するようtreeView.tsの各ヘルパー・Tree.tsxの行識別（`key`含む）を見直すことを推奨。developerへ1回目の指摘として差し戻す。
+- M9a-R2-02 [Med] NG: `handleRequestDelete`（App.tsx）は複数選択削除の対象が一部だけロック解除セッション配下であるケースの均質性を検証せず、`lockContext`を`memoNames[0]`のみから決定している。コメントは「異なるスコープが混在する場合はメイン側のnameMap突合により安全に拒否される」とするが、実際は`deleteMemosInSession`（memoHandlers.ts）・非セッション版`memo:delete`とも対象名が自スコープの実体に見つからない場合「拒否」ではなく「既に削除済みとして成功扱い（no-op）」する実装であり、コメントの前提と食い違う。セッション配下ノードとタブ直下ノードを跨いだ複数選択削除（Ctrl+クリックで可能）を行うと、スコープ外の名前は実際には削除されないまま`ok`が返り、ローカルの`removeTreeNodesByNames`が見た目上ツリーから消してしまう（実ファイルは無傷だが次回ツリー再取得までUI上「消えた」ように誤表示）。`handleLocalMove`は`tokens.size === 1`で均質性を事前検証しているのに対し非対称。developerへ1回目の指摘として差し戻す。
+- M9a-R2-03 [Low] 情報提供（対応不要でも可）: `buildContextMenuItems`の`rowNodeLocked`分岐は「ロックを解除」を常に表示するが、この判定は当該プレースホルダが（開いている別セッションの子としての）入れ子ロックかどうかを区別しない。`buildSessionTreeNodes`の実装上、入れ子ロック済み子ノードには`lockToken`が付与されないため`rowInSession`では検出できず、この状態でクリックすると`ipc.unlockNode`がlockContext無しで呼ばれ失敗する（AGENT_LOG申告の「メニュー非表示化で誤操作導線は塞いだ」がこのケースを網羅していない）。ただし現行UIには入れ子ロックを新規作成する導線自体が無い（rowInSessionチェックで「サブツリーをロック」が隠されている）ため、通常操作のみでは到達できず、IPC直叩き等で既に作られた入れ子ロックを後から開いた場合のみ顕在化する限定的事象。失敗してもエラーメッセージ表示のみでデータ破損は無い。
+- 確認良好点: `collapseSessionToPlaceholder`が生成するプレースホルダ形状（`memoName:lockToken, nodeLocked:true, children:[]`）はバックエンドの`buildSessionTreeNodes`/M8ロック実行フローの正規表現と一致（起点の難読化名=lockTokenをそのまま使う設計, PLANv3 §1.4）。`handleLocalMove`の境界跨ぎフォールバック（`tokens.size===1`チェック）は妥当。M6個別暗号化（`om.encrypted`のみ）とM9aセッション（`om.lockToken`）の分岐は自動保存・競合解決・保存・ロックボタン・ステータス表示のいずれも一貫しており見落としなし。秘密情報（パスワード・復号平文・トークン）のログ出力は無い。
+- 判定: M9a-R2-01・M9a-R2-02（いずれもMed）の解消が必要。developerへ差し戻し（1回目の指摘）。M9a-R2-03は任意対応。
+
+## developer — M9a-R2-01/M9a-R2-02 対応（1回目の修正）
+
+対象: src/renderer/components/Tree/treeView.ts（scope-qualified 版ヘルパー新設）, src/renderer/components/Tree/Tree.tsx（行データからの lockToken hint 配線・key 一意化）, src/renderer/App.tsx（各ハンドラの hint 利用・削除の均質性検証）。
+
+- **方針**: `(lockToken, memoName)` の複合キー化にあたり、「呼び出し元が hint を渡す」方式を採用（ユーザーが実際にクリック/右クリック/ドラッグした行は Tree.tsx 側で既に判明しており、`row.lockToken` をそのまま hint として下流へ渡せば `memoName` 文字列一致のみに頼る再解決が不要になるため）。
+- **treeView.ts**: `findTreeNodeInScope`/`updateTreeNodeInScope`/`removeTreeNodesByNamesInScope`/`insertTreeNodeAtInScope` を新設（既存の `findTreeNode`/`updateTreeNode`/`removeTreeNodesByNames`/`insertTreeNodeAt` はそれぞれ scope 非対応の残存用途向けにコメントを追記した上で維持）。`collapseSessionToPlaceholder` 内部の自己参照（起点ノードの再検索）も `updateTreeNodeInScope`（`root.lockToken` を scope に）へ変更。`resolveLockContext` は全呼び出し元を hint 方式に置き換えたため削除。
+- **Tree.tsx**: `ContextMenuState` に `lockToken?: string` を追加し、右クリック時点（`handleContextMenu`）で行自身の `lockToken` を保持（以後 `buildContextMenuItems` は `flatRows.find` による再検索ではなく `findTreeNodeInScope(tree, memoName, lockToken)` で対象を解決）。`onOpenMemo`/`onToggleExpand`/`onRequestRename`/`onRequestDelete`/`onRequestSetLabel`/`onRequestToggleLock`/`onRequestCreate`（anchor）/`onLocalMove`（anchor）の各コールバックへ、行データ（クリック行・ドロップ先アンカー行）から得た `lockToken`/`anchorLockToken` を追加引数として配線。`<TreeRow key={row.memoName}>` は `` key={`${row.lockToken ?? ''}:${row.memoName}`} `` に変更（React key 重複を解消）。
+- **App.tsx**: `openMemoByName`/`persistTreeStructure`（→`handleToggleExpand`/`handleRequestSetLabel`/`handleRequestToggleLock`）/`handleRequestCreate`/`handleRequestRename`/`handleLocalMove` は、`resolveLockContext`/`findTreeNode` によるツリー再検索をやめ、引数で受け取った hint から直接 `LockContext` を組み立てる（hint が `undefined` ならタブ直下）。ローカル state 更新も scope-qualified 版（`updateTreeNodeInScope`/`insertTreeNodeAtInScope`/`removeTreeNodesByNamesInScope`）に切替。`handleRequestRename`/`handleRequestDelete` の「現在開いているメモかどうか」判定に `openMemo.lockToken === lockToken` の一致確認を追加（別スコープの同名メモを誤って書き換え/クローズしないように）。
+- **M9a-R2-02**: `handleRequestDelete` に `memoNames.every((n) => !!findTreeNodeInScope(tree, n, lockToken))` による均質性検証を追加。1件でも hint のスコープに実在しなければ「スコープ混在」とみなし、操作を中断してエラーメッセージを表示する（reviewer指摘の2案のうち「明示的なエラーで中断」を採用。理由: メイン側 `deleteMemosInSession`/`memo:delete` は対象外の名前を no-op 成功扱いするため、フォールバック呼び出しでも一部だけ実削除されない静かな不整合の再現余地が残るため、フォールバックではなく中断を選んだ）。あわせて実装と食い違っていたコメント（「メイン側の nameMap 突合により安全に拒否される」）も削除・訂正。
+- **対応済み範囲（reviewer優先指定の5点）**: rename（`handleRequestRename`）/ delete（`handleRequestDelete`、均質性検証込み）/ create-anchor（`handleRequestCreate`）/ localMove（`handleLocalMove`、アンカー hintを正としドラッグ対象は scope-qualified lookup、不一致はスキップ＝安全側）/ persistTreeStructure の対象解決（`handleToggleExpand`/`handleRequestSetLabel`/`handleRequestToggleLock`）/ Tree.tsx の `key`。加えて範囲外だったが同じ hint 経路で低コストに直せた `openMemoByName`（クリック/矢印キー由来）と、開いているメモの編集ロック表示判定（`findTreeNodeInScope(tree, openMemo.memoName, openMemo.lockToken)`）も修正。
+- **対応不能として残した範囲（申し送り）**:
+  1. F2 リネーム・矢印キー連続移動（`Tree.tsx` `handleTreeKeyDown`）: 選択は `Set<string>`（memoName のみ）で行そのものへの参照を持たないため、`flatRows.find((r) => r.memoName === memoName)` という文字列一致の再検索に依然として頼る。同名ノードが複数スコープに同時に「表示中（展開済み）」かつ「選択中の名前と一致」という狭い条件が重ならない限り顕在化しない。
+  2. Ctrl+クリックによる複数選択・DND のドラッグ対象群: `store/selection.ts`（`SelectionState.selected: Set<string>`）自体が memoName のみを保持する設計のため、複数選択に同名ノードが異なるスコープから混在するケースを選択状態レベルでは区別できない（Set が同名を1エントリに畳んでしまう）。`handleLocalMove` はアンカーの hint を正としてドラッグ対象を scope-qualified に解決するため誤った対象を動かすことは無い（見つからなければスキップ）が、「意図した特定の同名ノードを複数選択の一員として掴む」こと自体はできない。完全な解決には選択状態を `(lockToken, memoName)` の複合キー化する必要があり、`rangeSelect`/`toggleSelection`/`selectSingle` や描画側の `selection.selected.has(row.memoName)` 判定を含む本格的な改修になるため、本ラウンドでは見送った。
+  3. `handleLocalMove` のタブ直下（非セッション）フォールバック経路: `@shared/treeOps`（`MetaTreeNode[]`、`lockToken` 非対応）を使うため、ドラッグ対象/アンカーがタブ直下でも、開いている別セッション内の同名ノードとの取り違えリスクはこのフォールバック内では未解消（`@shared/treeOps` 自体の拡張が必要でスコープ超過と判断）。
+  4. `treeNodeContains`（`handleRequestLockNode` が使用、`crypto:lockNode` 自体は本ラウンドの対象外の据え置き7チャネルに含まれない既存のスコープ外事項）は `findTreeNode`（scope非対応）のまま。ロック対象は常にタブ直下ノードのみ（`rowInSession` の場合はメニュー非表示）だが、タブ直下の対象名と偶然同名の開いているセッション内ノードが存在すると、開いているメモがロック対象配下に含まれるかの判定を誤りうる。
+  5. `openMemoDirect`/`handleJumpToHit`（`memo:` リンク遷移・全文検索ジャンプ）は元々 `lockContext` を一切渡しておらずセッション配下メモを開けない（M9a開発時点からの既存の別スコープ）。今回のR2-01/R2-02対応とは独立の既存ギャップのため触っていない。
+- 確認: `npm run typecheck` エラーなし。`npx electron-vite build` 成功（`out/main/index.js` 119.67kB / `out/preload/index.js` 9.08kB / `out/renderer/assets/index-*.js` 1,024.02kB）。実行時動作検証は未実施（tester範囲）。
+- reviewerへ「M9a-R2-01/R2-02に対する1回目の修正」として再レビュー依頼。コミット・プッシュは行っていない。
+
+## reviewer — M9a-R2-01/M9a-R2-02 修正確認（ラウンド2）
+
+対象: src/renderer/components/Tree/treeView.ts（`findTreeNodeInScope`/`updateTreeNodeInScope`/`removeTreeNodesByNamesInScope`/`insertTreeNodeAtInScope`/`findSessionRootNode`/`collapseSessionToPlaceholder`）、src/renderer/components/Tree/Tree.tsx（`ContextMenuState.lockToken`・各コールバックのhint配線・`key`一意化）、src/renderer/App.tsx（`openMemoByName`/`persistTreeStructure`/`handleRequestCreate`/`handleRequestRename`/`handleRequestDelete`/`handleLocalMove`のhint利用・削除均質性検証）。
+
+- M9a-R2-01 OK（解消）: クリック/右クリック/ドラッグ経由の全対象解決が、行データ由来の`lockToken` hintを使った`findTreeNodeInScope`等の複合キー解決に置き換わっていることをコード上確認。`Tree.tsx`の`key={`${row.lockToken ?? ''}:${row.memoName}`}`でReact key重複も解消。`openMemo.lockToken === lockToken`の一致確認（rename/delete）も別スコープの同名メモを誤って現在開いているメモとして扱わない対策として妥当。
+- M9a-R2-02 OK（解消）: `handleRequestDelete`の`memoNames.every((n) => !!findTreeNodeInScope(tree, n, lockToken))`によりバッチ全体の均質性を事前検証し、1件でもhintのスコープに実在しなければ操作を中断しユーザーへ明示メッセージを出す実装を確認。コメントの実装不一致（メイン側が実際はno-op成功扱いする点）も修正済み。
+- 残存ギャップ5点の重大度判定（developer申告どおり対応不要と判断、いずれもブロッキングではない）:
+  - (1) F2/矢印キー: `flatRows.find`（名前一致）に依存するため、同名ノードが複数スコープに同時可視化された状態でF2を押すと選択中と異なるノードがリネームされうる（誤操作は復元可能、データ喪失なし）。トリガーには「同名ノードを意図的に作る」という利用者側の能動的行為が要る狭いシナリオ。Low〜Med寄りだが個人プロジェクト規模では受容可能な残存リスク。
+  - (2) 複数選択/DNDの選択状態（`Set<string>`）: `handleLocalMove`はアンカーhintを正としスコープ内で見つからないドラッグ対象はスキップする設計のため、誤った対象を動かすことはない（意図した同名ノードを選択できないだけ）。Low、受容可能。
+  - (3) `handleLocalMove`のタブ直下フォールバック（`@shared/treeOps`, lockToken非対応）: 名前衝突時に誤ったノードを動かす可能性はあるが、メイン側`tree:updateStructure`（lockContext省略時）の`reattachLocks`/`sessionsByRealName`（M8-T1-01対応）が名前一致でセッション実体を検出し強制的にプレースホルダへ差し戻すため、最悪でもロックプレースホルダの木構造上の位置がずれる程度に留まり、暗号化コンテンツの露出やファイル破損には至らない。Low〜Med、受容可能（ドラッグで元に戻せる）。
+  - (4) `treeNodeContains`（`handleRequestLockNode`のUI安全網、`findTreeNode`のまま）: developer申告の懸念は妥当（タブ直下ロック対象と偶然同名のセッション内ノードが存在すると`findTreeNode`が誤ったノードを拾い、開いているメモがロック対象配下か否かの判定を誤りうる）。ただし本checkはUI利便性の安全網であり、暗号化自体のセキュリティ境界（パスワード無しで復号不可）には影響しない。最悪ケースはロック後に開いたままのエディタの保存がNOT_FOUNDで失敗する程度。Low、受容可能。
+  - (5) `openMemoDirect`/`handleJumpToHit`: 既存の別スコープ（今回未着手は妥当）。Info。
+  - 追加確認（reviewer自発、指摘ではない）: `Tree.tsx`の`isOpenMemo={openMemoName === row.memoName}`（433行目）も同様に名前一致のみで、同名ノード共存時に見た目の強調表示（CSSクラスのみ、機能影響なし）を誤る可能性があるが、(2)と同種の既知の残存範囲でありコード修正は不要。
+- 判定: **M9a-R2-01・M9a-R2-02とも解消。ブロッキング指摘なし。developerへの差し戻し不要。tester へ進行可。**
+
+## tester — M9a レンダラ側配線（`lockContext`自動付与）動作検証（ラウンド1・実UI操作）
+
+対象: reviewer M9a-R2-01/R2-02 ラウンド2 OK後の一式。前回（IPC直叩き）とは異なり、本ラウンドは実際のUI操作（CDP `Input.dispatchMouseEvent`による本物のクリック/右クリック、`DragEvent`+`DataTransfer`構築によるD&D）でロック解除セッション配下の操作を検証。
+
+- **判定: 新規コード欠陥としてのブロッキング指摘なし。developer への差し戻しは行わない。** ただし (A) 動作検証の前提となる環境分離方法に関する重大な運用上の発見、(B) 既知残存ギャップの実害再評価、(C) 依頼シナリオのうち2点がUI未実装のため検証不能、の3点を必ず申し送る。
+
+### (A) 【最重要・要認識】`--user-data-dir` 起動フラグがこのアプリには効かない（過去ラウンドの「隔離」は実質未隔離だった）
+- `src/main/index.ts` が起動直後に `app.setPath('userData', portableUserDataDir())` を呼び、`portableUserDataDir()`（`src/main/fs/appDataRoot.ts`）は非パッケージ時 `app.getAppPath()`（＝`electron .` 実行時はプロジェクトルート）直下の `config` フォルダを返す。これは Electron 標準の `--user-data-dir` CLI スイッチを完全に無視する設計（ユーザー要望によるポータブル化、コード自体は意図通り動作しており不具合ではない）。
+- 本セッションの検証開始当初、過去の tester ラウンド（M0/M1/M2/M9a IPC直叩きラウンド等）に倣い `--user-data-dir=<scratchpad>` を指定して起動したが、実際には **リポジトリ直下の `config/app-settings.json`（実際に開発者が `electron .`/`npm run dev` で使っている本物の設定ファイル）** に対して動作していたことが判明。同ファイルには実在のタブ「メモ」（`G:\.MainPC Backup\...\CatMemoNote\メモ`）や実際のテーマ/フォントサイズ/最終オープンメモ等、本物の個人データが含まれていた。加えて `.bak` 世代比較により、過去のいずれかのセッション（おそらく前回のM9a IPC直叩きラウンド）が追加した `m9a-tab1`（scratchpadの一時フォルダを指す）というテスト用タブ登録がクリーンアップされずに残存していたことも判明した（＝過去ラウンドの「後片付け: `--user-data-dir`で隔離...を削除済み」という報告は、隔離自体が効いていなかったため実質的に誤りだった可能性が高い）。
+- **本セッションでの対応**: (1) 該当のElectronプロセスを直ちに終了。(2) `config/app-settings.json` から本セッションが追加した `tab1` と、既存の残留物だった `m9a-tab1` の2エントリのみを削除し、実在タブ「メモ」および他の設定値（`theme`/`uiFontScale`/`window`/`lastOpened`/`editorDefaults`/`shortcuts`等）は一切変更せず復元（`.bak`世代との比較で「メモ」以外に本来存在しないはずのエントリが無いことを確認済み）。(3) 以降の検証は `out/`（ビルド成果物）とビルド用最小`package.json`のみをリポジトリ直下の一時ディレクトリ（`.tmp-tester-app/`, 検証後削除済み）へコピーし、そこへ`electron <ディレクトリ>`という位置引数形式で起動することで、`app.getAppPath()`自体を隔離先へ向けさせる方式に切り替えた（node_modules解決は親ディレクトリ探索でリポジトリの`node_modules`を発見できるため`iconv-lite`等の依存も解決できる）。この方式で`config`/`data`ともに完全に独立したディレクトリに作られることを確認した上で本ラウンドの全操作を実施。
+- 実データへの実害: メモ本体ファイル（G:\ドライブの実ファイル）への読み書き・削除は一度も行っていない（過去含め、testerは常に自分で新規登録した別tabIdを対象に操作しており、実タブ「メモ」を選択/操作した形跡はない）。実害があるとすれば`app-settings.json`内の雑多な値（テーマ等）が過去のテストで書き換わったまま残っている可能性のみだが、原本を特定できないため本ラウンドでは手を付けていない。
+- **今後への申し送り（reviewer/developer/designer/オーケストレーターへ）**: 今後このアプリを`electron`で直接検証する際は`--user-data-dir`では隔離できないため、上記(3)の「ビルド成果物を隔離ディレクトリへコピーして位置引数で起動」方式（または`electron-builder`でのパッケージビルド後に`--user-data-dir`相当の独自隔離オプションを別途用意する）を使うこと。CLAUDE.md/HANDOFF.md等への注記を検討する価値がある。
+
+### (B) 既知残存ギャップ（M9a-R2-02レビュー記載の(1)）の実害再評価: F2/矢印キー連続移動
+- 実UI操作で確認: 同名ノードがタブ直下とセッション内に同時存在する状態（例: 両方とも「Dup」）で、マウスクリックを介さず矢印キーのみでツリー内を移動すると、`handleTreeKeyDown`の`currentIndex = flatRows.findIndex((r) => r.memoName === currentName)`（`currentName`は選択中の**名前のみ**）が、実際にカーソルがいる行の位置に関わらず常に**その名前の最初の出現位置**を「現在位置」とみなしてしまう。これにより、2つ目以降の同名ノードに到達した直後の次回矢印キー操作で「現在位置」が最初の同名ノードの位置へ巻き戻り、**その名前の2番目以降の出現より後ろの行へ矢印キーで到達できなくなる**（今回の再現: `Parent→Child2→Child1→Grand1→Dup(セッション内)`まで進んだ後、`Other`→`Dup(タブ直下)`と一度は進めるように見えるが、次の矢印キー操作で「現在位置」が最初の`Dup`に巻き戻り、それ以降`Other`/`Dup(タブ直下)`と`Dup(セッション内)`の間を無限に往復し続け、`Dup(タブ直下)`より後ろの行へは到達不能）。
+- reviewer記載の想定（「同名ノードが複数スコープに同時に表示中かつ選択中の名前と一致という狭い条件が重ならない限り顕在化しない」）よりも実際は再現条件が広い: **セッションの有無に関係なく、表示中のツリー内のどこかに同名ノードが1組でも存在すれば（M9aのセッション機能を一切使わなくても）矢印キー移動がその名前の位置に到達した時点で発生しうる**、より一般的なツリーUIのナビゲーション不具合の性質を持つ。ただし実害は「キーボードのみでの移動が特定の行より先に進めなくなる／F2が意図と異なる（＝手前の）同名ノードを対象にリネームしてしまう」に留まり、マウス操作（クリック/右クリック/DND、今回検証した全シナリオ）はhint方式で対象解決しており本問題の影響を受けない。データ消失や誤削除には至らない（リネームは取り消し可能、F2は対象を間違えても実害は誤ったノード名を変更するだけ）。
+- 対応要否の判断はオーケストレーター/designerに委ねるが、**severityは reviewer の「Low〜Med寄り」よりやや高め（トリガー条件が広いため）に評価し直すことを推奨**。ただし本プロジェクトのレビュー往復節約方針、および同名ノード自体がユーザーの意図的な操作でしか作られない前提を踏まえ、今回は新規の修正ラウンドを要求せず情報提供に留める。
+
+### (C) 依頼シナリオのうち2点はUI未実装のため実UI検証が不可能（新規発見ではなく、developer/reviewer既申告の既存スコープ外事項の確認）
+- **シナリオ5（入れ子ロック）**: `Tree.tsx`の`buildContextMenuItems`は`rowInSession`（対象行が`lockToken`を持つ＝セッション配下）の場合「サブツリーをロック」項目自体を出さない（開発者の意図的スコープ外事項①「`crypto:lockNode`/`unlockNode`自体の`lockContext`は今回の対象7チャネルに含まれないため未着手」に対応するUI側の措置）。実際にセッション配下の`Child1`を右クリックして確認したところ、コンテキストメニューは`["メモを作成","名前変更","編集ロック","削除","アイコン▸"]`のみで「サブツリーをロック」は存在しなかった。**つまり入れ子ロックは現在のUIから開始する手段が一切無い**（IPC直叩きでは前回ラウンドで動作確認済み、依頼6 OK）。新規バグではなく、AGENT_LOG記載済みの意図的スコープ外事項の実地確認。
+- **「複製」**: `App.tsx`/`Tree.tsx`のどこにも`ipc.duplicateMemo`（`memo:duplicate`）を呼び出す箇所が無い（コード検索で確認、developer申告のスコープ外事項②と一致）。これはM9a固有ではなく**アプリ全体で複製のUI導線自体が存在しない**（同一タブ内複製はCtrl+ドラッグの`memo:move copy:true`で名前を自動改名しての複製だが、これはM9bスコープ＝境界跨ぎ前提のロジックであり、セッション配下では`lockContext`を渡さないため正しく動作する保証がない）。オーケストレーターの検証依頼にあった「配下に...複製が...通常のUI操作で問題なく行える」は、UI側にそもそも導線が無いため検証不能。
+
+### 実UI操作で確認できた項目（すべてOK）
+- **依頼1（作成/リネーム/編集保存/削除、セッション配下）**: 右クリック「サブツリーをロック」→パスワード設定→🔒プレースホルダ化、右クリック「ロックを解除」→誤パスワードで`パスワードが違います。`拒否→正パスワードで展開、をすべて実際のクリック+パスワード入力（ネイティブinputイベント）で確認。展開後、右クリック「メモを作成」で新規メモ作成→クリックで開く→CodeMirrorへ実テキスト入力（`Input.insertText`）→Ctrl+S実キーで保存（「保存しました」表示、ステータスバーに`🔒 ロック解除セッション`表示を確認）→右クリック「名前変更」→右クリック「削除」+確認ダイアログ、の一連が通常操作で問題なく行えることを確認。各操作後も`refreshTree`を挟まないローカル反映のためセッションが🔒へ巻き戻らないことを確認。
+- **依頼2（同名ノードの誤操作防止、最重要）**: タブ直下とセッション内（Parent直下、Child1/Child2と同階層）に同名「Dup」を意図的に作成し両方を同時表示させた状態で、(a) セッション側「Dup」のみを名前変更→タブ直下側は無変化、(b) タブ直下側「Dup」のみを名前変更→セッション側は無変化、(c) セッション側「Dup」にのみラベル色（赤）を設定→`tab:openTree`の生データ突合でタブ直下側「Dup」に`label`が付与されていないことを確認、(d) セッション側/タブ直下側それぞれをクリックして開き、ステータスバーの`🔒 ロック解除セッション`表示の有無で意図した方が開かれたことを確認。**いずれもマウス操作（右クリックメニュー含む）を通した対象解決は正しく機能**（既知の視覚のみの副作用として、選択中/オープン中のCSSハイライトは名前一致のみで両方の同名行に付くが、実データ操作への影響はない。reviewer既指摘・対応不要事項と一致）。
+- **依頼3（スコープ混在の複数選択削除は中断、M9a-R2-02）**: セッション内`Child2`をクリックで選択後、タブ直下`Other`をCtrl+クリックで追加選択→右クリック削除→確認ダイアログすら出さず即座に`ロック解除中セッション内とタブ直下など、異なる場所にまたがる削除は一度に行えません。同じ場所のメモだけを選択し直してください。`という明示エラーで中断され、ツリーに変化が無い（部分的サイレント削除が起きない）ことを確認。なお同名ノード同士（両方「Dup」）はCtrl+クリックで選択しようとすると選択状態が名前キーのSetのため2回目のクリックで最初の選択がトグルオフされてしまい、そもそも「同名2件を同時選択」という操作自体がUI上できない（reviewer記載の既知残存ギャップの実地確認、新規指摘ではない）。
+- **依頼4（セッション配下でのD&D並べ替え）**: `Child2`行をドラッグして`Child1`行の上部（`before`ゾーン）へドロップ（`DragEvent`+`DataTransfer`構築による実イベント発火）→ツリー上で`Child2`が`Child1`の前へ移動。`window.api.tab.openTree`の生データ読み出しで、セッションの実行時構造（`lockToken`付き）自体に新しい順序が反映され、タブを選び直して`tab:openTree`を再取得しても順序が維持される（＝都度アトミック保存されている）ことを確認。
+- **依頼5（入れ子ロック）**: 上記(C)の通りUI導線が無いため未検証（IPC直叩きでは前回ラウンド確認済み）。
+- typecheck: `tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json` エラーなし。build: `electron-vite build`成功（`out/main/index.js` 119.67kB / `out/preload/index.js` 9.08kB / `out/renderer/assets/index-*.js` 1,024.02kB、developer/reviewer報告と一致）。
+- console/例外チェック: 検証全体を通し、CDP経由の操作中にレンダラ側の例外・エラーは目視した範囲で発生せず（本ラウンドは主に実UI操作の機能検証に集中したため、M0/M1同様の全時間帯Runtime.exceptionThrown収集は実施していない）。
+- 後片付け: `.tmp-tester-app/`（リポジトリ直下、隔離用一時コピー）削除済み、scratchpad配下の一時ファイル削除済み、`config/app-settings.json`は本ラウンドが追加した`tab1`と既存残留物`m9a-tab1`のみ除去し他は無改変で復元済み。検証後`Get-Process electron`は0件を確認。
+- 外部サービスへの副作用: なし（すべてローカルファイル操作・localhost CDPのみ。実運用のAPIキー/Webhook等は使用していない）。上記(A)の通り、意図せず実在の個人設定ファイルに接触したが、実メモファイルへの読み書き・削除は無く、混入した2件のテスト用タブ登録エントリは本ラウンドで除去済み。
+
+## developer — M9b（ノードロック応用②: 境界を跨ぐ移動・コピー）実装
+
+対象マイルストーン: docs/v3/milestones/M9b-node-lock-boundary-move.md（M8/M9a完了済み前提）。「一方通行の金庫」判定表（PLANv3 §5.4/§7.5）をバックエンド（`memo:move`拡張）+レンダラ（D&D事前拒否・実際の到達経路）の両方で実装した。
+
+- **`src/shared/models.ts`**: `ErrorCode`に`LOCK_BOUNDARY_VIOLATION`を追加。
+- **`src/shared/ipc-contract.ts`**: `MemoMoveArgs`に`srcLockContext?`/`destLockContext?: LockContext`を追加。
+- **`src/main/crypto/nodeLock.ts`**: `readSubtreeMember`/`flattenSubtree`をexport化（`memoHandlers.ts`の新規ヘルパーから再利用するため）。新設`deleteConvertedSourceFile(oldPath)`（変換元ファイル削除の既存パターンを共通化。`lockNode`内のインライン実装をこちらへ差し替え、ロジック変更なしの純粋な抽出リファクタ）。
+- **`src/main/ipc/memoHandlers.ts`**: `memo:move`ハンドラ先頭に`args.srcLockContext || args.destLockContext`分岐を追加し、新設`handleLockBoundaryMove`へ委譲（両方省略時は既存v1ロジックを無変更で通す）。
+  - `handleLockBoundaryMove`: `requireSession`でsrc/destそれぞれのセッションを解決し、判定表通り「srcのみ有り→`LOCK_BOUNDARY_VIOLATION`（内→外）」「src/dest有りで別トークン→同エラー（別ロック間、tabId不一致による偶然のトークン一致も別ロック扱いに含めて判定）」「同一トークン→`moveWithinSession`」「destのみ有り→`moveIntoSession`（外→内）」に分岐。
+  - `moveWithinSession`（新設）: 同一セッション内の移動/コピー。既存トップレベルmemo:moveと同型のmove/copyロジックを`entry.children`/`nameMap`に適用。move は物理ファイル不動・位置のみ変更。copyは`cloneSubtreeWithUniqueNames`+`copyMemoFileToFolder`で複製するが、選択範囲に入れ子ロック済み子孫（`.lock`保有、`nameMap`に対応トークン無し）が含まれる場合は`LOCK_CONTAINS_ENCRYPTED`で書込み前に拒否する（developer判断: 複製すると`lock`情報を引き継がない空ノードを生む事故を防止する多層防御。新設`containsLockedDescendant`ヘルパーで検出）。
+  - `moveIntoSession`（新設）: 通常領域→セッション配下（外→内）。既存`lockNode`と同じ`readSubtreeMember`（`parentEntry`省略=平文専用）で個別暗号化(.txtenc)混在チェック+平文読込を行い（既存のロック中プレースホルダも物理的に`.txtenc`のため同じチェックで自然にLOCK_CONTAINS_ENCRYPTEDとなる、追加分岐不要）、対象を新規難読化トークンで`writeSessionMemoContent`（既存`createMemoInSession`と同一パターン）により暗号化書込み、move時のみ`deleteConvertedSourceFile`+`removeMemoFromIndex`で変換元を除去。コピー時は`cloneSubtreeWithUniqueNames`で自動改名。dest側`nameMap`/`children`へ組み込み後`persistNodeLockSession`で再暗号化保存（M9aの再暗号化保存フローをそのまま踏襲）。呼び出し元（`handleLockBoundaryMove`）は移動(非コピー)時のみ事前に`isNameTakenInSession`でセッション全体（フラット、PLANv3 §7.3）との名前重複を検証してからstore更新+`moveIntoSession`を呼び、成功後にsrcメタをアトミック保存+`emitIndexUpdated`する。
+- **レンダラ（実際にD&Dから到達可能にする配線）**:
+  - `src/renderer/components/Tree/treeView.ts`: `MemoDragPayload`に`srcLockToken?`（ドラッグ元行自身が保持する`lockToken`、掴んだ行そのものなので取り違えようがない）を追加。新設`isLockBoundaryMoveAllowed(srcLockToken, destLockToken)`（判定表そのままの純粋関数、TreeRow.tsx/Tree.tsx/App.tsxで共用）。
+  - `src/renderer/components/Tree/TreeRow.tsx`: 新設prop`canAcceptDrop`。`handleDragOver`/`handleDrop`は`!canAcceptDrop`なら`preventDefault`を呼ばず（ブラウザ標準の「ドロップ不可」カーソル）、コールバックも一切呼ばない（レンダラ側の事前拒否そのもの、milestone doc指定のTreeRow.tsx拡張）。
+  - `src/renderer/components/Tree/Tree.tsx`: `dragLockToken`state新設（ドラッグ開始行自身の`lockToken`を保持）。`handleDragStart`が`lockToken`引数を受け取りstate+payloadへ設定。各行の`canAcceptDrop`を`isLockBoundaryMoveAllowed(dragLockToken, row.lockToken)`から算出しTreeRowへ渡す。`handleRowDrop`は`isLockBoundaryMoveAllowed`で二段目の再検証を行った上で`onLocalMove`/`onLocalCopy`へ`srcLockToken`ヒントを追加送出。
+  - `src/renderer/App.tsx`: `handleLocalMove`/`handleLocalCopy`に「一方通行の金庫」拒否分岐（`srcLockToken && srcLockToken!==anchorLockToken`）+「外→内」新規分岐（`anchorLockToken`のみ有り→`ipc.moveMemo`に`destLockContext`のみ付与、成功後は`refreshTree`で反映。既存セッションは`tab:openTree`のreconcileが`tabId`経由で展開表示を維持するため巻き戻らない、M8既存機構）。既存M9aの「同一セッション内は`tree:updateStructure`」分岐は`srcLockToken===anchorLockToken`の場合のみ到達するよう順序を調整（ロジック自体は無変更）。`handleLocalCopy`はM9a時点ではスコープ非対応（常に無条件memo:move copy:trueで実質壊れていた）だったため、`srcLockContext`/`destLockContext`を組み立てて渡すよう新規に対応（同一セッション内コピーも今回`moveWithinSession`経由で初めて正しく動作する）。`handleDropMemoOnTab`（TabBarへのクロスタブドロップ）に`payload.srcLockToken`拒否分岐を追加（クロスタブの移動先は常に`destPosition:'last'`＝セッション指定不可のため、セッション配下からのドラッグは常に内→外として拒否）。
+- **意図的にスコープ外とした事項（developer判断）**: (a) `handleLocalMove`/`handleLocalCopy`のドラッグ対象複数選択における同名ノード混在の完全解消はM9a-R2-01由来の既存残存範囲のまま（掴んだ行自身の`srcLockToken`のみを代表値として使う。AGENT_LOG既存記載の限界を踏襲、新規悪化なし）。(b) 「外→内」時、宛先セッションの`destPosition:'child'`でロック中(入れ子, 未解除)ノードをアンカーにするケースは既存M8と同水準の多層防御（`collectLockedNodesByName`チェック）を追加済み。(c) クロスタブでdestLockContext（別タブの開いているセッションへ直接投げ込む）は現行UIに到達経路が無い（TabBarドロップは常に`last`固定）ため未検証だが、バックエンドは一般化して実装済み（tabId跨ぎでも`getTabFolderPath(destTabId)`経由で正しく解決される）。
+- 確認: `npm run typecheck`（`tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json`）エラーなし。`npx electron-vite build`成功（`out/main/index.js` 127.68kB / `out/preload/index.js` 9.08kB / `out/renderer/assets/index-*.js` 1,026.10kB）。実行時動作検証は未実施（tester範囲）。
+- reviewerへ静的レビューを依頼予定。コミット・プッシュは行っていない。
 
-## developer — M3-②（全文検索本体）実装
-
-対象: M3-①（CodeMirror 6統合、reviewer/tester合格済み・未コミット）に続き、全文検索本体（メモリ内インデックス・IPC・検索履歴・全文検索パネルUI・結果ジャンプ）を実装。
-
-- 新規: `src/main/search/searchIndex.ts`（tabId→memoName→{encrypted,contentLF|null}のMap。`buildIndex`=起動時全タブ走査、`indexTab`=1タブ(再)走査（tab:register/create用）、`updateMemo`/`removeMemo`/`renameMemoInIndex`/`moveMemoInIndex`(copy/moveの両方に対応)/`removeTabFromIndex`=経路①差分更新、`search`=name/body両対象・大小文字/正規表現オプション・MAX_HITS=1000上限）。暗号化メモは`contentLF:null`固定で本文を一切保持しない（DESIGN §2.4）。
-- 新規: `src/main/ipc/searchHandlers.ts`（`search:global`=indexのsearchを呼びtabNameを`listTabs()`で解決して返却、`search:history:get`/`search:history:add`=メインプロセスのメモリ内配列、上限20件、重複は先頭へ移動）。検索履歴はAppSettingsスキーマに定義が無く「メモリ内軽量・永続DBなし」方針に沿ってセッション内メモリ保持のみとした（developer判断、非永続）。
-- 新規: `src/renderer/components/Search/SearchPanel.tsx`（モーダル風オーバーレイ。scope=all/currentTab切替、大文字小文字区別/正規表現オプション、検索履歴クリックで再検索、結果一覧クリックで`onJump`、`evt:indexUpdated`購読で表示中クエリを自動再検索）。
-- 変更: `src/main/index.ts`（bootstrapに`searchIndex.buildIndex(listTabs())`を追加。ウィンドウ表示前にブロッキング構築、Fix11の想定規模内として許容。構築処理自体は`buildIndex`に分離済みで将来のバックグラウンド化に対応しやすい形）。
-- 変更: `src/main/ipc/registerIpc.ts`（`registerSearchHandlers`登録）、`src/main/ipc/memoHandlers.ts`（save/create/rename/delete/duplicate/moveの各成功箇所に経路①のインデックス更新+`evt:indexUpdated`発火を配線。同一タブ内move（ツリー位置のみ変更）はインデックス無変更なので発火しない）、`src/main/ipc/tabHandlers.ts`（register/createはフォルダ(再)走査で`indexTab`、removeは`removeTabFromIndex`。renameはtabId/メモ名とも不変のためインデックス更新不要と判断）。
-- 変更: `src/shared/models.ts`（`SearchHit`型追加）、`src/shared/ipc-contract.ts`（`SearchScope`/`SearchOptions`/`SearchGlobalArgs`/`SearchHistoryAddArgs`/`IndexUpdatedPayload`型、`PreloadApi.search`/`events.onIndexUpdated`追加）、`src/preload/index.ts`・`src/renderer/ipc.ts`（対応するAPI/イベント購読の配線）。
-- 変更: `src/renderer/components/Editor/CodeMirrorEditor.tsx`（`RevealTarget`prop追加。`token`をクリック毎にインクリメントし、同一位置への再クリックでも確実に選択・`EditorView.scrollIntoView`する設計。マウント用effectより後に宣言し同一コミット内でviewRef.current確定後に参照）、`src/renderer/App.tsx`（`showSearchPanel`/`revealTarget`state、`handleJumpToHit`=タブ切替→メモを開く→本文一致ならrevealTarget発行、Ctrl+Shift+Fショートカット（CodeMirror内蔵のCtrl+F現在メモ内検索とは非衝突）、`SearchPanel`のレンダリング）、`src/renderer/components/TabBar/TabBar.tsx`（「🔍 検索」ボタン追加）、`src/renderer/App.css`（`.search-panel*`スタイル追加）。
-- 設計判断（reviewer確認事項）:
-  1. `SearchHit.matchStart`/`matchEnd`は本文一致時のみ、readMemo/memo:save/memo:readWithEncodingと同じLF正規化済み`contentLF`基準のオフセット。ジャンプ時にCodeMirrorへそのまま渡せば選択位置が一致する設計（`memo:read`後のcontentLFと index内contentLFが同一パイプライン由来のため整合）。
-  2. 正規表現が不正な場合は`search:global`をエラー(Result NG)にせず「ヒットなし」として空配列を返す（インクリメンタル入力中の頻繁なエラー表示を避けるUX判断、00-core-principles.md §8「検索は基本的に読み取り操作」を踏まえた判断）。
-  3. `evt:indexUpdated`はtabId単位で発火（複数タブに跨るmemo:move/duplicateは影響する各タブ分だけ個別発火）。レンダラのSearchPanelは発火のたびに「表示中の直前クエリ」を単純に再実行する設計（tabId一致判定はしていない。scope=allなら常に有効、scope=currentTabでも対象タブ固定のため無害）。
-  4. 検索履歴はメインプロセスのメモリ内のみ保持し、アプリ設定JSONへは永続化しない（§5.2参照）。
-  5. `handleJumpToHit`はタブ切替（`selectTab`）後に`openMemoByName`（`selectedTabId`stateをクロージャで読む）へ委譲せず、`hit.tabId`/`hit.memoName`を直接引数に`ipc.readMemo`する自己完結実装にした（自己レビューで発見: `selectTab`のawait中に束縛済みの古い`openMemoByName`クロージャを呼ぶとタブ切替前の`selectedTabId`を参照するstale closureバグになるため）。タブ切替が未保存確認キャンセルで中断された場合は`selectedTabIdRef`（`dirtyRef`と同型のref）で検知しジャンプを中断する。
-- 確認: `npm run typecheck`（renderer/node両方）エラーなし、`npm run build`（electron-vite build）成功（`out/renderer/assets/index-*.js` 933.80kB）。実機起動・全文検索の動作確認はtester範囲のため未実施。
-
-## reviewer — M3-②（全文検索本体）実装 静的レビュー（ラウンド1）
-
-対象: searchIndex.ts / searchHandlers.ts / SearchPanel.tsx（新規）、memoHandlers.ts / tabHandlers.ts / main/index.ts / registerIpc.ts / models.ts / ipc-contract.ts / preload・renderer/ipc.ts / CodeMirrorEditor.tsx / App.tsx / TabBar.tsx（変更）。DESIGN §2.4・M3-search.md と照合。
-
-- 判定: **ブロッキング指摘なし。developer への差し戻し不要。**
-- 暗号化メモの本文除外（DESIGN §2.4最重要原則）: OK。`updateMemo`/`indexTab`/`moveMemoInIndex`いずれも`encrypted`時は`contentLF:null`固定。`search()`の`searchInTab`は`contentLF===null`をbody一致対象から確実にスキップ。name一致のみ許容（意図通り）。SearchHit/SearchPanelとも暗号化メモのbody内容（lineText等）を返す経路なし。検索履歴もユーザー入力クエリ文字列のみでメモ本文非経由。漏洩経路なし。
-- 経路①配線（DESIGN §2.4/§3.3）: memoHandlers.ts の save/create/rename/delete/duplicate/move、tabHandlers.ts の register/create/remove すべてで、実ファイル操作・メタ保存の「成功確認後」にインデックス更新関数を呼ぶ順序を確認（順序ミスなし）。同一タブ内move（実体不変）はインデックス更新・`evt:indexUpdated`とも発火しない判断も妥当。tab:renameがtabId不変（UUID、tabService.renameTab確認）なのでインデックス更新不要という判断も正しい。main/index.tsのbootstrapで`buildIndex`がウィンドウ生成前に呼ばれることも確認。
-- `handleJumpToHit`自己完結実装: stale closure回避の設計判断は妥当。`selectTab`のawait後に`selectedTabIdRef`で実際に切り替わったか確認してからジャンプする実装も正しい。`openMemoByName`との重複はあるが（意図的なclosure回避のため）実害なし。
-- 検索履歴の非永続化: AppSettingsスキーマに対応フィールドが無い状況での妥当なdeveloper判断。個人プロジェクト規模で許容範囲。
-- コード品質: 型安全性・エラーハンドリングとも問題なし。不正な正規表現を「ヒットなしの空配列」で丸める判断も00-core-principles.md §8に沿う。MAX_HITS=1000の安全弁も妥当。
-- 非ブロッキング留意（対応不要、M6着手時の参考）: `memoHandlers.ts`の`memo:save`は`updateMemoIndex(..., false, ...)`と`encrypted`を固定`false`で呼んでいるが、現時点で`crypto:*`ハンドラ（registerIpc.tsコメントに「以降のMで追加」と明記）が未登録のため`memo:save`は平文メモ専用であり実害なし。M6でのcrypto:saveEncrypted実装時にそちらから`updateMemoIndex(..., true, null)`を呼ぶ配線を忘れないよう留意。
-
-## tester — M3-②（全文検索本体）動作検証（ラウンド1）
-
-対象: reviewer M3-② ラウンド1（ブロッキング指摘なし）後の一式。npm install / typecheck / build / prod起動 / IPC直叩き+実DOM操作（CDP Runtime.evaluate・Input.dispatchKeyEvent）による全文検索・差分更新（経路①）・正規表現/大文字小文字オプション・検索履歴・暗号化メモ除外・結果ジャンプ・M3①回帰を独立して再現確認。
-
-- 判定: **全項目 OK。不具合なし。developer への差し戻しなし。**
-- npm install: 成功（`up to date, audited 391 packages`。allow-scripts警告のみで動作に支障なし）。
-- typecheck: `tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json` エラーなし。
-- build: `electron-vite build` 成功。`out/main/index.js`(52.15kB)/`out/preload/index.js`(3.72kB)/`out/renderer/assets/index-*.js`(934.55kB)+css を生成確認。
-- prod起動: `--user-data-dir`で隔離したuserDataを使い`electron . --remote-debugging-port=9333`起動（`.txtenc`確認のため計2回起動）。ログは`DevTools listening`のみでエラーなし。
-- **全文検索の基本動作（最重要）**: `tab.register`で2タブ（tabA/tabB）登録、`memo.create`+`memo.save`で3メモ作成（メモ名・本文ともユニーク文字列を含む）。`search:global`でメモ名一致・本文一致の双方がヒットすること、scope='all'（全タブ横断）とscope='currentTab'（対象タブのみ・他タブ不干渉）の両方が正しく機能することをIPC直叩きで確認。実DOM操作でも「🔍検索」ボタンでSearchPanel起動→入力→送信→結果一覧描画→ヒットクリックでタブ切替+該当メモオープン+`document.getSelection().toString()`が一致箇所と完全一致（`zzz123`）することを確認（`revealTarget`によるジャンプ機能、`EditorView.scrollIntoView`込み）。
-- **インデックス差分更新（経路①）の実際の反映確認（重要）**: 保存（内容変更）→直後の全文検索で旧文字列が消え新文字列がヒットすることを確認（`before`→`save`→`afterOld`（空）→`afterNew`（ヒット）の順でIPC直叩き確認）。リネーム（旧名ヒット消失・新名ヒット出現、本文ヒットは維持）、複製（複製元・複製先の両方が本文ヒット）、削除（削除対象のみ消失・複製先は残存）、タブ間移動（移動元タブでヒット消失・移動先タブでヒット出現）を全てIPC直叩きで確認。加えてSearchPanelを開いた状態でIPC経由の`memo.save`を実行し、`evt:indexUpdated`購読による自動再検索（表示中クエリの再実行）が実際に発火し結果一覧が即座に更新される（文字列除去後「一致する結果はありません。」表示に切替）ことを実DOM操作で確認。
-- **正規表現検索・大文字小文字オプション**: 正規表現（`C[hH]erry\w*`でメモ名+本文ヒット）、大文字小文字区別なし（既定, 'cherry'で'CherryLog'名・本文双方ヒット）、大文字小文字区別あり（'cherry'では本文のみヒットしメモ名'CherryLog'は不一致、'CherryLog'では逆にメモ名のみヒット）を意図通り確認。不正な正規表現（`(unterminated`）はエラーではなく空配列（ヒットなし）として安全に丸められることも確認（設計判断どおり）。
-- **検索履歴**: `search:history:add`後に`search:history:get`へ反映、同一クエリの重複追加が先頭へ移動し重複エントリを作らないことを確認。
-- **暗号化メモの扱い**: タブフォルダへ`.txtenc`拡張子のダミーファイルを直接配置した状態でElectronプロセスを再起動（`buildIndex`による起動時走査を実際に経由）し、`search:global`でメモ名のみヒット・本文（ダミー内容の文字列）は一切ヒットしないことを実機で確認。`tab.list`でタブ構成にも影響がないことを確認。`searchIndex.ts`コードレベルでも`encrypted`時`contentLF:null`固定の経路を確認。
-- **M3①（CodeMirror統合）の回帰確認**: 実DOM+CDPキー入力でCtrl+Fを送信し、CodeMirror内蔵検索パネル（`.cm-search`）が正しく開くことを確認。エディタツールバーの`encoding`/`eol`表示、文字数/行数/カーソル位置/選択文字数のステータス表示も編集・選択操作に追従することを確認。深刻な回帰は検出せず。
-- 後片付け: 検証用一時フォルダ（scratchpad配下、リポジトリ外）・Electron userData（`--user-data-dir`で隔離、リポジトリ外）を削除済み。検証後`Get-Process electron`は0件を確認（2回の起動セッションとも終了確認済み）。
-- 外部サービスへの副作用: なし（すべてローカルファイル操作・localhost CDPのみ。実運用のAPIキー/Webhook等は使用していない）。
-
-## reviewer — M4（ファイル監視）実装 静的レビュー（ラウンド1）
-
-対象: watch/watcher.ts・conflict.ts・activeMemoState.ts（新規）、ipc/editorHandlers.ts・dialogs/ConflictDialog.tsx（新規）、selfWriteRegistry.ts・atomicWrite.ts・memoFileService.ts・trash.ts・tabHandlers.ts・registerIpc.ts・index.ts・constants.ts・ipc-contract.ts・preload/index.ts・renderer/ipc.ts・codeMirrorSetup.ts・CodeMirrorEditor.tsx・App.tsx（変更）、package.json（chokidar追加）。M4-watch.md・00-core-principles.md §4/§5/§7/§8/§10・data-model.md・DESIGN §3.3/§5.6と照合。
-
-- 判定: **ブロッキング指摘なし。developer への差し戻し不要。tester へ進行可。**
-- M4-R1-01 [Low/中程度寄り] 要改善（ブロッキングではない）: `atomicWrite.ts`はrename失敗時に`consumeSelfWrite`で予約解放するが（M1-R1-02由来の既存対応）、同じ「操作前registerSelfWrite→fs操作失敗」パターンを持つ`memoFileService.ts`の`renameMemoFile`/`duplicateMemoFile`/`moveMemoFileToFolder`/`copyMemoFileToFolder`と`trash.ts`の`trashPath`/`deletePathDirect`には失敗時の解放処理が無い。`withRetry`/`shell.trashItem`が全滅すると、登録済みレコードがTTL(2.5秒)満了まで残存し、その間に同一パスへの真の外部変更が発生すると自己発火と誤判定され握りつぶされ得る（00-core-principles.md §4の意図「登録漏れ=外部変更の誤検知を防ぐ」に対する漏れ）。実害はTTL内の稀な競合窓に限定され、データ破損はないが、`atomicWrite.ts`で既に確立した対処パターンとの不整合のため、同様の解放処理の追加を推奨。
-- developer確認9点への回答:
-  1. `editor:reportActive`新設: 妥当。dirty状態はレンダラ由来でメインが本来関知しないため、最小限の一方向通知を追加する以外に方法が無い。ペイロードも機微情報を含まず、PreloadApi/ipc-contract.tsの型整合も確認。承認。
-  2. mtime不使用（サイズ+ハッシュ完全一致のみ）: DESIGN §3.3/§5.6・M4-watch.mdの記述（mtime+サイズ+ハッシュの複合判定）とは字面上乖離するが、ハッシュ完全一致は実質的にmtimeより厳密な同一性判定であり、mtime追加はNTFSタイムスタンプ精度・stat取得タイミングのブレによる誤判定（自己発火の見逃し→毎回保存のたびに誤ったevt:conflict/externalChange発火）のリスクを増やすだけで精度向上に寄与しない、という判断は技術的に妥当。ブロッキングとはしないが、DESIGN.md/M4-watch.mdの文言とコードの意図的乖離のため、正本側への注記更新をどこかのタイミングで行うことを推奨（doc同期の課題であり今回の実装不備ではない）。
-  3. `.bak`をchokidarの`ignored`で完全除外: DESIGN文中は`.bak`をselfWriteRegistry照合対象として扱う書きぶりだが、`.bak`は常にnull-expectationで登録され突合時は無条件マッチ（安全側）になるため、ignored除外とselfWriteRegistry経由除外は実質的に同じ結果になる。むしろignored除外の方が`.bak`関連イベントを検索インデックス/競合判定に一切到達させない点でシンプルかつ安全。承認。
-  4. メタJSON外部変更の簡易処理（ツリー再取得のみ促す）: PLAN §2.7の記述（changesが空配列になり得る）と整合。実際の再読込・復旧カスケードはrefreshTree→tab:openTree側の既存経路に委譲されており妥当。承認。
-  5. reloadGenerationによる強制再マウント: 非制御CodeMirrorコンポーネントの制約（initialContentLFはマウント時のみ有効）を踏まえた妥当な設計。Undo履歴が外部反映のたびにリセットされるのも「内容が外部由来」である以上適切。承認。
-  6. evt:opErrorのM4初実装: IPC呼び出し元を持たないバックグラウンドI/O（chokidarイベント処理）で初めて必要になったという経緯は妥当。実装（safeProcessSettledEvent/watcher error handler）もcode/message/pathのみレンダラへ返し、内部ログにOSエラーコード・スタックを記録する00-core-principles.md §10方針と一致。承認。
-  7. chokidar ^4.0.3固定: 情報不足のv5見送りは保守的で妥当な判断。承認。
-  8. 競合ダイアログ表示中ロック（自動保存未実装のため対象外）: grep確認の結果、現コードベースに自動保存のデバウンス保存ロジックは実装されていない（AppSettings.autosaveはスキーマのみ）。エディタ入力ロック（readOnly Compartment）とhandleSaveのconflictInfoガードで「解決中ロック」の趣旨は満たされている。承認（自動保存実装時は当該箇所にも同様のconflictInfoガードが必要になる点を留意事項として記録）。
-  9. 「自分の変更を保存」がexpectedHash:undefinedでCONFLICT検出を意図的にバイパス: ユーザーが競合ダイアログで明示的に選択した意図的な上書きであり、既存の保存API競合チェック（ハッシュ比較のみの一発判定）の設計と矛盾しない限定的バイパス。承認。
-- その他の軽微な指摘（Info、対応不要）: `constants.ts`の`TEMP_FILE_GLOB`が定義のみで未使用（watcher.tsは`TEMP_FILE_PREFIX`を直接参照する独自関数`isIgnoredPath`を実装）。デッドコードだが実害なし。`index.ts`の`app.on('activate')`は`stopWatching`を挟まず`startWatching`を再実行するが、Windows優先アプリでmacOS専用経路のため実害なし。
-- セキュリティ/例外処理: 秘密情報のハードコード・ログ出力なし。`processSettledEvent`の例外は`safeProcessSettledEvent`で捕捉しUNKNOWN化+内部ログのみ（Fix8方針と一致）。`chokidar`の`error`イベントも同様に処理。IPCハンドラは全て`wrapHandler`経由。同期順序（①ストア→②実ファイル+予約登録→③メタ保存）・selfWriteRegistry一元化・Windowsリトライ（withRetry）は既存M1-M3の実装パターンを踏襲し新規逸脱なし。
-
-## developer — M4-R1-01 修正（ラウンド1）
-
-対象: memoFileService.ts（renameMemoFile/duplicateMemoFile/moveMemoFileToFolder/copyMemoFileToFolder）、trash.ts（trashPath/deletePathDirect）。
-
-- 修正: atomicWrite.ts で確立済みの「registerSelfWrite → fs操作 → 失敗時はconsumeSelfWriteで予約解放 → rethrow（trashPathのみ既存どおりerr()で返却）」パターンを、指摘対象の6関数すべてに追加。
-  - `renameMemoFile`: `fs.rename`をtry/catchで囲み、失敗時に旧パス（delete予約）・新パス（upsert予約）両方を`consumeSelfWrite`してから`throw e`。
-  - `duplicateMemoFile`/`copyMemoFileToFolder`: `fs.copyFile`失敗時に宛先パスを`consumeSelfWrite`してから`throw e`。
-  - `moveMemoFileToFolder`: rename+EXDEVフォールバック（copy+unlink）全体を囲むtry/catchで、失敗時に旧パス・宛先パス両方を`consumeSelfWrite`してから`throw e`。
-  - `trash.ts trashPath`: 既存のcatch節（`TRASH_FAILED`を返す箇所）に`consumeSelfWrite(absolutePath)`を追加。
-  - `trash.ts deletePathDirect`: `fs.unlink`をtry/catchで囲み、失敗時に`consumeSelfWrite`してから`throw e`。
-- いずれも`throw e`/`err()`前に予約解放のみを行い、リトライ回数や制御フロー自体（呼び出し元への返り値の型・エラーコード）は変更していない。
-- 確認: `npm run typecheck`・`npm run build`ともにエラーなし。作業ツリーへの変更のみでコミット・プッシュはしていない。
-
-## tester — M4（ファイル監視）動作検証（ラウンド1）
-
-対象: reviewer M4 ラウンド1（ブロッキング指摘なし）+ developer M4-R1-01修正後の一式（reviewer再レビューは今回省略、直接tester検証）。npm install / typecheck / build / prod起動 / IPC直叩き+実DOM操作+実際のOSレベルファイル操作（エクスプローラー相当の外部変更・PowerShellによる排他ロックでのfs操作強制失敗）による外部変更検知・自己発火除外・競合ダイアログ/ロック・M4-R1-01修正・メタJSON外部変更・OS生成ファイル除外を検証。
-
-- **判定: 不具合なし。developer への差し戻しなし。M4はコミット判断（ユーザー指示待ち）へ進めてよい。**
-- npm install: 成功（`up to date, audited 393 packages`。allow-scripts警告のみ）。
-- typecheck: `tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json` エラーなし。
-- build: `electron-vite build` 成功（`out/main/index.js`(68.00kB)/`out/preload/index.js`(5.10kB)/`out/renderer/assets/index-*.js`(942.25kB)+css）。
-- **[Info] 記録のみ（コード不具合ではなくビルド成果物の一過性事象、対応不要）: 検証開始時にリポジトリに残存していた`out/`（developerが直前にビルドした`.gitignore`対象の成果物）で起動したところ、`appSettings`モジュールがバンドル内で2箇所に分裂し（`cached`変数を持つ側と`initAppSettings`本体を持つ側が別インスタンス化）、`cached`が実際には設定されず`bootstrap()`が`getAppSettings not initialized`の未処理Promise例外で失敗しウィンドウが生成されない事象を確認（CDPのpageターゲットが0件）。`rm -rf out && npm run build`でクリーンビルドし直したところ即座に解消し、以降複数回の再ビルド（cleanなし）でも再現しなかった（Rollupの一過性のモジュール重複と推定）。コード自体の欠陥ではなく`out/`という`.gitignore`対象のビルド成果物が古い/不整合な状態で残っていたことによる事象と判断（CIやクリーンチェックアウトでは発生しない）。念のため以降のビルド確認は必ず`rm -rf out`後の状態で実施した。developer/reviewerへの申し送り事項として記録するのみで、差し戻しは行わない。
-- prod起動: `--user-data-dir`で隔離したuserDataを使い`electron . --remote-debugging-port=9333`起動（クリーンビルド後）。ログは`DevTools listening`のみでエラーなし。CDPのpageターゲット確認・`document.title`取得で正常起動を確認。
-- CDP操作手法: Node組込みの`WebSocket`グローバル（Node 22+）でCDPへ直接接続し`Runtime.evaluate`（`window.api`直叩き・DOM操作・`dispatchEvent(new MouseEvent(...))`によるReactハンドラ起動）と`Input.insertText`（contenteditableへフォーカス後の実文字入力、CodeMirror本文編集）を使用。ws等の外部パッケージ不使用。
-- **1. 外部変更検知（evt:externalChange, 最重要）**: タブ登録後、`window.api`を介さず**Node `fs`で直接**（アプリ外からのファイル操作を模した最も直接的な検証）tabAフォルダへ`.txt`を新規作成/内容変更/削除する3パターンを実施。いずれも200msデバウンス後に`evt:externalChange`が正しい`kind`（'add'/'change'/'unlink'）で発火し、`tab:openTree`でツリーへの反映（新規追加/削除）も確認。
-- **2. 自己発火除外（selfWriteRegistry）**: アプリ自身のIPC操作（`memo.save`/`memo.rename`/`memo.move`（タブ間移動）/`memo.move copy:true`（タブ間コピー）/`memo.duplicate`（同タブ内複製）/`memo.delete`（既定=ごみ箱送り））を実行するたびに`evt:conflict`/`evt:externalChange`が一切発火しないことを確認（`evt:indexUpdated`は経路①分のみ想定通り発火）。rename/move/duplicate/deleteいずれも自己書き込みとして正しく除外された。
-- **3. 編集中メモへの外部変更→競合ダイアログ→ロック（実DOM操作、最重要）**: タブ/メモ行を実際にクリックして開き（`dispatchEvent(new MouseEvent('click'))`でReactのonClickを起動）、`Input.insertText`でCodeMirrorへ実際に文字入力しdirty状態にした上で、当該メモファイルをNode `fs`で直接外部変更。`evt:conflict`が発火し、DOM上に`.confirm-dialog`（「〇〇は編集中に外部（他のアプリ等）で変更されました」）が実際に表示されることを確認。表示中は`.cm-content`の`contenteditable`が`false`（入力ロック）になることも確認。
-  - ロック中の保存試行: `保存`ボタン自体は`disabled`属性が付与されない（見た目上は活性のまま）が、クリックしても`handleSave`内部の`conflictInfo`ガードにより実際には何も起きない（ディスク上のファイル内容・ダイアログ表示とも変化なし）ことを実機確認。ロック自体は機能上有効だが、ボタンの見た目が非活性化されない点はUX上の軽微な不整合（**Info、対応不要と判断**。データ破損や誤操作には至らない防御的ガードが機能しているため）。
-- **4. 競合解決フロー（両方向）**: 「外部の変更を採用」クリックでダイアログが閉じ本文が外部内容に置き換わり編集可能に復帰（dirty解消・保存ボタン非活性）することを確認。別途dirty+競合状態を再現し「自分の変更を保存」クリックで`expectedHash:undefined`バイパス保存が実行され、ディスク上のファイルが**自分の編集内容**で上書きされる（外部の変更が破棄される）ことを実ファイル確認。いずれの解決後も後続の自己書き込み（保存）が誤ってconflict/externalChangeを再発火しないことも確認。
-- **5. M4-R1-01修正の実機確認（rename失敗時のselfWriteRegistry解放、最重要）**: PowerShell（`[System.IO.File]::Open(path,'Open','ReadWrite','None')`、`-ExecutionPolicy Bypass`で別プロセス起動）で対象メモファイルを排他ロックした状態で`memo:rename`をIPC直叩きし、リトライ全滅で`Result{ok:false}`（`UNKNOWN`）になることを確認（rename自体は約800ms〜1秒で失敗、退避先はロック解放直後）。ロック解放直後（登録から2.5秒のTTLが自然失効するより十分前、実測で登録後1.7〜2.4秒の時点）に、**同一パス（旧名）への本物の外部delete**と**リネーム先の名前での本物の外部add**をNode `fs`で直接実行したところ、両方とも即座に`evt:externalChange`（それぞれ`kind:'unlink'`/`kind:'add'`）が正しく発火し、TTL待ちで握りつぶされることがないことを確認。これは修正前の実装であれば「新パスのnull期待値は常にマッチ扱い」「旧パスのdelete期待値はTTLが切れるまで残存」により本来検知すべき外部変更が最大2.5秒握りつぶされ得た箇所であり、修正が実際に機能していることを実機で裏付けた。duplicate/move/copy/trashPath/deletePathDirectは同一パターン（コードレビューで確認済み）だが、copyFile/unlink/trashItemを黒箱的に確実に失敗させる手段（フォルダACL拒否等）は用意が煩雑なため個別の強制失敗テストは実施していない（renameで代表検証、明記のうえ許容と判断）。
-- **6. メタJSON（`.tabtreenote.json`）の外部変更検知**: メタJSONをNode `fs`で直接書き換え（`expanded`変更）たところ`evt:externalChange`（`changes:[]`の簡易ペイロード）が発火し、`tab:openTree`再取得で実際に`expanded:false`が反映されることを確認。
-- **7. 一時ファイル・`.bak`・OS生成ファイルの監視除外**: `.~tmp~`プレフィックスファイル・`.bak`ファイル・`desktop.ini`・`Thumbs.db`をtabAフォルダへ直接作成しても、いずれも`evt:externalChange`/`evt:conflict`/`evt:indexUpdated`が一切発火しないことを確認。
-- **8. 経路②インデックス更新**: 上記1・6・7の検証を通じて、外部変更検知時のみ`evt:indexUpdated`が発火し（メタJSON外部変更・一時ファイル等では発火しない）、自己発火除外時は発火しない（経路①分のみ発火）ことを一貫して確認。
-- opError: 検証全体を通じて`evt:opError`は一度も発火せず（意図しない例外が発生していないことの傍証）。
-- 後片付け: 検証用一時フォルダ（scratchpad配下、リポジトリ外）・Electron userData（`--user-data-dir`で隔離、リポジトリ外）・PowerShellロック用一時スクリプトを削除済み。検証後`Get-Process electron`/`Get-Process powershell`（自セッション以外）とも0件を確認。
-- 外部サービスへの副作用: なし（すべてローカルファイル操作・localhost CDP・ローカルPowerShellプロセスのみ。実運用のAPIキー/Webhook等は使用していない）。
-
-## developer — M5（リンク機能）実装
-
-対象: リンク装飾（URL/mail/path/`memo:`）・外部起動（確認+`path.resolve`+OS API）・`memo:` 解決/遷移（M5-links.md、DESIGN §2.8、PLAN §2.5/§5.8）。M1-M4（未コミット、作業ツリーに存在）の続き。
-
-- 新規: `src/main/ipc/linkHandlers.ts`（`link:openExternal`/`link:resolveMemo`）。
-  - `link:openExternal`: kind別に処理。`url`は`www.`始まりへ`https://`補完後スキーム許可リスト（http/https/ftp）検証→`shell.openExternal`。`mailto`は`mailto:`未前置なら補完しスキーム検証→`shell.openExternal`。`path`は`file://`正規化→絶対パスならそのまま、相対パスは`baseTabId`のタブフォルダ絶対パスを`getTabFolderPath`で取得し**必ず`path.resolve`で絶対パス化**（DESIGN §2.8必須事項）してから`shell.openPath`。シェル文字列連結は不使用（00-core-principles.md §10）。
-  - `link:resolveMemo`: `memoRef`（`memo:`除去済み）を`\`→`/`正規化し最初の`/`で分割。`/`無し=現在タブ内メモ名、`タブ名/メモ名`=`listTabs()`から`normalizeForCompare`でタブ名一致検索、`タブ名/`=メモ指定なし（`memoName`省略）。メモ名は`validateName`通過を要求（含む場合は解決不能=null、`findMemoFile`へのパストラバーサル文字列到達を多層防御で遮断）。`findMemoFile`で実ファイル確認、無ければnull。全経路で解決不能はResultエラーにせずnull（DESIGN §2.8「エラーダイアログは出さない」）。
-- 新規: `src/renderer/editor/links.ts`（CodeMirror 6拡張）。
-  - `detectLinks`: 単一正規表現（`memo:\S+` / `(https?://|ftp://|www\.)...` / `mailto:\S+` / 素のメールアドレス / `[A-Za-z]:\\`・`.\`・`..\`・`file://`のパス）で文書全文を走査し種別判定、末尾の句読点・閉じ括弧類をトリム。
-  - `LinkDecorationPluginValue`（`ViewPlugin.fromClass`）: `docChanged`時に再検出し`Decoration.mark({class:'cm-link'})`を`RangeSetBuilder`で構築。
-  - `buildLinkExtension`: 上記プラグイン+`EditorView.domEventHandlers({click,dblclick})`。`getOpenTrigger()`（`ctrlClick`/`singleClick`/`doubleClick`）に応じてトリガー一致時のみ`posAtCoords`でリンク特定→`preventDefault`+`onLinkClick`コールバック呼び出し（実際のIPC呼び出し・確認ダイアログは呼び出し側=App.tsxに委譲。onChange/onStats/onSaveと同じ「エディタ層はUI検出のみ、処理は親へ委譲」パターン）。
-- 変更: `src/renderer/components/Editor/CodeMirrorEditor.tsx`（`linkOpenTrigger`/`onLinkClick` props追加。既存のonChange/onStats/onSaveと同様ref経由で最新値を参照するため、マウント時の拡張リストに一度だけ組み込めばよい設計＝Compartment不要）。
-- 変更: `src/renderer/App.tsx`（`linkSettings` state追加、`settings:get`応答の`AppSettings.links`で上書き。`openMemoDirect`＝`memo:`リンク解決後にメモを開く独立ヘルパー（`memo:read`結果の`encrypted`で暗号化メモはM6未対応メッセージに留める。既存の`handleJumpToHit`と類似だが`link:resolveMemo`の返却に`encrypted`が無いため独立実装）。`handleLinkClick`＝`memo:`種別は`link:resolveMemo`→（タブ違いなら`selectTab`の既存未保存確認ガード経由/同タブなら`dirtyRef`で同様のガード）→`openMemoDirect`。url/mailto/path種別は`linkSettings.confirmBeforeOpen`（既定true）に応じ既存`ConfirmDialog`（削除確認等と共用の汎用コンポーネント）を挟んでから`link:openExternal`invoke。`CodeMirrorEditor`へ`linkOpenTrigger`/`onLinkClick`を配線）。
-- 変更: `src/shared/ipc-contract.ts`（`LinkKind`/`LinkOpenExternalArgs`/`LinkResolveMemoArgs`/`LinkResolveMemoResult`型、`PreloadApi.link`追加）、`src/preload/index.ts`・`src/renderer/ipc.ts`（`link.openExternal`/`link.resolveMemo`の配線）、`src/main/ipc/registerIpc.ts`（`registerLinkHandlers`登録）。
-- 変更: `src/renderer/App.css`（`.cm-link`＝`var(--color-accent)`色+下線+`cursor:pointer`）、`src/main/index.ts`（`setWindowOpenHandler`のコメント更新のみ。本流は`linkHandlers.ts`に委譲した旨を明記、ロジック変更なし）。
-- 設計判断（reviewer確認事項）:
-  1. `LinkResolveMemoResult.memoName`を省略可とした（data-model.md/PLAN §2.5の型表記は`{tabId,memoName}`の非オプショナルだが、DESIGN §2.8の`memo:タブ名/`＝メモ指定なしでタブを開くだけのケースを表現するため）。
-  2. `link:openExternal`のエラーコードは固定enum（`ErrorCode`）の中から意味的に近いものを流用（不正スキーム/baseTabId未指定=`NAME_INVALID`、`shell.openPath`失敗=`NOT_FOUND`）。新規コード追加はdata-model.md変更が必要になるため行っていない。
-  3. リンク検出は`detectLinks`が文書全文を都度正規表現走査する単純実装（個人用メモの小規模テキスト想定。`@codemirror/view`の`MatchDecorator`のような差分最適化は行っていない）。
-  4. クリック時のカーソル形状は常時`cursor:pointer`（トリガーが`ctrlClick`でもCtrl押下状態を検知して動的に切り替える実装はしていない）。
-  5. 番号/位置系記法（`#3`、`[ABC]`等）はDESIGN/PLAN双方で「v1任意」と明記されており未実装（メモ名/タブ名指定でのジャンプのみ実装）。
-  6. `link:resolveMemo`が解決した`.txtenc`メモは`openMemoDirect`が`memo:read`の`encrypted`を見てM6未対応メッセージを表示するのみ（M6未実装のため、実際の開封フローへの遷移は行わない。既存の`openMemoByName`/`handleJumpToHit`と同じ扱い）。
-- 確認: `npm run typecheck`（renderer/node両方）・`npm run build`（`electron-vite build`、`rm -rf out`後のクリーンビルド）とも成功。実機起動・実際のクリック操作・外部起動の動作検証はtester範囲のため未実施。
-
-## reviewer — M5（リンク機能）実装 静的レビュー（ラウンド1）
-
-対象: M5差分一式（main/ipc/linkHandlers.ts, renderer/editor/links.ts, shared/ipc-contract.ts, preload/index.ts, renderer/ipc.ts, main/ipc/registerIpc.ts, renderer/components/Editor/CodeMirrorEditor.tsx, renderer/App.tsx, renderer/App.css, main/index.ts）。M5-links.md・00-core-principles.md §1/§8/§10/§11・data-model.md と照合。
-
-- 判定: **ブロッキング指摘なし。developer への差し戻し不要。tester へ進行可。**
-- セキュリティ（重点確認）: `link:openExternal` はURLをM0のスキーム許可リスト方式（`ALLOWED_URL_SCHEMES`=http/https/ftp）と同じ考え方で`new URL().protocol`検証してから`shell.openExternal`、`kind`（レンダラの分類）を信用せず実際のスキームで判定するため多層防御になっている。`path`種別は相対パスを`baseTabId`のタブフォルダ絶対パスに`path.resolve`してから`shell.openPath`へ渡しており（生の相対パス文字列を直接渡す実装ではない）、シェル文字列連結・`exec`系は不使用。絶対パス/`..\`によるタブフォルダ外脱出は`path`種別では意図的に許容（DESIGN §2.8が任意ドライブレターパスを想定しており、`shell.openPath`はダブルクリック相当でコマンドライン注入経路にならないため設計と整合）。確認ダイアログをバイパスする経路は無し（`ipc.openExternalLink`/`ipc.resolveMemoLink`の呼び出し元は`handleLinkClick`の1箇所のみで、url/mailto/pathは`linkSettings.confirmBeforeOpen`分岐を必ず経由）。
-- `memo:`解決の閉じ込め: `resolveMemoLink`は`memoName`に対し`validateName`（`/`\`等禁止）を通過させてから`findMemoFile`（`join`）へ渡しており、スラッシュを含む文字列はその時点でnull化されるため、`join`によるフォルダ外脱出は発生しない（`isPathContained`を明示的には呼んでいないが、区切り文字自体を拒否する構成のため実質的に閉じ込め済み。M1-R1-01の多層防御パターンと同等）。
-- developer確認依頼6点はいずれも設計妥当と判断: (1) `LinkResolveMemoResult.memoName`省略可はDESIGN §2.8の`memo:タブ名/`（メモ指定なし）表現に必要な変更で、data-model.mdの表記との齟齬は実装上必須の具体化として許容。(2) エラーコード流用（`NAME_INVALID`/`NOT_FOUND`）は固定enum内での意味的に近い選択で妥当、内部ログにはOSエラー情報を残す`toUnknownResult`/`wrapHandler`の既存パターンも維持されている。(3) 全文正規表現走査は小規模メモ想定で許容範囲（M3-①のCodeMirror拡張の一般的な軽量実装と同水準）。(4) カーソル常時pointerはUX上の軽微な簡略化でブロッキングではない。(5) 番号/位置系記法未実装はPLAN/DESIGN明記の「v1任意」の通り。(6) `.txtenc`メモへの`memo:`リンクはM6未実装のため`openMemoByName`/`handleJumpToHit`と同様のM6対応予定メッセージに留めている。
-- インターフェース整合: `ipc-contract.ts`のPreloadApi.link → preload/index.ts → renderer/ipc.ts → App.tsx/CodeMirrorEditor.tsxの配線は型・チャネル名とも一貫。`AppSettings.links`既定値（`ctrlClick`+`confirmBeforeOpen:true`）はdata-model.mdおよびsettings/appSettings.tsの既定値と一致。
-- 明らかなバグ・タイポ: なし。`main/index.ts`の`setWindowOpenHandler`はコメント更新のみでロジック変更なし（既存のM0-R1-02スキーム許可リストを維持）。
-
-## tester — M5（リンク機能）動作検証（ラウンド1）
-
-対象: reviewer M5 ラウンド1（ブロッキング指摘なし）後の一式。npm install / typecheck / build / prod起動 / 実DOM操作+実CDPマウスイベント（Input.dispatchMouseEvent、Ctrl修飾）+ネイティブ`window.confirm`ダイアログの実際のハンドリング（Page.javascriptDialogOpening/handleJavaScriptDialog）による装飾検出・確認ダイアログ・外部起動・`memo:`遷移・未保存確認ガード・暗号化メモ/存在しないメモの安全な扱い・`confirmBeforeOpen`設定反映・疑似リンク誤検出なしを独立して再現確認。
-
-- **判定: 全項目 OK。不具合なし。developer への差し戻しなし。**
-- npm install: 成功（`up to date, audited 393 packages`。allow-scripts警告のみ）。
-- typecheck: `tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json` エラーなし。
-- build: `rm -rf out && npm run build`（クリーンビルド）成功。`out/main/index.js`(64.30kB)/`out/preload/index.js`(5.39kB)/`out/renderer/assets/index-*.js`(948.64kB)+css を生成確認。
-- prod起動: `--user-data-dir`で隔離したuserDataを使い`electron . --remote-debugging-port=9333`起動。CDP(`Runtime.consoleAPICalled`/`Runtime.exceptionThrown`)で監視した一連の操作（memo:リンク遷移・暗号化メモ/存在しないメモへのリンク・`www.`リンクの外部起動）を通じてコンソールエラー・例外0件。
-- **1. 装飾・視覚ハイライト（実DOM確認）**: URL(`https://example.com/page`)/`mailto:`明示/素のメールアドレス/相対パス(`.\subdir\target.txt`)/絶対パス(`C:\Windows\System32\drivers\etc\hosts`)/`www.`裸リンク/`memo:`記法（名前のみ・タブ名+メモ名・タブ名のみ）のいずれも`.cm-link`スパンとして装飾されることをCodeMirrorのDOM出力から確認。`getComputedStyle`で`text-decoration: underline`・`cursor: pointer`を実機確認。
-- **2. URL/mailtoの確認ダイアログ→実際の外部起動（実CDPマウスイベント, 最重要）**: `Input.dispatchMouseEvent`（`modifiers:2`=Ctrl、既定`openTrigger:ctrlClick`）でURL/mailtoリンクを実クリックし、`ConfirmDialog`（`role="dialog" aria-label="外部を開く確認"`）が正しいラベル（「次のURLを...」「次のメールアドレスを...」「次のパスを...」）で表示されることを確認。キャンセルで何も起きないこと、確認後は`link:openExternal`が呼ばれエラー表示なし（`shell.openExternal`/`shell.openPath`が実際に呼ばれ完了）を確認。**実際にOSの既定ブラウザ（Opera、確認時刻と一致する新規プロセス起動で裏付け）でexample.com/www.example.orgへのタブが開かれたこと、mailto:リンクでも同様にエラーなく完了したことを確認**（副作用は最終報告に明記）。
-- **3. 相対パスリンクの解決（実クリック+IPC直叩き併用）**: `.\subdir\target.txt`をCtrl+クリック→確認ダイアログのメッセージが生の相対パス文字列のまま表示→確認後エラーなし（ダイアログ経由でOSの「アプリの選択」チューザーが実際に開くのを確認、これは対象マシンに`.txt`の既定関連付けが無いための正常なOS側動作でありapp側の不具合ではない。チューザーは検証後に閉じて後片付け済み）。IPC直叩き（`link:openExternal` kind:'path'）でも`baseTabId`未指定時`NAME_INVALID`で正しく拒否されることを確認し、`baseTabId`指定時は`getTabFolderPath`基準の`path.resolve`が働いていることを実際の起動結果から確認。
-- **4. `memo:`リンクでの遷移・未保存確認ガード（実DOM+ネイティブconfirmダイアログの実ハンドリング, 最重要）**: `memo:child`（現在タブ内）/`memo:TabA/child`（タブ名+メモ名、大文字小文字無視で"tabA"タブに一致）/`memo:TabA/`（タブのみ、メモ指定なし）の3パターンをCtrl+クリックで実行し、いずれも実際にタブ切替・該当メモの本文オープン（`.cm-content`の内容一致）を確認。未保存編集ありの状態での遷移は、CDPの`Page.javascriptDialogOpening`/`Page.handleJavaScriptDialog`で実際のネイティブ`window.confirm`ダイアログを捕捉し、キャンセル時は遷移中断（元メモの`*`未保存表示・内容が維持）、OK時は破棄して遷移（新メモが開かれる）ことを、同一タブ内ケース（`dirtyRef`直接ガード）とタブ間ケース（`selectTab`内部ガード）の両方で確認。
-- **5. 存在しないメモ名を指す`memo:`リンク**: `memo:doesnotexist`をCtrl+クリックしても画面上何も変化せず（現在メモのまま）、エラーダイアログ・クラッシュ・コンソール例外いずれも発生しないことを確認（`resolveMemoLink`のnull解決どおり）。
-- **6. `.txtenc`メモへの`memo:`リンク**: `memo:secretenc`をCtrl+クリックすると実際に開封を試みず、ステータスバーに「「secretenc」は暗号化メモのため、開くには M6 の対応が必要です。」を表示するのみで現在メモのまま維持されること（クラッシュなし）を確認。
-- **7. `confirmBeforeOpen:false`設定の反映**: `settings:set`で`links.confirmBeforeOpen:false`に変更後、アプリ再読込（設定はマウント時に一度だけ読み込む設計のため、実運用の再起動相当としてPage.reloadで反映確認）し、Ctrl+クリックで確認ダイアログが一切表示されず直接`link:openExternal`が実行される（エラー表示なし、`.confirm-dialog`要素が存在しない）ことを確認。既定の`openTrigger:ctrlClick`どおり、Ctrl無しの素クリックでは何も起きないこと（誤操作防止）も確認。
-- **8. 疑似壊れリンクの非検出**: `http:/broken`（スラッシュ欠落）・`htt://not-a-real-scheme`（不正スキーム）・`foo:bar not a link`のいずれも`.cm-link`スパンとして装飾されない（=クリック不能）ことをDOM出力で確認。誤検出なし。
-- **9. npm install/typecheck/build/prod起動**: 上記のとおりすべてエラーなし。
-- **[Low/Info] 記録のみ（差し戻し不要、developer/designerの今後の判断に委ねる）: `shell.openPath`が「親フォルダは実在するが対象ファイルが存在しない」パス（例 存在する`subdir`配下の存在しないファイル名）に対し、この検証環境では2分以上応答が返らない（ハング）ことを確認。** 同一環境で親フォルダごと丸ごと存在しないケースは約9秒でエラー文字列を返して正常終了することと対比すると、Windows側のファイル種別解決処理（既定アプリ未関連付け+検証環境のネットワーク制限が疑われる）に起因する可能性が高く、`shell.openPath`呼び出し自体（Electron/OS側API）の挙動であり`linkHandlers.ts`のロジック不備ではない。ただし`openExternalLink`は`shell.openPath`の呼び出しにタイムアウトや存在チェック（`fs.access`等）を挟んでいないため、実運用でも同種の環境（既定アプリ未設定+オフライン等）に当たったユーザーは壊れた相対/絶対パスリンクをクリックした際に無期限に応答なし（エラー表示もされない）に見える可能性がある。DESIGN/PLANはこのケースの明示要件を持たないため致命的とは判断せずブロッキングにはしないが、防御的な事前存在チェックまたは`Promise.race`によるタイムアウトの追加を今後の改善候補として記録する。
-- 後片付け: 検証用一時フォルダ（scratchpad配下、リポジトリ外）・Electron userData（`--user-data-dir`で隔離、リポジトリ外）・検証中に開いたOSの「アプリの選択」チューザーを削除/終了済み。検証後`Get-Process electron`/`Get-Process OpenWith`とも0件を確認。
-- **外部サービスへの副作用（重要・明記）**: 本検証はM5の検証項目（「実際に既定ブラウザ/メールクライアントが起動する(または起動を試みる)こと」）に明示的に含まれていたため、実際に`shell.openExternal`/`shell.openPath`を実行した。結果、ユーザーの実環境で以下が発生した: (1) 既定ブラウザ（Opera）で`https://example.com/page`への新規タブが計2回、`https://www.example.org`への新規タブが1回開かれた（いずれもIANA予約の実在しないプレースホルダ/例示ドメインで、データ送信・課金・実際の通知先は無し）。(2) `mailto:foo@example.com`が既定メールハンドラへ1回渡された（メール送信は行っていない。実際に送信されたメールはない）。(3) 実在するローカルファイル（テスト用相対パスファイル）を開こうとした際、対象マシンに`.txt`の既定アプリ関連付けが無かったため、OS標準の「アプリの選択」チューザーが表示され、検証後にプロセスを終了した（アプリ選択・実行は行っていない）。実運用のAPIキー/Webhook/課金の発生・外部への実データ送信は一切なし。ユーザーの既定ブラウザに新規タブが残っている場合があるため、必要であれば手動で閉じてください。
-
-## developer — M5 tester記録（shell.openPathハング）修正
-
-対象: `src/main/ipc/linkHandlers.ts`（`openExternalLink`のkind='path'分岐）、`src/shared/constants.ts`（`LINK_OPEN_PATH_TIMEOUT_MS`新設）。
-
-- 背景: tester M5検証で「親フォルダは実在するが対象ファイル自体が存在しないパス」を`shell.openPath`に渡すと無期限にハングする事象を記録（差し戻しではなく記録のみ、上記347行目参照）。ユーザー指示によりオーケストレーター経由で修正を依頼された。
-- 修正1（事前存在チェック）: `shell.openPath`呼び出し前に`fs.promises.access(absolutePath)`で存在確認。`ENOENT`なら即座に`err('NOT_FOUND', ...)`を返す（既存のErrorCode enumから流用。`shell.openPath`失敗時に既に使っていた`NOT_FOUND`と同一コードで一貫）。ENOENT以外（権限エラー等）は事前チェックで確定的に弾かず`shell.openPath`側の判断+下記タイムアウトに委ねる。
-- 修正2（タイムアウト安全網）: `shell.openPath(absolutePath)`を新設の`withTimeout`ヘルパー（`Promise.race`相当、対象Promiseはキャンセルできないため単に先着した結果を採用する方式）で包み、`LINK_OPEN_PATH_TIMEOUT_MS`（5000ms、`src/shared/constants.ts`新設）で打ち切る。タイムアウト時は内部ログ（`console.error`、pathとtimeoutMsのみ）を記録した上で`err('UNKNOWN', ...)`を返す。これにより事前チェックをすり抜けるレースやその他の環境依存の遅延でもレンダラ側は最大5秒で応答を受け取れる。
-- 変更なし: `kind='url'`/`kind='mailto'`（`shell.openExternal`経由）は今回のtester記録で問題が確認されていないため対象外、ロジック変更なし。
-- 確認: `npm run typecheck`（renderer/node両方）エラーなし。`rm -rf out && npm run build`成功（`out/main/index.js`65.30kB/`out/preload/index.js`5.39kB/`out/renderer/assets/index-*.js`948.64kB+css）。`--user-data-dir`で隔離したuserDataで`electron . --remote-debugging-port`起動し、CDP経由で`window.api.link.openExternal({kind:'path', raw:<存在しない絶対パス>})`を直叩きしたところ、約1msで`{ok:false, error:{code:'NOT_FOUND', ...}}`が返り、ハングしないことを確認（tester範囲の本格検証は別途）。検証用一時フォルダ・Electronプロセスは後片付け済み、副作用なし。
-- コミット・プッシュは未実施（作業ツリーへの変更のみ、ユーザー指示どおり）。
-
-## reviewer — M5 tester記録（shell.openPathハング）修正確認（ラウンド2）
-
-対象: linkHandlers.ts（kind='path'の事前fs.access存在確認+withTimeoutラップ）, constants.ts（LINK_OPEN_PATH_TIMEOUT_MS=5000）。tester記録（差し戻しではなくInfo記録）への対応の確認であり、ブロッキング指摘への修正ではない。
-
-- 判定: **ブロッキング指摘なし。tester への再検証依頼が可能。**
-- TOCTOUレース窓: fs.access成功後〜shell.openPath呼び出しの間に対象が削除されるレースは残るが、その場合も5秒のwithTimeoutが最終防御として機能し無期限ハングには至らない設計。事前チェックは「大半のケースを即座にNOT_FOUNDで返す」高速化目的、タイムアウトは「すり抜けたレース+その他環境依存遅延」の安全網という役割分担が明確でOK。
-- withTimeoutのPromise.race実装: shell.openPathは1回のみ呼び出されており（timeoutで再実行はしない）二重実行の懸念なし。タイムアウト後もbackgroundのPromiseは残るが、`resolvePromise`は最初の1回のみ有効（JS Promiseの仕様上2回目の解決呼び出しは無視される）ため二重解決のバグは無い。低頻度なリンククリック操作が対象のため、稀にbackgroundで残り続けるPromise自体による実害（メモリ蓄積等）は個人プロジェクト規模で許容範囲。
-- エラーコード流用: 事前チェックのENOENT→NOT_FOUNDはM1（tab:register等の「存在しない親フォルダ」）と同じ用法で一貫。タイムアウト→UNKNOWNも00-core-principles.md §8「予期せぬ例外」の丸め先として妥当（専用コードが無い状況での意味的に近い選択、ラウンド1で承認済みのNOT_FOUND流用方針と同様の判断）。
-- url/mailto経路への影響: kind='url'/'mailto'（shell.openExternal経由）はコード上変更なしを確認。今回の修正はkind='path'分岐にのみ限定されている。
-- ログ出力: タイムアウト時のconsole.errorはpath/timeoutMsのみで機密情報・内部例外詳細の露出なし（該当パスはそもそもResultのpathフィールドとしてもレンダラへ返す情報のため問題なし）。
-- 非ブロッキング留意（Info、対応不要）: (1) withTimeoutのPromise reject分岐がタイムアウトと同一メッセージ「タイムアウト」で丸められるが、shell.openPathは例外を投げない仕様のためこの分岐は実質到達不能な防御的コードであり実害なし。(2) fs.access自体はタイムアウトで保護されていない（ネットワークドライブ等でaccess自体が長時間応答しない場合は5秒の外側で待つ）が、今回tester確認済みの事象（shell.openPath自体のハング）とは別種の理論上の残存ケースであり、致命ではない。
-- M5は tester への再検証依頼が可能と判断。
-
-## tester — M5 tester記録（shell.openPathハング）修正 再検証（ラウンド2）
-
-対象: reviewer ラウンド2（ブロッキング指摘なし）後の linkHandlers.ts（fs.access事前チェック+withTimeout）・constants.ts（LINK_OPEN_PATH_TIMEOUT_MS=5000）。npm run typecheck / npm run build / `--user-data-dir`で隔離したprod起動+CDPによるIPC直叩き・実DOM+実マウスイベント操作で、無期限ハングの解消・正常系回帰・url/mailto回帰・実クリックでのフリーズ有無を再検証。
-
-- **判定: 不具合なし。developer への差し戻しなし。**
-- typecheck: `tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json` エラーなし。
-- build: `rm -rf out && npm run build` 成功（`out/main/index.js`65.30kB/`out/preload/index.js`5.39kB/`out/renderer/assets/index-*.js`948.64kB+css）。
-- prod起動: `--user-data-dir`で隔離したuserDataを使い`electron . --remote-debugging-port=9345`起動。Node組込み`WebSocket`でCDPへ直接接続（`Runtime.evaluate`/`Input.dispatchMouseEvent`/`Page.reload`）し検証。
-- **1. ハング解消の実機確認（最重要）**: `tab:register`で登録した実フォルダ（親フォルダ`subdir`は実在、対象`missing-target.txt`は不存在）に対し`link:openExternal(kind:'path')`をIPC直叩き。ページ内`Date.now()`計測で**約1ms**、CDP呼び出し全体でも約2msで`{ok:false, error:{code:'NOT_FOUND', message:'ファイルが見つかりません: ...'}}`が返り、前回tester確認の「2分以上ハング」が完全に解消していることを確認。
-- **2. 正常系の回帰確認**: 同フォルダ内の実在ファイル（`subdir/exists.txt`）への同IPC呼び出しが約147msで`{ok:true}`を返し、実際にOS既定アプリ（この検証機は`.txt`の既定関連付けがありNotepadが起動）で開かれたことをプロセス一覧（`Notepad`プロセス、ウィンドウタイトル`exists.txt - メモ帳`）で確認。修正が正常系を壊していないことを確認（確認後Notepadプロセスは終了・後片付け済み）。
-- **3. url/mailto回帰確認**: コード差分上`kind='url'/'mailto'`分岐は今回の修正で無変更であることを確認済み（reviewerラウンド2の指摘と一致）。加えて`kind:'url', raw:'javascript:alert(1)'`が引き続き`NAME_INVALID`で拒否されることを実機確認（許可リスト検証ロジックが健全に機能）。さらに正常系1件として`kind:'url', raw:'https://example.com/...'`を実IPC呼び出しし`{ok:true}`+実際に既定ブラウザ（Opera）のタブタイトルが`Example Domain`に変化したことを確認、url経路の回帰なしを確認。
-  - **副作用に関する重要な補足（意図せず発生）**: mailtoの「不正な入力」を確認する目的で`kind:'mailto', raw:'not a valid mailto @@@'`を試したところ、`mailto:`スキームの妥当性チェックは`new URL('mailto:'+raw).protocol==='mailto:'`のみ（アドレス書式自体は検証しない、M0由来の既存設計でM5の今回修正とは無関係）のため`{ok:true}`となり実際に`shell.openExternal`が実行された。この検証機には既定メールクライアントの関連付けが無いため、実際にメールは送信されず、OS標準の「アプリの選択」チューザーが表示されるのみだった（確認後プロセス終了・後片付け済み）。想定外の実行だったため記録するが、メール送信等の実害はなし。
-- **4. 実DOM操作での存在しないファイルへのパスリンククリック（最重要）**: 実際にメモ本文へ`.\subdir\missing-target.txt`を含む内容を保存し、タブ/メモ行の実クリック（`MouseEvent`ディスパッチ）でメモを開き、リンク装飾（`.cm-link`）を実際のCDP `Input.dispatchMouseEvent`（Ctrl+クリック、既定`openTrigger:ctrlClick`）で操作。確認ダイアログ（`外部を開く確認`）表示→「開く」ボタンをクリックすると、約1秒以内にステータスバーへ`外部起動エラー[NOT_FOUND]: ファイルが見つかりません: ...`が表示され、アプリはフリーズせず即座に操作可能な状態を維持することを確認（`window.addEventListener('error'/'unhandledrejection')`のカウンタも0のまま）。ユーザー向けフィードバック（エラー表示）が機能しており、無反応どころか明確なエラーメッセージが出ることを確認。
-- 後片付け: 検証用一時フォルダ・スクリプト（scratchpad配下、リポジトリ外）を削除済み。`--user-data-dir`で隔離したElectronプロセス（PID確認済み）を`Stop-Process`で終了、検証後`Get-Process electron`は0件を確認。誤って開いた「アプリの選択」チューザー・Notepadは検証中に終了済み。
-- **外部サービスへの副作用（明記）**: 実際に`shell.openExternal`/`shell.openPath`を実行した。(1) 既定ブラウザ（Opera）で`https://example.com/m5-round2-regression-check`への新規タブが1回開かれた（IANA予約の実在しないプレースホルダドメイン、データ送信・課金なし）。(2) 上記「意図せず発生」の通り、mailto検証テストが実際に`shell.openExternal('mailto:not a valid mailto @@@')`を実行し、既定メールクライアント未設定のためOS標準の「アプリの選択」チューザーが表示された（実際のメール送信なし、検証後プロセス終了済み）。(3) 実在するローカルファイルをNotepadで開いた（検証後プロセス終了済み）。実運用のAPIキー/Webhook/課金の発生・外部への実データ送信は一切なし。ユーザーの既定ブラウザに新規タブが残っている場合があるため、必要であれば手動で閉じてください。
-
-## reviewer — M6（パスワード暗号化）実装 静的レビュー（ラウンド1）
-
-対象: M6差分一式（main/crypto/{cipher,encFormat,sessionKeyStore}.ts、main/ipc/cryptoHandlers.ts、shared/ipc-contract.ts・constants.ts、preload/index.ts・renderer/ipc.ts、main/ipc/registerIpc.ts・memoHandlers.ts、main/fs/memoFileService.ts、renderer/components/dialogs/PasswordDialog.tsx、renderer/components/Tree/Tree.tsx、renderer/App.tsx・App.css）。M6-crypto.md・00-core-principles.md §1-§11・data-model.md と照合。実行検証はtester範囲のため未実施。
-
-- M6-R1-01 [High] NG: `App.tsx` の `evt:externalChange` 購読（非dirty時の「静かな反映」経路、onExternalChangeハンドラ内、対象メモが暗号化メモかどうかの分岐なし）が、開封中(session鍵あり)かつ未編集の暗号化メモの`.txtenc`が外部変更された場合に`memo:read`を呼んでしまう。`memo:read`は`.txtenc`に対して本文を返さず`contentLF:''`のみ返す仕様（`memoFileService.readMemo`, PLAN §1.4）のため、エディタ表示内容が空文字列で上書きされ、同時に`dirty:false`・`lastKnownHash`も更新されて「保存済みの状態」として扱われてしまう。この直後にユーザーが編集すると、低頻度自動保存や手動保存が実際には空(+新規入力)の内容で`.txtenc`を上書きし、外部で追記されていた実データを消してしまうデータ損失リスクがある。同じ「暗号化メモは`memo:read`で本文取得不可」という制約は、dirty時の競合ダイアログ解決（`handleConflictAdoptExternal`）では`openMemo?.encrypted`分岐でセッション鍵破棄+再オープン誘導として正しく特別扱いされているが、非dirty時の静かな反映経路にはこの分岐が存在せず一貫していない。要修正: `onExternalChange`内で`om.encrypted`の場合は`handleConflictAdoptExternal`と同様に安全側（セッション鍵破棄+メモを閉じて再パスワード入力を促す、または少なくとも本文上書きをせず何もしない）に倒す。
-- M6-R1-02 [Med] 要確認/NG寄り: `cryptoHandlers.ts`の`crypto:changePassword`ハンドラが、パスワード変更成功後に無条件で`setSessionKey`を呼び直す。コード内コメントは「開封中であれば」updateする意図を述べているが、実装は変更前にその(tabId, memoName)のセッションが存在したかどうかを確認せず常に新規セッションを作る。Treeの右クリックメニュー「パスワードを変更」はそのメモが現在開封（エディタで開いている）状態でなくても常に選択可能なため、閉じたまま（一度も`crypto:open`していない）暗号化メモに対してパスワード変更だけ行うと、以後そのメモの復号鍵がメインプロセスのメモリに無期限に残り続ける。UIの「ロック」ボタンは現在開いているメモにしか表示されないため、ユーザー操作でこのセッションを明示的に閉じる手段がない（アプリ終了まで残存）。鍵は引き続きレンダラへは渡らずディスクにも残らないため直ちにセキュリティ不変条件違反ではないが、「鍵の保持は開封中のみ」という設計意図から外れる望ましくない残存。推奨: 変更前に`getSessionKey`が存在した場合のみ`setSessionKey`で更新し、存在しなかった場合は何もしない（呼び出し元に「未開封のまま変更した」ことを示す情報も不要なので変更不要）。
-- 型定義・IPC配線: `ipc-contract.ts`のCrypto*Args/Result、`data-model.md`§3/§4と完全一致。`preload/index.ts`・`renderer/ipc.ts`の6チャネル配線も過不足なし。`SCRYPT_DEFAULTS`(N=32768/r=8/p=1/keyLen=32)・`GCM_IV_LENGTH`(12)・`maxmem`(64MB)はdata-model.md §3の既定と一致。
-- セキュリティ不変条件: 鍵/パスワードはレンダラへ渡さない（`crypto:open`の戻り値は`contentLF`/`eol`/`hash`のみ）、内部ログ(`console.error`)に鍵・パスワード・復号平文の出力なし、`.txtenc`はJSON全体ハッシュで競合判定（hash対象規約§6と一致）、salt流用/IV新規生成（`generateIv()`を`saveEncrypted`/`encryptMemo`/`changePassword`いずれも都度呼び出し）を確認。`scrypt`は`deriveKey`がコールバックAPIをPromiseラップし`await`、`scryptSync`不使用を確認。
-- 平文原本削除の順序: `encryptMemo`が`atomicWrite(encPath)`→（fsync込み）→ `registerSelfWrite`+`fs.unlink(plainPath)`の順で、DESIGN §2.9「`.txtenc`永続化後に削除」を遵守。unlink失敗時は`consumeSelfWrite`で予約解放してrethrowする既存パターンと整合。
-- developer申告事項1-5はいずれも設計判断として妥当（editor:reportActive踏襲のlock前自動保存をrenderer側実装/DECRYPT_FAILEDへのヒント追記/暗号操作後のrefreshOpenMemoAfterCryptoOpによるhash更新/dirty時の構造操作ブロック/crash時平文併存の既知ギャップ）。ギャップ5（reconciliation未実装）はM6-crypto.mdに具体的なモジュール指定が無く、PLAN §8-3の「起動時突合」がどのマイルストーンで実装されるか派生ドキュメント上不明瞭なため、対応要否はdesigner確認事項として残る（M6ブロッキングとはしない）。
-- 判定: M6-R1-01（High）の解消が必要。M6-R1-02（Med）もあわせて修正を推奨。developer へ差し戻し（ラウンド1）。
-
-## developer — M6 指摘修正（ラウンド1 / M6-R1-01・M6-R1-02）
-
-対象: src/renderer/App.tsx（onExternalChange の非dirty「静かな反映」経路に encrypted 分岐を追加）, src/main/ipc/cryptoHandlers.ts（crypto:changePassword が変更前セッション有無を確認してから setSessionKey を呼ぶよう修正）。
-
-- M6-R1-01 対応: `onExternalChange`（unlink以外の変更通知、非dirty時）で `om.encrypted` の場合は `handleConflictAdoptExternal` と同一パターン（`ipc.lockMemo`でセッション鍵破棄→`clearEncryptedAutosaveTimer`→メモを閉じる→「開き直してください」表示）に倒し、`memo:read`（`contentLF:''`固定）での空文字上書きを回避。useEffect の deps に `clearEncryptedAutosaveTimer` を追加。
-- M6-R1-02 対応: `crypto:changePassword` 冒頭（旧鍵導出前）で `getSessionKey(args.tabId, args.memoName) !== undefined` を `hadSessionBeforeChange` として控え、末尾の `setSessionKey` 呼び出しを `if (hadSessionBeforeChange)` でガード。未開封のまま変更した場合は新規セッションを作らない。
-- 確認: `tsc --noEmit`（renderer/node両方）エラーなし、`electron-vite build` 成功。実行検証は tester 範囲のため未実施。
-- reviewer へ再レビュー依頼（2件とも1回目の修正）。
-
-## reviewer — M6 指摘修正確認（ラウンド2 / M6-R1-01・M6-R1-02）
-
-対象: src/renderer/App.tsx（onExternalChange の encrypted 分岐・useEffect deps）, src/main/ipc/cryptoHandlers.ts（changePassword の hadSessionBeforeChange ガード）。
-
-- M6-R1-01 OK（解消）: onExternalChange の非dirty経路に encrypted 分岐を追加し、memo:read を呼ばず lockMemo→clearEncryptedAutosaveTimer→setOpenMemo(null)等→「開き直してください」表示、の順で安全側に倒している。handleConflictAdoptExternal と手順・呼び出し順が一致し一貫性あり。useEffect deps 追加（clearEncryptedAutosaveTimer）は当該関数が useCallback([]) で恒等参照不変のため再購読タイミングへの影響なし。
-- M6-R1-02 OK（解消）: hadSessionBeforeChange を deriveKey 前・全エラー早期return経路より後で取得し、末尾 setSessionKey を同フラグでガード。getSessionKey は Map.get ベースで undefined 判定も妥当。「開封中かつ非dirtyで変更→継続編集」フロー（isOpenAndDirty は dirty のみブロック）は hadSessionBeforeChange=true となり refreshOpenMemoAfterCryptoOp 経由で継続編集可能なことを確認、ロック済みメモへの変更では新規セッションを作らないことも確認。
-- 00-core-principles.md §8/§10（セキュリティ不変条件・外部編集競合/暗号復号失敗の扱い）と整合。新規の副作用・不整合なし。
-- 判定: ブロッキング指摘なし。ラウンド2合格。tester へ進行可（実行検証はtester範囲、本レビューでは未実施）。
-
-## tester — M6（パスワード暗号化）動作検証（ラウンド1）
-
-対象: reviewer M6 ラウンド2（ブロッキング指摘なし）後の一式。npm install / typecheck / build / prod起動 / IPC直叩き+実DOM操作（CDP Runtime.evaluate・Input.dispatchMouseEvent/insertText）による暗号化/開封/保存/パスワード変更/暗号化解除/ロック/低頻度自動保存/誤パスワード/reviewer指摘2件の再現確認を独立して実施。
-
-- **判定: 全項目 OK。不具合なし。developer への差し戻しなし。**
-- npm install: 成功（`up to date, audited 393 packages`。allow-scripts警告のみで動作に支障なし）。
-- typecheck: `tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json` エラーなし。
-- build: `rm -rf out && electron-vite build` 成功。`out/main/index.js`(79.56kB→初回79.56kB相当)/`out/preload/index.js`(6.21kB)/`out/renderer/assets/index-*.js`(967.68kB)+cssを生成確認。1回目の起動でM4tester既知の一過性Rollupモジュール重複事象（`getAppSettings not initialized`の未処理例外でウィンドウ非生成）に再度遭遇したが、`rm -rf out && npm run build`のクリーン再ビルドで即解消（再現後は複数回の操作を通じて再発なし）。コード不具合ではなくビルド成果物の一過性事象と判断（M4ラウンド1で既に同種の記録あり）。
-- prod起動: `--user-data-dir`で隔離したuserDataを使い`electron . --remote-debugging-port=9333`起動（クリーンビルド後）。ログは`DevTools listening`のみでエラーなし。CDP（Node組込み`WebSocket`によるRuntime.evaluate/Input.dispatchMouseEvent/Input.insertText）で操作。
-- **ゴールデンパス（平文→暗号化→パスワード設定→保存→ロック→パスワード入力で復号）**: IPC直叩きで`memo.create`+`memo.save`（平文）→`crypto.encryptMemo`（`.txtenc`生成・`.txt`直接削除をディスクで確認）→`crypto.lock`→`crypto.open`（正しいパスワードで元の内容と完全一致する復号）を確認。実DOM操作でも同フロー（右クリック「パスワードを設定して暗号化」→確認再入力+ヒント入力→ロック🔒アイコン表示→クリックでパスワード入力ダイアログ→開封）を一気通貫で確認。
-- **暗号化メモの編集→低頻度自動保存→ロック→再度開いて内容保持**: CDP実キー入力（`Input.insertText`）でCodeMirrorへ実際に文字追加後、既定デバウンス（5000ms）経過後に自動保存が発火し（ステータスバー「自動保存しました（memo1）」）、ファイルの`mtime`更新も確認。UIの「ロック」ボタンクリック→再度パスワード入力で開封→追記内容が正しく保持されていることを確認。
-- **パスワード変更（開封中）**: `crypto.open`後に`crypto.changePassword`実行→変更直後に新パスワードで`crypto.saveEncrypted`が成功（新鍵でセッション継続）、旧パスワードでの`crypto.open`は`DECRYPT_FAILED`で拒否されることを確認。UIでも右クリック「パスワードを変更」→現在/新規/確認再入力の3フィールド+不一致時のメッセージ表示+送信ボタン非活性化を確認。
-- **パスワード変更（未開封, reviewer指摘M6-R1-02の再現確認, 最重要）**: `crypto.lock`でセッション破棄→**一度も`crypto.open`せず**`crypto.changePassword`をIPC直叩き→変更成功後、**同じく`crypto.open`せず**`crypto.saveEncrypted`を呼ぶと`DECRYPT_FAILED`（「このメモは開封されていません」）で拒否されることを確認。これは修正前なら無条件`setSessionKey`によりセッションが常駐し保存が成立してしまっていたはずの経路であり、**hadSessionBeforeChangeガードが実際に機能し余計なセッションが残らないことを実機で確認**。新パスワードで`crypto.open`すると正しく復号でき、旧パスワードでは`DECRYPT_FAILED`になることも確認。
-- **暗号化解除（`.txtenc`→平文`.txt`）**: 右クリック「暗号化を解除」→パスワード入力→`.txt`生成+内容一致+旧`.txtenc`削除（`.txtenc.bak`のみ残存、中身はJSON=暗号化済みで平文露出なしを確認）をディスクで確認。UI表示も🔒アイコンが📄へ変化し`encoding`/`eol`表示に切り替わることを確認。
-- **誤ったパスワード入力時のエラー表示・ヒント表示**: IPC直叩き（`DECRYPT_FAILED`+`パスワードが違います。（ヒント: ...）`、本文非返却）と実DOM操作（ダイアログ内にエラーメッセージ+ヒントが表示されダイアログは閉じずに再入力可能、続けて正しいパスワードで開封成功）の両方で確認。
-- **外部変更検知時の安全側フォールバック（reviewer指摘M6-R1-01の再現確認, 最重要）**: 実DOM操作で暗号化メモをパスワード入力で開封（未編集=非dirty状態を維持）した状態で、Node `fs`から直接（アプリ外の変更を模して）`.txtenc`のJSONヘッダ（`hint`フィールド）を書き換え。chokidar検知後、`memo:read`（`.txtenc`では`contentLF:''`固定）を呼ばずに**セッション鍵破棄+メモを閉じ**「「memo1」は外部で変更されました。開き直してください。」を表示することを確認。**この間ディスク上の`.txtenc`はアプリによって一切書き換えられていない**（外部変更後の内容がそのまま残存、空文字での上書き無し）ことをディスク上のファイル内容で直接確認。修正前バグ（`memo:read`経由で空文字を「保存済み」として静かに上書き）が再現しないことを実機で裏付けた。再度パスワード入力で開き直すと直前の（編集済みの）正しい内容へ問題なくアクセスできることも確認。
-- **dirtyガード（isOpenAndDirty）**: 暗号化メモを開封し実キー入力で編集（dirty化）した状態で右クリック「パスワードを設定して暗号化」相当の操作（暗号化解除・パスワード変更も同様のガード関数を共有）を試みると、パスワードダイアログを一切表示せず「未保存の変更を保存してから暗号化してください。」等のメッセージのみで中断されることを確認（誤操作によるデータ不整合防止が機能）。
-- **競合検出（`crypto:saveEncrypted`のexpectedHash）**: 開封時取得のhash（旧世代）で`saveEncrypted`を呼ぶと`CONFLICT`（「保存前に外部でメモが変更されています。」）で拒否されることを確認。新IV毎回生成（`saveEncrypted`成功のたびに`savedHash`が変化）も一貫して確認。
-- パスワード設定ダイアログの入力検証: 確認再入力の不一致時にメッセージ表示+送信ボタン`disabled`化、一致後は活性化して送信可能になることを実DOM操作で確認。ヒントは`.txtenc`ヘッダに平文文字列として保存される（DESIGN §2.9通り、UI側に警告文表示あり）ことをファイル直接確認。
-- console/例外チェック: 検証全体を通じて主要操作後にDOM上のエラー表示（`[class*=error]`等）0件を随時確認。メインプロセスの内部ログ（`console.error`）には鍵・パスワード・復号平文の出力なし（1件の`[main] unexpected error`は検証序盤に自作テストスクリプトが`memo:create`へ誤った形状の`position`引数を渡したことによるM6スコープ外の既存`memo:create`実装起因の例外であり、M6コードの不具合ではないことを確認。UI操作（「先頭に追加」「末尾に追加」ボタン）経由の呼び出しには影響なし）。
-- 後片付け: 検証用一時フォルダ・userData（scratchpad配下、リポジトリ外、`--user-data-dir`で隔離）を削除済み。検証後`Get-Process`/`tasklist`でelectronプロセス0件を確認。
-- 外部サービスへの副作用: なし（すべてローカルファイル操作・localhost CDPのみ。実運用のAPIキー/Webhook等は使用していない）。
-
-## developer — M7（仕上げ）実装
-
-対象: M7-polish.md 記載の一式。ステータスバー・設定画面・ショートカット設定・トレイ常駐（最小）・AutoReName・マイグレーション土台・electron-builder ポータブル配布・各種エディタトグル。M0〜M6 は reviewer/tester 合格済みだが作業ツリー上は未コミット。
-
-- 新規: `src/renderer/components/StatusBar/StatusBar.tsx`（文字数/行数/カーソル行:列/選択文字数/フォントサイズ/改行コード/暗号化状態等の表示をコンポーネント切り出し）、`src/renderer/editor/autoRename.ts`（本文の最初の非空行抽出+変化検出、編集停止からのデバウンス発火。暗号化メモは対象外, DESIGN §2.2/§2.9）、`src/shared/shortcuts.ts`（`DEFAULT_SHORTCUTS`・`SHORTCUT_ACTION_LABELS`・`ShortcutAction`型・`formatShortcutFromEvent`）、`src/renderer/components/Settings/SettingsDialog.tsx`（設定画面。外観/エディタ/自動保存/リンク/パスワード/ショートカットの各セクション。永続化は行わず App.tsx の各 `onChange*` へ委譲）、`src/main/util/migrate.ts`（`schemaVersion`/`appVersion` マイグレーション土台、v1のみのため現状 no-op）。
-- 変更: `src/main/settings/appSettings.ts`（`defaultAppSettings`に`shortcuts`/`sessionRememberPassword`追加、`migrateSchema`呼び出し配線）、`src/main/index.ts`（タスクトレイ常駐+表示/非表示トグルの最小実装）、`src/main/fs/metaStore.ts`（マイグレーション呼び出し配線）、`src/renderer/App.tsx`（設定画面呼び出し・各種トグルの状態/永続化配線・AutoReName配線・ショートカット配線）、`src/renderer/editor/codeMirrorSetup.ts`/`eolKeeper.ts`（ショートカット/トグル対応の拡張）、`src/renderer/App.css`（設定画面・ステータスバーのスタイル追加）、`src/shared/models.ts`（`AppSettings.shortcuts`/`sessionRememberPassword`追加）、`electron-builder.yml`（ポータブル配布設定）。
-- developer 確認事項（reviewer/tester申し送り）: `AppSettings.sessionRememberPassword` は設定画面に「セッション内でパスワードを記憶する」トグルとして表示・永続化されるが、実際のセッション鍵保持/破棄ロジック（M6, crypto:lock 経路）には未接続で、値を変更しても実挙動（メモ切替のたびに常にロック）は変化しない設計上のギャップがある。セッション鍵の保持期間を延ばす方向の変更はセキュリティに関わる設計判断のため、M7 では値の保存のみ実装し designer 確認事項として申し送った。
-- 確認: `npm run typecheck`（renderer/node両方）エラーなし、`npm run build`成功。実行検証は tester 範囲のため未実施。
-
-## developer — M7 ユーザー確認事項の反映（sessionRememberPassword 設定項目の削除）
-
-対象: 上記 developer 申し送り事項について、designer への仕様確認を経ずユーザーへ直接確認した結果「この設定項目自体を UI から削除する」方針に決定。以下を修正。
-
-- `src/renderer/components/Settings/SettingsDialog.tsx`: 「パスワード」セクション（「セッション内でパスワードを記憶する」トグルとその既知の制限コメント）を丸ごと削除。`SettingsDialogProps`から`sessionRememberPassword`/`onChangeSessionRememberPassword`を削除。ファイル冒頭コメントの扱い一覧からも除去し、削除理由を追記。
-- `src/renderer/App.tsx`: `sessionRememberPassword` state・`settings:get`結果からの復元・`handleChangeSessionRememberPasswordFromDialog`・`SettingsDialog`への props 渡しを削除。他の editorDefaults/links/autosave/eol/shortcuts/theme の配線には触れていない。
-- `src/shared/models.ts`: `AppSettings.sessionRememberPassword: boolean` フィールドを型定義から削除（未使用設定値を型に残すと将来の混乱の元になるため、設計方針に基づき削除）。他フィールドは変更なし。
-- `src/main/settings/appSettings.ts`: `defaultAppSettings()`の`sessionRememberPassword: true`を削除。`migrateSchema`/`DEFAULT_SHORTCUTS`等の他ロジックは変更なし。
-- 影響範囲確認: `sessionRememberPassword`という識別子はリポジトリ全体で上記4ファイルのみが参照しており、main/ipc層・crypto層・migrate.ts・preload・ipc-contract.tsには元々参照が無かったため、型・デフォルト値・保存/読込ロジックの削除のみで完結（IPC契約やハンドラの変更は不要）。
-- 確認: `npm run typecheck`エラーなし、`npm run build`成功。
-- reviewer へ M7 実装全体（本修正含む）の初回レビューを依頼。
-
-## reviewer — M7（仕上げ）実装 静的レビュー（ラウンド1）
-
-対象: M7差分一式（StatusBar/SettingsDialog新設、autoRename.ts/shortcuts.ts/migrate.ts新設、main/index.ts のトレイ常駐、appSettings.ts/metaStore.ts の migrateSchema配線、App.tsx のAutoReName配線・平文自動保存・設定画面配線・グローバルショートカット、models.ts/electron-builder.yml）。M7-polish.md・00-core-principles.md・data-model.md と照合。実行検証はtester範囲のため未実施。
-
-- M7-R1-01 [Med] NG: `appSettings.ts` の設定読込（`tryReadSettings`）は `isValidAppSettings`（`schemaVersion`/`tabs`/`theme`のみ検査）を通れば既存ファイルをそのままキャッシュし、`defaultAppSettings()` とのマージ（不足フィールドの補完）を一切行わない。本 M7 で `AppSettings.shortcuts` を`schemaVersion`を上げずに新規追加したため、M0〜M6期に生成された既存 `app-settings.json`（`shortcuts`キー無し）を読み込むと `getAppSettings().shortcuts` が `undefined` のまま残る。結果: (1) `App.tsx` 初期化時 `setShortcuts(res.value.shortcuts)` で state が `undefined` になり、グローバルショートカットの `keydown` ハンドラ内 `shortcuts.globalSearch ?? ...` が `undefined` プロパティアクセスで例外化 → 全4種のグローバルショートカット（検索/テーマ切替/設定/ロック）が機能しなくなる。(2) `appSettings.ts` の `deepMerge` は `base`（ここでは `draft.shortcuts`）が `undefined` の場合 `typeof base !== 'object'` 分岐でそのまま `base`（undefined）を返し patch を握りつぶすため、設定画面でショートカットを変更（`settings:set({shortcuts:{action:value}})`）しても永続化されない（再起動で消える）。新規インストールでは`defaultAppSettings()`が`shortcuts`を含むため発生しないが、本milestoneが謳う「schemaVersion/appVersionマイグレーション土台」が実際には最も基本的な後方互換シナリオ（既存設定ファイルへの新フィールド追加）を全くカバーできていないことを示す実例。推奨修正: (a) 設定読込時に`defaultAppSettings()`とのディープマージで不足フィールドを補完してからキャッシュする、(b) `deepMerge`を修正し`base`がundefined/nullでも`patch`オブジェクトを起点にマージするようにする（現状は`base`未定義時にpatch全体を捨ててしまう一般的なバグ）。
-- [Info] 対応不要・参考: トレイ常駐（最小限）により×ボタンでは終了せずhideするだけになったため、ユーザーが誤って2重起動した場合（`requestSingleInstanceLock`未導入、M1以来未実装）に2プロセスが同一タブフォルダのメタJSON/chokidar監視を独立に持つリスクが従来よりも顕在化しやすくなる。M7-polish.mdは単一インスタンス化を要求しておらず、個人プロジェクトの「最小限」スコープを超える堅牢化提案のため今回はブロッキングとしない。将来検討事項として記録のみ。
-- [Info] 対応不要・参考: `sessionRememberPassword`のUI削除・型削除はユーザー直接承認済みだが、正本であるPLAN.md/data-model.md（§4.2のAppSettings例）には同フィールドの記載が残ったまま。designer側でのドキュメント同期を推奨（本レビューの合否には影響しない）。
-- AutoReName（`autoRenameBaseline`変化検出+800msデバウンス+`buildAutoRenameCandidate`のサニタイズ/重複回避）: `computeFirstNonEmptyLine`→`sanitizeCandidate`（`validateNameLive`/`suggestSanitizedName`、fs層`pathSafety.ts`と同じ禁止文字/予約名集合を共有）→ `isNameTaken`(大文字小文字非区別)→重複時ベース名+`" (2)"`以降採番、は`memoFileService.pickAvailableName`の命名規則と一致。最終権威検証は`memo:rename`（`NAME_DUPLICATE`等）がフェイルセーフとして残るためレンダラ側の`existingNames`はベストエフォートでよいとする設計判断も妥当。暗号化メモは`handleEditorChange`の`else`分岐（非encrypted時のみ）でしか`scheduleAutoRename`を呼ばず除外されている。手動リネーム・タブ切替・外部変更反映・暗号化操作後の各箇所で`autoRenameBaselineRef`/タイマーの再設定・クリアが漏れなく行われている。
-- タスクトレイの`isQuitting`状態遷移: トレイ「終了」クリック時と`before-quit`（OS主導終了含む）の両方で`isQuitting=true`を設定後`win.on('close')`のpreventDefault分岐を通らず実際にウィンドウが閉じる、`window-all-closed`→`app.quit()`（二重呼び出しでも無害）→`will-quit`でtray破棄、の順序は矛盾なし。×ボタンでの`hide()`のみ（実際には終了しない）という设计意図も一貫。
-- 平文メモの自動保存（`schedulePlainAutosave`/`performPlainAutosave`）とM2の破棄確認ダイアログ（`requestCloseCurrentMemo`内`window.confirm`）: 自動保存はdirty時のみ・conflict解決中はロック・保存成功時`dirty:false`+`reportActiveMemo`更新という暗号化メモの既存パターン（M6）と対称的に実装されており、タブ切替/クローズ時は引き続き`window.confirm`が安全網として機能する（自動保存が普段dirtyを解消しておりダイアログが出る頻度は下がるが、デバウンス中の未保存編集は引き続き確認対象になり矛盾はない）。開発者申告事項1の通り「全面自動保存への置き換えはしていない」は実装と一致。
-- IPC/型整合: `settings:get`/`settings:set`/`app:getInfo`のIPCチャネル自体はM0/M1から不変。`AppSettings.shortcuts: Record<string,string>`はdata-model.md記載通りmodels.tsに反映済み。
-- セキュリティ: 新規コード（migrate.ts/shortcuts.ts/autoRename.ts/StatusBar/SettingsDialog/トレイ）に鍵・パスワード・復号平文のハードコード/ログ出力なし。`console.error`はエラーオブジェクト（code/message）のみで内部情報の露出なし。preload/contextIsolation/sandbox設定は変更なし。
-- 判定: M7-R1-01（Med）の解消が必要。developer へ差し戻し（これは指摘M7-R1-01に対する1回目の修正依頼）。
-
-## developer — M7-R1-01 修正（1回目）
-
-対象: `src/main/settings/appSettings.ts`（`tryReadSettings`・`deepMerge`）。
-
-- `tryReadSettings`: `isValidAppSettings`通過後、`migrateSchema`適用結果を`defaultAppSettings()`と`deepMerge`してからキャッシュ/返却するよう変更（推奨修正(a)）。schemaVersionを上げずに追加したフィールド（`shortcuts`等）が既存ファイルに無くても既定値で補完される。
-- `deepMerge`: `base`が`undefined`/`null`/非オブジェクトでも`patch`オブジェクトを起点にマージするよう根本修正（推奨修正(b)）。`patch`が非オブジェクトの場合はそのまま値を採用する分岐を先頭に追加し、`base`側は「オブジェクトなら展開、それ以外は空オブジェクトから開始」に変更。`settings:set`の他フィールド（`shortcuts`以外）でも同種の握りつぶしが起きうる根本原因を解消。
-- 確認: `npm run typecheck`・`npm run build`とも成功。
-- reviewer へ再レビュー依頼（指摘M7-R1-01に対する1回目の修正）。
-
-## reviewer — M7-R1-01 再修正確認（ラウンド2）
-
-対象: `src/main/settings/appSettings.ts`（`tryReadSettings`のdeepMerge組込み、`deepMerge`本体の`base`未定義時ハンドリング修正）。
-
-- M7-R1-01 OK（解消）: `tryReadSettings`が`migrateSchema`適用後に`defaultAppSettings()`との`deepMerge`を経てからキャッシュ/返却するようになり、既存`app-settings.json`に`shortcuts`キーが無くても（patch側にキー自体が存在しないため走査対象にならず）base=defaultの値がそのまま残ることを確認。グローバルショートカット4種の`undefined`起因の例外は解消。`deepMerge`の`base`未定義時分岐修正（`patch`が非オブジェクトならそのまま返す／それ以外は`base`がオブジェクトなら展開、非オブジェクトなら空オブジェクトから開始）もトレース確認し、`settings:set({shortcuts:{action:value}})`のような単一キーパッチが握りつぶされず`draft.shortcuts`の該当キーのみ更新・他キー維持されることを確認。
-- 副作用確認: 配列フィールド（`tabs`等）は`Array.isArray`分岐により従来通り全体置換（deep mergeされない）で変更なし。ただし`tabs`/`window`は`tabService.ts`等が`updateAppSettings`の直接mutatorで書き換えており、`deepMerge`/`patchAppSettings`経路自体を通らないため今回の変更の影響対象外。`editorDefaults`/`links`/`autosave`/`eol`等のネストしたオブジェクトフィールドは全て同じ再帰ロジックを通り、部分更新時に未指定キーがbase（既存値）から維持されることを確認。既存の他フィールドへの意図しない副作用は確認できず。
-- docs/00-core-principles.md § Result型/エラーハンドリング表との整合: `tryReadSettings`はdeepMerge追加後も例外はtry/catchで捕捉しnullを返す既存の破損復旧カスケードに合流するのみで、Result型規約やIPC境界のエラーハンドリング方針に変更・逸脱なし。
-- 判定: ブロッキング指摘なし。M7-R1-01は解消。ラウンド2として合格。tester へ進行可。
-
-## tester — M7（仕上げ）動作検証（ラウンド1）
-
-対象: reviewer M7-R1-01 ラウンド2 OK後の一式。npm install / typecheck / build / prod起動（`--user-data-dir`で隔離）/ CDP実機操作（Runtime.evaluate・Input.dispatchKeyEvent・Page.javascriptDialogOpening）+ Win32 API（PostMessage/ShowWindow/IsWindowVisible）によるネイティブウィンドウ操作を独立して再現確認。
-
-- 判定: **軽微な情報提供1件を記録のみで報告（差し戻し不要）。それ以外は全項目OK。developer への差し戻しなし。**
-- npm install: 成功（`up to date, audited 393 packages`。allow-scripts警告のみ）。
-- typecheck: `tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json` エラーなし。
-- build: `electron-vite build` 成功。`out/main/index.js`(82.01kB)/`out/preload/index.js`(6.21kB)/`out/renderer/assets/index-*.js`(992.25kB)を生成確認。
-- **M7-R1-01（reviewer最重点指摘）の再現確認**: `shortcuts`キーの無い旧形式`app-settings.json`（M0〜M6期を模した`schemaVersion:1`、`tabs`/`window`/`theme`/`editorDefaults`/`autosave`/`links`/`encoding`/`eol`のみ）を手動生成し読み込ませた。結果、`settings:get`で`shortcuts`が`DEFAULT_SHORTCUTS`（`Ctrl+Shift+F`/`Ctrl+Shift+T`/`Ctrl+Shift+L`/`Ctrl+,`）で補完されていることを確認。実キー入力（`Input.dispatchKeyEvent`）でグローバルショートカット4種（全文検索起動=Ctrl+Shift+F相当→検索パネル表示、テーマ切替=Ctrl+Shift+T→`data-theme`属性変化、設定画面=Ctrl+,→設定ダイアログ表示、ロック=Ctrl+Shift+L→暗号化メモの実ロック+ステータスバー通知）が全て`undefined`起因の例外なく動作することを確認。設定画面でショートカット（globalSearchをCtrl+Alt+Gへ変更）を実DOM操作で変更→`app-settings.json`に他フィールドを保ったまま該当キーのみ反映→electronプロセスを`Stop-Process -Force`で終了→同一`--user-data-dir`で再起動→`settings:get`で変更後の値が維持され、かつ変更後のCtrl+Alt+Gで実際に検索パネルが開くことを確認（reviewer指摘の両症状=グローバルショートカット全滅・設定変更の握りつぶし、がいずれも再発しないことを実機確認）。
-- **設定画面・各種設定の永続化**: テーマ（トグル）、エディタ既定（折り返しchars/タブ幅8/ソフトタブOFF/行番号OFF/フォントサイズ18、うちwrap/softTabは実DOM操作で変更）、自動保存（plain 2500ms/encrypted 9000ms）、リンク（singleClick/確認なし）、改行コード（crlf）、ショートカットを変更し、electronプロセスを完全終了→同一userDataで再起動後、`settings:get`で全フィールドが変更後の値のまま維持されることを確認。`editorDefaults`のように複数回（IPC直叩き→UI操作）にまたがる部分更新でも他キーを握りつぶさず個別キーごとに正しくマージされることも確認（deepMergeのキー単位マージ動作の副次確認）。
-- **AutoReName**: 新規メモ作成→本文の最初の非空行を入力→800ms超のデバウンス後にツリー・エディタタイトル・実ファイル名（`.txt`）が追随してリネームされることを実DOM操作+ディスク確認で確認。禁止文字を含む先頭行（`Bad:Name?Test`）→`Bad_Name_Test`へサニタイズされてリネームされることを確認。既存メモと同名になる先頭行（`memo1`）→`memo1 (2)`へ自動採番されることを確認（いずれも実ファイル生成をディスクで確認）。**暗号化メモ（`.txtenc`）除外**: 暗号化メモを開き先頭行を編集→暗号化用autosave debounce（既定5000ms）超の待機後も名前が変化せず、実ファイルも`enc-test.txtenc`のまま維持されることを確認（AutoReName対象外の仕様通り）。
-- **平文メモの自動保存 + 既存の破棄確認ダイアログ**: 平文メモ編集後、放置（plainDebounceMs=1500ms超）で自動的にdirty解消・実ファイルへ反映されることを確認。デバウンス完了前に別メモへ切替を試みると`window.confirm`（「未保存の変更があります。破棄して別のメモを開きますか？」）が実際に表示され、`Page.handleJavaScriptDialog`でキャンセル時は編集内容を保持したまま同一メモに留まり、承諾時は編集を破棄して切替わることを確認（自動保存導入後もダイアログが matching タイミングで機能することを確認）。
-- **タスクトレイ（ネイティブOS操作での検証）**: Win32 API（`PostMessage`で実際の`WM_CLOSE`メッセージをメインウィンドウへ送信=物理的な×ボタンクリックと同一の通知経路）を送信した結果、`IsWindowVisible`が`True→False`に変化（ウィンドウは破棄されず非表示化）、プロセス数は変化なし（クラッシュ・終了なし）、Chromiumの`document.visibilityState`も`hidden`に変化しCDPセッションは生存し続けることを確認（×ボタンでhideのみ・実際には終了しない、という設計通りの挙動を実ネイティブメッセージで確認）。`ShowWindow`(`SW_SHOW`)で`IsWindowVisible`が`True`に戻ることも確認（トレイ「表示/非表示」相当のOSレベルの可視性反転自体は正常）。トレイコンテキストメニュー「終了」の物理クリック自体は本サンドボックス環境にシステムトレイ操作用のUIオートメーションツールが無く自動化できなかったため未実施（`isQuitting`フラグ＋`app.quit()`のロジックはreviewerラウンド1/2の静的解析と一致するコードのままで変更なし）。
-- **[Info] 記録のみ・ブロッキング対象外: レンダラから`window.close()`（JS API）を直接呼ぶと即座にアプリ全体が終了する（トレイのhide経由にならない）。** ネイティブの`WM_CLOSE`（物理×ボタン/Alt+F4相当）経由では正しくhideされる（上記で確認済み）のに対し、CDP経由で`window.close()`を明示的に呼び出すと`before-quit`を経由せずプロセスが即終了する挙動を確認（要因は未特定、Electron/Chromiumの`window.close()`実装の内部差異の可能性）。ただし`grep`で確認した限り`src/renderer`配下のどのコードも`window.close()`を呼び出しておらず、通常のユーザー操作（×ボタンクリック・Alt+F4）・既存のアプリコードのいずれからも到達しない経路のため、現行コードに対するリグレッションではない。将来何らかの理由でレンダラから`window.close()`を呼ぶコードが追加された場合にhideされず終了してしまう点にのみ留意（対応不要、記録のみ）。
-- console/例外チェック: 上記一連の操作を通してCDP `Runtime.consoleAPICalled`(error)/`Runtime.exceptionThrown`を監視し0件。electronプロセスの標準出力ログにも`Network service crashed, restarting service.`という無害なChromium基盤ログ以外にエラー行なし。
-- 後片付け: 検証用一時フォルダ複数（scratchpad配下、リポジトリ外）・Electron userData（`--user-data-dir`で隔離、リポジトリ外）を削除済み。検証後`Get-Process electron`は0件を確認（複数回の起動・強制終了サイクルを通じて確認）。
-- 外部サービスへの副作用: なし（すべてローカルファイル操作・localhost CDP・ローカルWin32 APIのみ。実運用のAPIキー/Webhook等は使用していない）。
+## reviewer — M9b（ノードロック応用②: 境界を跨ぐ移動・コピー）実装 静的レビュー（初回）
+
+対象: M9b差分一式（memoHandlers.ts の `handleLockBoundaryMove`/`moveWithinSession`/`moveIntoSession`/`containsLockedDescendant`、nodeLock.ts の export化+`deleteConvertedSourceFile`抽出、shared/models.ts・ipc-contract.ts、treeView.ts の `isLockBoundaryMoveAllowed`/`MemoDragPayload.srcLockToken`、TreeRow.tsx の `canAcceptDrop`、Tree.tsx/App.tsxのD&D配線）。M9b-node-lock-boundary-move.md・PLANv3 §5.4/§7.5・DESIGNv3 §1.12・00-core-principles.mdと照合。
+
+- M9b-R1-01（Med-High、要修正）: `nodeLocked`（未解除・セッション無しの🔒プレースホルダ）行は、トップレベル（`metaStore.reconcile`）・セッション内入れ子（`nodeLockSessionStore.buildSessionTreeNodes`）のいずれも意図的に`lockToken`を付与しない（M9a由来、「このセッションの一部として直接編集可能ではない」ことを示す既存の意味）。ところがM9bはこの同じ`lockToken`を新設の`srcLockToken`ドラッグ起点ヒントとして再利用しており（`isLockBoundaryMoveAllowed`/`handleDropMemoOnTab`）、`nodeLocked`行からのドラッグは常に`srcLockToken===undefined`＝「通常領域からのドラッグ」と誤認される。具体的な実害2点:
+  (a) 回帰: セッション内の入れ子ロック済みプレースホルダを同一セッション内で並べ替える操作（Tree.tsx既存コメント「プレースホルダ自身の並び替えまでは制限しない」で許可されているはず）が、新設の`if (anchorLockToken && !srcLockToken)`分岐（外→内ルート）に先に捕捉されてしまい、`moveIntoSession`がトップレベルのディスクメタ内を探して見つからず`NOT_FOUND`で失敗する（本来`moveWithinSession`経由で成功すべき操作の回帰）。
+  (b) 抜け穴: トップレベルの`nodeLocked`（セッション無し）プレースホルダをTabBarへドラッグしてクロスタブ移動すると、`handleDropMemoOnTab`の`if (payload.srcLockToken)`ガードが素通り（`srcLockToken`がundefinedのため）し、`srcLockContext`/`destLockContext`なしの素の v1 `memo:move` へ進む。素のv1パスは移動対象自体が`.lock`保有かを一切チェックしないため、パスワード入力なしで暗号化済みサブツリー一式が別タブのフォルダへ物理移動できてしまう。DESIGNv3 §1.1「ロック中はあらゆる構造変更操作を禁止」（タブ間移動も構造変更の一種）に反する。milestone doc冒頭は「ロック中(セッション無し)は…対象を選択できない」と想定しているが、実際は`Tree.tsx`の`handleRowClick`（`nodeLocked`でも`selectSingle`/`toggleSelection`は無条件実行）・`TreeRow.tsx`（`draggable`/`onDragStart`が`nodeLocked`で無条件）により選択・ドラッグ自体は可能なため、この前提は成立していない。
+  再現手順の要点: ①セッションを解除し、内部に入れ子ロック済み(🔒)ノードが見える状態でその🔒行をドラッグし同セッション内の別位置へドロップ→NOT_FOUND。②タブ直下の未解除🔒ノードをドラッグし、TabBarの別タブへドロップ→パスワード入力なしで物理移動が成立する。
+  milestoneの最重要確認項目（レンダラ/IPC双方での二重防御）が、この「未解除ロック中ノード」という起点種別に対しては実質的に機能していないため、developer側で対応方針（`nodeLocked`行のドラッグ開始自体を抑止する／`lockToken`とは別に「ロック中フラグ」をドラッグペイロード・各ガードに伝搬する等）を検討し修正すること。
+- 判定: M9b-R1-01（1件、Med-High）の解消が必要。developer へ差し戻し（これは指摘M9b-R1-01に対する1回目の依頼）。
+
+## developer — M9b-R1-01 対応（1回目の修正）
+
+対象: `src/main/crypto/nodeLockSessionStore.ts`（`buildSessionTreeNodes`）、`src/shared/models.ts`（`TreeNode.lockToken` doc）、`src/renderer/components/Tree/treeView.ts`（`MemoDragPayload.srcNodeLocked`新設）、`src/renderer/components/Tree/Tree.tsx`（`handleDragStart`にnodeLocked引数追加・呼び出し元更新）、`src/renderer/App.tsx`（`handleDropMemoOnTab`のガード拡張）、`src/main/ipc/memoHandlers.ts`（plain v1 `memo:move`にクロスタブ`.lock`保有ノード拒否チェック追加）。
+
+- **根本原因への対処（(a)回帰の解消）**: `buildSessionTreeNodes`の入れ子`nodeLocked`プレースホルダに、他の兄弟ノードと同じくそのセッションの`lockToken`を付与するよう変更（従来は意図的に付与しなかった）。これにより`isLockBoundaryMoveAllowed`/`findTreeNodeInScope`/`insertTreeNodeAtInScope`等の既存スコープ判定インフラがこのプレースホルダも正しく「同一セッション内」として扱えるようになり、`App.tsx handleLocalMove`の「外→内」分岐(`anchorLockToken && !srcLockToken`)を誤って通らず、既存の「セッション内`tree:updateStructure`」分岐（`moveWithinSession`相当のバックエンド`updateStructureInSession`。`reattachLocks`による`.lock`再付与ロジックは元々このケースを想定済みで無変更）へ正しく到達するようになった（机上トレースで確認、バックエンド側の変更は不要だった）。`TreeNode.lockToken`のdocコメント本来の意味「起点＋子孫全て」（models.ts）にも合致するため、ハック的な特例ではなく本来あるべき挙動への是正と判断。
+  - **副次的な安全性向上（意図した変更ではないが波及効果として確認）**: 同じ理由で、入れ子`nodeLocked`プレースホルダを右クリック→「削除」した際に渡される`lockToken`ヒントも正しくセッショントークンになる。これにより削除リクエストが（従来のバグでは誤って素のv1 `memo:delete`経由で実ファイルを直接削除してしまっていたところ）正しく`deleteMemosInSession`へルーティングされ、既存のM9a-R1-01ガード（`NAME_INVALID`で明示的に拒否）が効くようになった。「セッション内で気付かれずに実ファイルを直接削除し孤児化させる」という、より危険な経路が閉じたための挙動変化であり、退行ではなく修正の一部として報告する。
+- **(b)抜け穴の解消（多層防御）**:
+  - レンダラ: `MemoDragPayload`に`srcNodeLocked?: boolean`を新設（ドラッグ元行自身が`nodeLocked`かどうか。`srcLockToken`が「ロック解除セッション配下か」しか表せず、トップレベルの`nodeLocked`（セッション自体が存在しない）を区別できないための独立フラグ）。`Tree.tsx handleDragStart`で`row.nodeLocked`をpayloadへ含め、`App.tsx handleDropMemoOnTab`のガードを`if (payload.srcLockToken || payload.srcNodeLocked)`へ拡張（レンダラの事前拒否）。
+  - IPC側: `memoHandlers.ts`のplain v1 `memo:move`（`srcLockContext`/`destLockContext`とも無指定の経路。M9bで新設した`handleLockBoundaryMove`はこの経路を素通りにしていたため、ここには`.lock`保有チェックが元々無かった）に、タブをまたぐ場合のみ`findNode(srcLoaded.metaTree, name).node.lock`を検査し、1件でも該当すれば`LOCK_BOUNDARY_VIOLATION`で拒否する再検証を追加。同一タブ内の並べ替え・コピー（ロック対象の中身に触れない外側の位置変更、Tree.tsx `clampZoneForLockedTarget`のコメントと同じ扱い）は対象外とし、既存の「ロック済みノード自体の並び替えは許可」という設計判断を壊さないよう限定した。
+  - これで milestone doc の「レンダラの事前拒否とIPC側の再検証、両方の防御」が`nodeLocked`起点のケースにも成立する。
+- 確認: `npx tsc --noEmit -p tsconfig.json`・`npx tsc --noEmit -p tsconfig.node.json`いずれもエラーなし。`npx electron-vite build`成功（`out/main/index.js` 127.97kB / `out/preload/index.js` 9.08kB / `out/renderer/assets/index-*.js` 1,026.23kB）。実行時動作検証は未実施（tester範囲）。
+- reviewerへ、これは指摘M9b-R1-01に対する1回目の修正である旨を明記して再レビューを依頼する。コミット・プッシュは行っていない。
+
+## reviewer — M9b-R1-01 修正確認（ラウンド2）+ 新規指摘2件
+
+対象: `nodeLockSessionStore.ts`(`buildSessionTreeNodes`)、`shared/models.ts`(`TreeNode.lockToken`doc)、`treeView.ts`(`srcNodeLocked`)、`Tree.tsx`(`handleDragStart`)、`App.tsx`(`handleDropMemoOnTab`)、`memoHandlers.ts`(plain v1 `memo:move`のクロスタブ`.lock`チェック)を中心に、周辺の`moveWithinSession`/`cloneSubtreeWithUniqueNames`/scopeベースの各treeViewヘルパーまで含めて確認。
+
+- M9b-R1-01(a)(b) OK（解消）: (a)は`buildSessionTreeNodes`が兄弟と同じ`lockToken`を入れ子`nodeLocked`にも付与するようになり、`App.tsx handleLocalMove`の「外→内」誤判定分岐を通らず正しく`moveWithinSession`側へ到達することを机上トレースで確認。(b)は`srcNodeLocked`フラグ新設によりレンダラの`handleDropMemoOnTab`が未解除ロックプレースホルダ自身のクロスタブ移動を拒否、IPC側`memo:move`もタブを跨ぐ場合`topLevelNames`自身の`.lock`を検査し`LOCK_BOUNDARY_VIOLATION`で拒否することを確認。`findTreeNodeInScope`/`insertTreeNodeAtInScope`/`removeTreeNodesByNamesInScope`/`updateTreeNodeInScope`/`findSessionRootNode`/`collapseSessionToPlaceholder`はいずれも`n.lockToken===scopeLockToken`一致判定のみでnodeLockedの子孫を特別扱いしておらず、lockToken伝播変更による副作用なし。React key(`${row.lockToken??''}:${row.memoName}`)も一意性に問題なし。副次効果（削除誤ルーティングの是正）も`deleteMemosInSession`の既存M9a-R1-01ガード（`collectLockedNodesByName`+`NAME_INVALID`）に正しく合流することを確認、悪影響なし。
+- M9b-R2-01（新規, Med-High）NG: developerが追加した plain v1 `memo:move`のクロスタブ`.lock`チェック（memoHandlers.ts ~1139-1146）は`topLevelNames`（＝ユーザーが直接選択したノード自身）の`.lock`のみを検査し、子孫はスキャンしない。M8の個別ロックはセッション無しでも任意の子ノードに掛けられるため、「ロックされていない通常フォルダの中に、（未選択の）個別ロック済みの子が入れ子で存在する」状態は容易に作れる。この状態でそのフォルダ自身をクロスタブへドラッグ（またはTabBarへドロップ）すると、レンダラ側`handleDropMemoOnTab`の`payload.srcLockToken||payload.srcNodeLocked`もフォルダ自身の値しか見ないため素通りし、IPC側の新チェックも`topLevelNames`のみ検査のため素通りし、未解除・パスワード未入力のロック済み子がそのまま別タブへ物理移動してしまう（DESIGNv3 §1.1「ロック中はあらゆる構造変更操作を禁止」違反、R1-01(b)と同カテゴリの抜け穴が選択ノード自身以外の入れ子経路に残存）。同ファイル内の`moveWithinSession`(コピー分岐)や`moveIntoSession`は`containsLockedDescendant`/`readSubtreeMember`で部分木全体を走査しており、この新チェックだけ浅い（非再帰）確認になっている非対称も傍証。対応: `collectLockedNodesByName(srcLoaded.metaTree)`等を使い`topLevelNames`各々の部分木（`collectSubtreeNames`）全体に`.lock`保有ノードが無いか検査するよう拡張を推奨。
+- M9b-R2-02（新規, High、M9bより前から存在する可能性が高い潜在バグ）NG: plain v1 `memo:move`のコピー分岐（同一タブのCtrl+ドラッグ複製・クロスタブコピー両方が共通で通る、`sameTab`分岐なし）が使う`cloneSubtreeWithUniqueNames`（memoHandlers.ts ~427-441）の`walk`関数は返却オブジェクトに`memoName/expanded/label/editor/children`のみを詰めており`MetaTreeNode.lock`フィールドをコピーしていない。選択範囲に個別ロック済みの子孫が含まれる場合、複製先ノードは`.lock`を失った「一見ただの空ノード」になる一方、物理ファイルは新しいトークン名でそのまま複製される（`allRenames`が全ノードに一律rename/copyを発行するため）ため、メタと実ファイルが食い違う破損コピーが生成される。姉妹関数の`moveWithinSession`コピー分岐は全く同じ危険性に対し`containsLockedDescendant`で書込み前に`LOCK_CONTAINS_ENCRYPTED`拒否するガードを既に持っているが、plain v1側の同名関数の呼び出し箇所（~1239付近）にはこのガードが無い。M8で`.lock`フィールド導入時からこの関数が更新されていない可能性が高く、M9b固有の新規回帰ではなく既存の潜在バグと思われるが、本ラウンドで監査した同一コード領域・同一脆弱性クラスのため報告する。対応: plain v1のコピー分岐（同一タブ・クロスタブとも）にも`moveWithinSession`と同じ`containsLockedDescendant`チェックを追加し書込み前に拒否することを推奨。
+- 判定: M9b-R1-01自体は解消（3回目の依頼は不要）。ただし新規指摘M9b-R2-01・M9b-R2-02（いずれも1回目）をdeveloperへ差し戻す。
+
+## developer — M9b-R2-01・M9b-R2-02 対応（いずれも1回目の修正）
+
+対象: `src/main/ipc/memoHandlers.ts`（plain v1 `memo:move`ハンドラのみ。既存ヘルパー`collectLockedNodesByName`/`containsLockedDescendant`/`findNode`を再利用、新規ヘルパー追加なし）。
+
+- **M9b-R2-01（クロスタブ`.lock`チェックの非再帰性）**: `!sameTab`分岐の`.lock`保有チェック（旧: `topLevelNames`自身の`loc.node.lock`のみ判定）を、`moveWithinSession`のコピー分岐と同じパターン（`collectLockedNodesByName(srcLoaded.metaTree)`+`containsLockedDescendant(loc.node, lockedByName)`）に置き換え、選択ノード自身だけでなく部分木全体（未選択の入れ子子孫を含む）にロック済みノードが1件でもあれば`LOCK_BOUNDARY_VIOLATION`で拒否するよう拡張。move/copy共通の分岐（現行コードの位置のまま）なので両方に効く。
+- **M9b-R2-02（コピー時の入れ子ロックメタ情報消失）**: plain v1のコピー分岐（`args.copy===true`、同一タブCtrl+ドラッグ複製・クロスタブコピー共通）の`cloneSubtreeWithUniqueNames`呼び出し直前に、`moveWithinSession`コピー分岐と同一の`containsLockedDescendant`チェックを追加。該当すれば書込み前（クローン・ファイルコピー前）に`LOCK_CONTAINS_ENCRYPTED`で拒否。クロスタブコピーはR2-01修正後の`LOCK_BOUNDARY_VIOLATION`チェックで既に弾かれるため、この追加チェックは主に同一タブ内コピー（Ctrl+ドラッグ複製）を保護する（クロスタブでも二重に安全網として機能、実害なし）。
+- `cloneSubtreeWithUniqueNames`自体（`.lock`フィールドを引き継がない実装）は変更せず、呼び出し前のガードで防ぐ方針とした（`moveWithinSession`と同じ設計判断に合わせるため）。
+- 確認: `npx tsc --noEmit -p tsconfig.json`・`npx tsc --noEmit -p tsconfig.node.json`いずれもエラーなし。`npx electron-vite build`成功（`out/main/index.js` 128.45kB / `out/preload/index.js` 9.08kB / `out/renderer/assets/index-*.js` 1,026.23kB）。実行時動作検証は未実施（tester範囲）。
+- reviewerへ、これはM9b-R2-01・M9b-R2-02に対する1回目の修正である旨を明記して再レビューを依頼する。コミット・プッシュは行っていない。
+
+## reviewer — M9b-R2-01・M9b-R2-02 修正確認（ラウンド1）
+
+対象: `memoHandlers.ts`の`memo:move`ハンドラ差分（`!sameTab`分岐の`.lock`チェック置き換え・コピー分岐への新規チェック追加）を中心に、`collectLockedNodesByName`/`containsLockedDescendant`/`findNode`/`hasSelectedAncestor`の定義、`moveWithinSession`/`moveIntoSession`/`handleLockBoundaryMove`への副作用有無を確認。
+
+- M9b-R2-01 OK（解消）: `!sameTab`分岐の`.lock`チェックが`collectLockedNodesByName(srcLoaded.metaTree)`（ツリー全体を再帰走査してロック済みノードをmemoName→ノードのMapに収集）+`containsLockedDescendant(loc.node, lockedByName)`（ノード自身と全子孫を再帰走査）に置き換わり、`topLevelNames`各々の部分木全体を検査するようになったことを確認。move/copy共通の位置（`if (!args.copy)`より前）にあるため両方に効く。`hasSelectedAncestor`によりtopLevelNamesは選択範囲の「根」のみだが、containsLockedDescendantが根から全子孫を辿るため未選択の入れ子ロック済み子孫も漏れなく検出できる。
+- M9b-R2-02 OK（解消）: コピー分岐（`cloneSubtreeWithUniqueNames`呼び出しの直前、クローン・ファイルコピーいずれの書込みより前）に`moveWithinSession`コピー分岐と同一パターンの`containsLockedDescendant`チェックが追加され、該当時`LOCK_CONTAINS_ENCRYPTED`（`srcFolder.value`をpath引数、`err()`のシグネチャと整合）で拒否することを確認。書込み前ガードという要求を満たす。クロスタブコピーはR2-01修正の`LOCK_BOUNDARY_VIOLATION`で先に弾かれ、同一タブ内コピー（Ctrl+ドラッグ複製）はこの新規チェックで保護される。
+- 副作用確認: M9b-R1-01(a)(b)関連のコメント・ロジック（1129-1138行目付近の`srcNodeLocked`起点の既存チェック）はテキスト差し替えなく維持。`moveWithinSession`・`moveIntoSession`・`handleLockBoundaryMove`のコードは今回未変更で、悪影響なし。
+- 確認方法: 静的コードレビューのみ（`tsc`/`build`は前回developer報告済みの範囲を確認、再実行はしていない）。
+- 判定: 指摘なし。M9b-R2-01・M9b-R2-02とも解消。developerからtesterへの動作確認依頼を進めてよい。
+
+## tester — M9b（ノードロック応用②: 境界を跨ぐ移動・コピー）動作検証（ラウンド1・実UI操作）
+
+対象: reviewer M9b-R2-01/R2-02 ラウンド1 OK後の一式。`--user-data-dir`はこのアプリに効かないため（AGENT_LOG既記載(A)参照）、`out/`とビルド用最小`package.json`をリポジトリ直下の一時ディレクトリ`.tmp-tester-app/`（検証後削除済み）へコピーし`electron .tmp-tester-app`という位置引数形式で起動（本セッションのシェルは`ELECTRON_RUN_AS_NODE=1`が設定されており、これを外さないとelectron.exeがNodeとして起動してしまう＝新たな注意点として申し送る）。CDP(Node組込み`WebSocket`)+実`DragEvent`/`DataTransfer`構築による実イベント発火（右クリック→パスワード入力ダイアログへの実入力を含む）で依頼のシナリオ1〜9をすべて検証した。
+
+**判定: M9b-T1-01（新規, High, 1回目）によりdeveloperへ差し戻し。他のシナリオ（2/3/4/5/6/7/8/9）は全てOK。**
+
+### M9b-T1-01（High、要修正）: 「外→内」移動（同一タブ内）で、移動元タブのメタJSON保存がセッションの再暗号化保存を上書きし、移動したノードがセッションから消失する（データ損失）
+
+- 再現手順: 同一タブ（T1）内で、通常領域のノード（`NormalNode`）をロック解除中セッション（`LockRootA`, 配下に`SessionChild1`/`SessionChild2`）へ実際にドラッグ&ドロップで移動（シナリオ1）。UIは「移動しました」的に成功して見え、その場ではセッション内に`NormalNode`が正しく表示される。しかしその後セッションを再ロック（`crypto:relockNode`）→再度パスワードで解除すると、**`NormalNode`がセッションから完全に消えている**（`SessionChild1`/`SessionChild2`のみ残る）。一方、`NormalNode`用に新規生成された難読化トークンの実ファイル（例: `fe7c37ce....txtenc`、実際に暗号化された中身は残っている）はタブフォルダ直下に物理的に残り続け、`.tabtreenote.json`の**トップレベル**に`nodeLocked`フラグの付かない`encrypted:true`の孤児ノード（ロックともM6個別暗号化とも紐付かない、セッションの鍵でしか復号できないためUIからは永久に開けない）として出現し続ける（再ロック後・再起動相当のリロード後も再現、恒久的な孤児化）。
+- 根本原因: `src/main/ipc/memoHandlers.ts`の`handleLockBoundaryMove`（「外→内」move分岐, ~L748-767）は、①関数冒頭で`srcLoaded = await loadTabMeta(srcFolderPath)`によりタブの現時点のメタツリーを読み込み、対象ノードを`removeNode`でこの**インメモリのスナップショット**から除去した上で、②`moveIntoSession(...)`を呼ぶ。`moveIntoSession`内部は新規暗号化ファイルを書込み後、`persistNodeLockSession(destTabId, destLockToken)`（`src/main/crypto/nodeLock.ts` L425-446）を呼び、そこでも**別途`loadTabMeta(folderPath)`でディスクから再読込**したツリーにセッションの新しいロックプレースホルダ（新規`claimedTokens`含む）を書き込み`saveTabMeta`で保存する。ところがこの2回目の読込はまだ①のsrc側削除が反映されていない生のディスク状態であり、しかも「外→内」でmove（コピーでない）の場合、`handleLockBoundaryMove`は`moveIntoSession`の成功後に③**`await saveTabMeta(srcFolderPath, srcLoaded.metaTree)`（L765）で①の古いスナップショットをそのまま上書き保存**する。同一タブ内移動（`srcFolderPath === destFolderPath`、まさにシナリオ1の想定形）の場合、この③の書込みが②で正しく保存されたはずのセッションの新しいロックプレースホルダ（新規`claimedTokens`を含む）を、①時点の古いプレースホルダで丸ごと上書きしてしまう。結果、ディスク上のセッションのロックブロブは移動前の状態に戻り、移動によって追加されたノードの参照（`nameMap`/`children`/`claimedTokens`）が消失する。物理ファイル自体は削除されないため孤児として残る。
+- 影響範囲: コピー（`args.copy===true`）はこの③の上書き保存自体を行わない分岐（`if (!args.copy) { ... }`）のため影響を受けない。クロスタブ「外→内」（`srcFolderPath !== destFolderPath`）も③が別ファイルを上書きするだけなのでdest側セッションは無傷（発生しない）。**「同一タブ内で通常ノードをロック解除中セッションへ移動」という、依頼シナリオ1そのもの・かつ最も基本的な使われ方に限定して発生する。**
+- milestone doc（M9b-node-lock-boundary-move.md）の「reviewer/testerへの申し送り」に明記された最重要確認項目（「外→内」時のdest側`nameMap`/`children`/`claimedTokens`組み込みがM9aの再暗号化保存フローと矛盾なく行われているか）は、3回にわたる静的レビューでは検出されず、実行時（セッション再ロック後の再取得というタイミング）でのみ顕在化する種類の不具合だった。
+- 確認方法: 実UI操作（右クリック→ロックを解除→パスワード入力→実DragEvent/DataTransferによるドラッグ&ドロップ）+ IPC直叩き（`crypto.unlockNode`で移動後・再ロック後の実際の永続化状態を突合）。`npx tsc --noEmit`/`electron-vite build`は前回developer報告済みの範囲（変更なしのため再実行不要と判断）。
+- 対応方針の提案: `handleLockBoundaryMove`の③（`saveTabMeta(srcFolderPath, srcLoaded.metaTree)`）を、`moveIntoSession`が完了した**後の最新ディスク状態を再読込してから対象ノードのみ除去する**方式に変更する（①のスナップショットをそのまま保存しない）、または③と②が同一ファイルを保存する場合は③を`moveIntoSession`の**前**に実行する（src側の除去を先に確定させ、その後`moveIntoSession`が自身の`loadTabMeta`で最新状態を読む）等、developer側で安全な順序を検討すること。
+
+### 他シナリオの実施結果（すべてOK、実際のD&Dで確認）
+- シナリオ2（内→外禁止）: セッション内`SessionChild1`をタブ直下`EncNode`へドラッグ→`canAcceptDrop`によりdragover/dropとも`preventDefault`されず、ツリー無変化。
+- シナリオ3（別ロック間禁止）: 2つの別セッション（LockRootA/LockRootB、それぞれ別パスワードで解除中）の間でノードをドラッグ→同上、拒否されツリー無変化。
+- シナリオ4（同一セッション内move）: `SessionChild1`→`SessionChild2`の後ろへドラッグで順序入替→反映、再ロック→再解除後も順序が保持されていることを確認（`tree:updateStructure`経由、本件の不具合の影響を受けない別経路）。
+- シナリオ5（未解除🔒のクロスタブドラッグ禁止, M9b-R1-01(b)再確認）: `Folder7`配下の未解除🔒プレースホルダをTabBarの別タブへドラッグ→「ロック中のノードは別のタブへ移動・コピーできません（一方通行の金庫）。」で拒否、対象タブのフォルダに新規ファイルが増えないことをディスク確認。
+- シナリオ6（セッション内の入れ子🔒プレースホルダの並べ替え, M9b-R1-01(a)再確認）: セッション内の入れ子ロック済みプレースホルダを同一セッション内の別位置へドラッグ→正常に移動（回帰なし）。
+- シナリオ7（隠れた入れ子ロックを含む通常フォルダのクロスタブ移動禁止, M9b-R2-01再確認）: それ自体は`nodeLocked`でも`lockToken`持ちでもない`Folder7`（配下に個別ロック済み`LockedChild7`）をTabBarへドラッグ→`LOCK_BOUNDARY_VIOLATION`で拒否、移動先タブに新規ファイルなしをディスク確認。
+- シナリオ8（入れ子ロック済み子孫を含む複製禁止, M9b-R2-02再確認）: `Folder7`をCtrl+ドラッグで同一タブ内複製→`LOCK_CONTAINS_ENCRYPTED`で拒否、複製物が生成されないことをツリー確認。
+- シナリオ9（個別暗号化混在時の外→内禁止）: 個別暗号化済み`EncChild9`を含む`Folder9`をセッション配下へドラッグ→`LOCK_CONTAINS_ENCRYPTED`（「暗号化済みのメモが含まれています。先に個別の暗号化を解除してください。」）で拒否。
+
+### 環境・後片付け
+- 環境隔離: `out/`+最小`package.json`を`.tmp-tester-app/`（リポジトリ直下、検証後削除済み）へコピーし`electron .tmp-tester-app`で起動。テストデータはこの隔離ディレクトリ内の`data/`フォルダにのみ作成（2タブ`m9bT1`/`m9bT2`、検証後ディレクトリごと削除）。実データ`config/app-settings.json`・`data/`は本ラウンドで一切参照・変更していない（`git status --short config/`が空であることを確認済み）。
+- 後片付け: `.tmp-tester-app/`削除済み、scratchpad配下の一時ファイル削除済み。検証後`Get-Process electron`は0件を確認。
+- 副作用: なし（すべて隔離ディレクトリ内のローカルファイル操作・localhost CDPのみ。実運用のAPIキー/Webhook等は使用していない）。
+- 申し送り: 本セッションのシェル環境変数`ELECTRON_RUN_AS_NODE=1`が設定されているため、`electron`コマンドをそのまま実行すると（`--user-data-dir`問題とは別に）electron.exeがNode.jsとして起動し`electron.app`が undefined になる（`env -u ELECTRON_RUN_AS_NODE`を前置して起動する必要がある）。今後同様の検証を行う際の注意点として申し送る。
+
+## developer — M9b-T1-01 対応（1回目の修正）
+
+対象: `src/main/ipc/memoHandlers.ts`の`handleLockBoundaryMove`（「外→内」move分岐の末尾、`args.copy===false`時のsrc側メタJSON保存処理のみ）。
+
+- 指摘: `handleLockBoundaryMove`が関数冒頭で読み込んだ`srcLoaded.metaTree`（moveIntoSession呼び出し前の古いスナップショット）から対象ノードを`removeNode`で除去し、`moveIntoSession`（内部で`persistNodeLockSession`がdestセッションを再暗号化保存）成功後に、この古いスナップショットをそのまま`saveTabMeta(srcFolderPath, srcLoaded.metaTree)`で上書き保存していた。同一タブ内移動（`srcFolderPath === destFolderPath`）の場合、この上書きが`moveIntoSession`で正しく保存されたはずのセッションの新しいロックプレースホルダ（新規`claimedTokens`含む）を古い状態で潰してしまい、移動したノードが再ロック→再解除後にセッションから消失する（物理ファイルのみ孤児として残る）データ消失バグ。
+- 対応: tester提案の2案のうち「`moveIntoSession`完了後の最新ディスク状態を再読込してから対象ノードのみ除去する」方式を採用。`saveTabMeta(srcFolderPath, srcLoaded.metaTree)`を、`moveIntoSession`成功確認後に`loadTabMeta(srcFolderPath)`で最新ディスク状態を`latestSrc`として再読込→`topLevelNames`各々を`latestSrc.metaTree`から`removeNode`で除去→`saveTabMeta(srcFolderPath, latestSrc.metaTree)`という順序に変更した。同一タブ内の場合は`moveIntoSession`が保存済みのdestセッションの新しいロックプレースホルダを含んだ最新状態を再読込した上でsrcの対象ノードのみ除去するため上書き消失が起きず、クロスタブの場合（`srcFolderPath !== destFolderPath`）も従来通り正しく動作する（reload対象ファイルはdestと別ファイルのため実質無変化、既存の良好動作を維持）。tester提案のもう一つの案（③を②の前に実行）ではなくこちらを採用した理由: `moveIntoSession`が失敗した場合に早期returnする既存の安全性（src側は一切保存されず、元のノードは物理ファイルごと変更されないまま残る）を保つため。仮に③を②の前に実行する順序にすると、`moveIntoSession`が途中で失敗した際にsrc側は既に対象ノード参照なしで保存済みなのに新しい暗号化ファイル・destセッションへの反映は行われない、という新たな孤児化リスクを生む懸念があったため採用しなかった。
+- スコープ: 変更は`handleLockBoundaryMove`の該当箇所（数行）のみ。`moveWithinSession`/`moveIntoSession`/`persistNodeLockSession`本体、他シナリオ（2/3/4/5/6/7/8/9）に関わるコード（`isLockBoundaryMoveAllowed`/`containsLockedDescendant`/クロスタブ`.lock`チェック等）は無変更。
+- 確認: `npx tsc --noEmit -p tsconfig.json`・`npx tsc --noEmit -p tsconfig.node.json`いずれもエラーなし。`npx electron-vite build`成功（`out/main/index.js` 128.59kB / `out/preload/index.js` 9.08kB / `out/renderer/assets/index-*.js` 1,026.23kB）。実行時動作検証は未実施（tester範囲）。
+- reviewer（設計適合性・セキュリティへの影響確認）へ静的レビューを依頼した上で、tester（M9b-T1-01に対する1回目の修正である旨を明記）へ再検証を依頼予定。コミット・プッシュは行っていない。
+
+## reviewer — M9b-T1-01 修正確認（ラウンド1）
+
+対象: `src/main/ipc/memoHandlers.ts`の`handleLockBoundaryMove`（src側メタJSON保存部分、1回目の修正）。`moveIntoSession`/`persistNodeLockSession`（`nodeLock.ts`）/`removeNode`/`loadTabMeta`/`saveTabMeta`（`metaStore.ts`）とトレース照合。
+
+- M9b-T1-01 OK（解消）: `moveIntoSession`は物理ファイル操作のみ行いsrcFolderPath側のメタツリー構造（トップレベルnames自体のエントリ）には一切触れず（削除するのは実ファイルのみ）、destセッションの更新は`persistNodeLockSession`内部の**独立した`loadTabMeta(destFolderPath)`再読込**によって行われることを確認。よって`moveIntoSession`完了時点で、同一タブ内ケース（`srcFolderPath===destFolderPath`）ではディスク上のメタJSONは「移動対象トップレベルnamesがまだ dangling な平文エントリとして残存 + セッションのプレースホルダは新しい`claimedTokens`込みで更新済み」という状態になる。修正後のコードはこの状態を`loadTabMeta(srcFolderPath)`で正しく再読込した上で、`topLevelNames`のみを`removeNode`で除去してから保存するため、セッション側の更新を潰さずに済む。`removeNode`（metaStore.ts）は`memoName`一致のみで判定する全木再帰探索（位置・深さに依存しない）であるため、再読込後のツリーで対象ノードの位置が変わっていても`topLevelNames`（旧スナップショットから算出、`memoName`自体は不変）を安全に再利用できることも確認。クロスタブケース（`srcFolderPath!==destFolderPath`）は`moveIntoSession`が別ファイル（destFolderPath）のみを更新するため、再読込は実質従来のsrcLoaded.metaTreeと同内容になり退行なし。
+- 確認点2（失敗時の安全性）OK: 変更対象は`if (!res.ok) return res;`より後のブロックのみで、`moveIntoSession`（内部で`persistNodeLockSession`のエラーも含め）が失敗した場合はsrc側の`loadTabMeta`/`removeNode`/`saveTabMeta`に一切到達せず、srcFolderPathのメタJSONは元のまま変更されない。
+- 確認点3（`topLevelNames`の使い回しの安全性）OK: 上記の通り`removeNode`は名前ベースの全木探索のため、`srcLoaded.metaTree`（旧スナップショット）から算出した`topLevelNames`を`latestSrc.metaTree`（新スナップショット）に対して使い回しても対象ノードの特定に問題なし。両スナップショットとも今回の一連の処理中に他の同時書き込みが入る余地はなく（Node/Electronメインプロセスのシングルスレッド実行、既存コード全体で同様の前提）、トークン名（難読化名）は128bit衝突チェック済みのランダム値のため`topLevelNames`（元の実名）と偶然一致することもない。
+- 確認点4（他シナリオへの影響）OK: 変更は`if (!args.copy)`ブロック内のみで、`args.copy===true`（コピー、src側は無変更のまま）の分岐、`moveWithinSession`（同一セッション内move/copy）、`handleLockBoundaryMove`冒頭の判定表分岐（内→外拒否・別ロック間拒否等）はいずれも今回のdiffに含まれず無変更。シナリオ2/3/4/5/6/7/8/9（tester既確認済み）に関わるコードパスとは独立している。
+- 確認点5（セキュリティ）OK: 追加されたのは`loadTabMeta`/`removeNode`/`saveTabMeta`の呼び出しのみで、鍵・パスワード・復号平文のログ出力・新規露出なし。
+- 参考（非ブロッキング、今回のdiff範囲外）: `moveIntoSession`のステップ3ループ（複数member一括の暗号化書込み+元ファイル削除）は、途中の1件が失敗した場合に既に処理済みの前件について新規暗号化ファイル書込み・元ファイル削除が行われた状態のまま`return written`で早期returnする（部分適用のまま`persistNodeLockSession`に到達しない）既存の挙動が残っているように見えた。ただしこれは今回の修正差分に含まれない`moveIntoSession`本体側の既存コードであり、M9b-T1-01の再現手順（一括操作の途中失敗)とは異なる仮定のため、今回のレビュー対象としては指摘としない（必要であれば別途申し送り事項として記録するのみに留める）。
+- 判定: ブロッキング指摘なし。M9b-T1-01（1回目の修正）は解消。developer への差し戻し不要。tester へ進行可。
+
+## tester — M9b-T1-01 修正確認（再検証・1回目の修正に対する検証）
+
+対象: `src/main/ipc/memoHandlers.ts`の`handleLockBoundaryMove`（reviewer M9b-T1-01ラウンド1 OK後）。元のバグの再現手順そのもの（同一タブ内で通常ノードをロック解除セッションへ移動→再ロック→再解除）に絞って実IPC操作で検証（クロスタブ移動・コピー・内→外禁止等の他シナリオは、今回の修正が同一タブ内moveのみに限定された変更であることをコードレビューで確認済みのためオーケストレーター指示により深追いせず）。
+
+- 環境隔離: `out/`+ビルド用最小`package.json`をリポジトリ直下`.tmp-tester-app/`（検証後削除済み）へコピーし`electron .tmp-tester-app`という位置引数形式で起動。本セッションのシェルにも`ELECTRON_RUN_AS_NODE=1`が設定されていたため`env -u ELECTRON_RUN_AS_NODE`を前置して起動（AGENT_LOG既記載の申し送り通り）。`--remote-debugging-port`でCDP接続し、Node組込み`WebSocket`で`Runtime.evaluate`により`window.api`（preloadが公開するIPCラッパー）を直接呼び出す方式で検証（IPCハンドラの入出力を直接確認する必要があったため、UIのD&D/右クリックメニューではなく`window.api.memo.move`等を直接叩く形とした。今回のバグ・修正は`handleLockBoundaryMove`という同一の内部関数に閉じており、UI側のD&D配線は前回ラウンドで既にOK確認済みのため、この検証方式の違いによる見落としリスクは無いと判断）。
+- 手順と結果:
+  1. `tab.create`で隔離データフォルダにテスト用タブ作成→`memo.create`で`NormalNode`（トップレベル）と`LockRootA`（トップレベル、子に`SessionChild1`/`SessionChild2`）を作成。
+  2. `crypto.lockNode`で`LockRootA`をロック→`crypto.unlockNode`で解除、`lockToken`取得。`tab.openTree`で`LockRootA`配下に`SessionChild1`/`SessionChild2`のみ存在することを確認。
+  3. `memo.move`に`destLockContext: { lockToken }`を指定し`NormalNode`を同一タブ内でセッション配下へ移動（`srcTabId===destTabId`、まさにM9b-T1-01の再現条件）→`ok: true`。直後の`tab.openTree`でセッション内に`NormalNode`が追加されていることを確認（ここまでは修正前でも成功して見えていた）。
+  4. **`crypto.relockNode`でセッションを再ロック→再度`crypto.unlockNode`で解除**（バグが顕在化する核心の操作）→`tab.openTree`の結果、`LockRootA`配下に`SessionChild1`/`SessionChild2`/`NormalNode`の3件が全て残っていることを確認。**修正前の再現手順（reviewerログのM9b-T1-01）で報告されていた「`NormalNode`が消失し物理ファイルのみ孤児として残る」現象は再現しなかった。**
+  5. ディスク上の`.tabtreenote.json`（トップレベルメタ）を直接読み、`tree`が単一の🔒プレースホルダノードのみで、その`lock.claimedTokens`に4件（root自身+`SessionChild1`+`SessionChild2`+`NormalNode`の各難読化トークン）全てが含まれ、フォルダ内の`.txtenc`実ファイルも過不足なく4件であることを確認（孤児ファイル・孤児メタエントリともに無し）。
+  6. 失敗時の非破壊確認（依頼2）: 新規トップレベル`PlainX`を作成し、存在しない/期限切れの`lockToken`を指定して`memo.move`を実行→`requireSession`により`LOCK_SESSION_NOT_FOUND`で早期拒否され、実行前後で`tab.openTree`の結果（`LockRootA`配下・`PlainX`とも）が完全に同一であることを確認。src側メタJSONへの書込みに一切到達しないため破損の余地がないことを実地でも確認。
+- typecheck: `npx tsc --noEmit -p tsconfig.json`・`npx tsc --noEmit -p tsconfig.node.json`いずれもエラーなし。build: `npx electron-vite build`成功（`out/main/index.js` 128.59kB / `out/preload/index.js` 9.08kB / `out/renderer/assets/index-*.js` 1,026.23kB、developer/reviewer報告と一致）。
+- 環境・後片付け: `.tmp-tester-app/`（検証後削除済み）、scratchpad配下の一時ファイルも削除済み。検証後`Get-Process electron`は0件を確認。`git status --short config/`・`git status --short data/`がいずれも空であることを確認済み（実データ`config/app-settings.json`には一切触れていない）。
+- 副作用: なし（すべて隔離ディレクトリ内のローカルファイル操作・localhost CDPのみ。実運用のAPIキー/Webhook等は使用していない）。
+- 判定: **M9b-T1-01（1回目の修正）は解消。追加の指摘なし。** developer/reviewer/tester間のM9b-T1-01に関する修正ループはこれで完了。他シナリオ（クロスタブ移動・コピー・内→外禁止等）は今回の修正スコープ外のため未再検証（前回ラウンドでOK確認済み・コードレビューで無変更確認済み）。
+
+## developer — M9c（ノードロック応用③: タブ切替時のセッション一括破棄）実装
+
+対象マイルストーン: docs/v3/milestones/M9c-node-lock-tab-switch.md（M8完了済み前提。M9a/M9bとは設計上独立、両方完了済みの状態から着手）。DESIGNv3 §1.11「タブから離れたら（別タブ選択で）即座にセッション破棄」・PLANv3 §5.5/§7.6を実装。3分割中最小規模のスコープ通り、新規IPCチャネル`crypto:relockAllInTab`の新設とレンダラのタブ切替処理への配線のみ。
+
+- **`src/main/crypto/nodeLockSessionStore.ts`**: 新設`deleteAllNodeLockSessionsForTab(tabId)`。`store`（`Map<string, NodeLockSessionEntry>`、キー=`"${tabId} ${lockToken}"`）から`"${tabId} "`前方一致のキーを全て削除する。入れ子ロックの子セッションも同じ`tabId`で登録されるため、親子関係を辿らず単純な前方一致で過不足なく破棄できる（`tabId`は`randomUUID()`生成で空白を含まないため、他タブのキーとの誤マッチは無い）。
+- **`src/main/crypto/nodeLock.ts`**: 新設`relockAllInTab(tabId): Result<void>`。`deleteAllNodeLockSessionsForTab`を呼ぶのみ（`relockNode`のループ相当、ファイル操作なし、milestone doc記載通り）。対象タブにセッションが1件も無い場合も何もせず`ok`を返す（冪等）。
+- **`src/shared/ipc-contract.ts`**: `IpcChannels.crypto.relockAllInTab = 'crypto:relockAllInTab'`、`CryptoRelockAllInTabArgs{tabId}`、`PreloadApi.crypto.relockAllInTab`を追加。
+- **`src/main/ipc/cryptoHandlers.ts`**: `crypto:relockAllInTab`ハンドラを登録（`relockNode`ハンドラと同型の同期`wrapHandler`）。
+- **`src/preload/index.ts`・`src/renderer/ipc.ts`**: 新規チャネルの配線を追加（既存`relockNode`と同一パターン）。
+- **`src/renderer/App.tsx`の`selectTab`**: `requestCloseCurrentMemo()`（dirty確認→保存/破棄確定、既存フローを完全に無変更で先頭に維持）完走後、`selectedTabIdRef.current`を`prevTabId`として捕捉した上で`setSelectedTabId(tabId)`等の既存タブ切替状態更新（無変更）を行い、その直後に`prevTabId`（切替先と異なる場合のみ＝同一タブへの再選択は「離脱」に該当しないため対象外）に対して`ipc.relockAllInTab({ tabId: prevTabId })`をfire-and-forget（既存`ipc.reportActiveMemo`等と同じ`void ...catch(console.error)`パターン）で呼び出す。milestone doc最重要確認項目の順序（dirty確認→保存/破棄確定→タブ切替→セッション破棄）を、`requestCloseCurrentMemo`がキャンセル（`false`）を返した場合はその時点で`return`し以降の行（タブ切替・セッション破棄とも）に到達しないことで保証している。
+- **意図的にスコープ外とした事項（milestone doc / PLANv3 §5.5の記載通り）**: (a) `tab:remove`（タブ登録解除, DESIGNv3 §1.11のセッション終了条件(c)）へのセッション破棄配線は、M9c-node-lock-tab-switch.mdの「このフェーズで扱う処理フロー」に記載が無く、`crypto:relockAllInTab`の呼び出し元も「レンダラの既存タブ切替処理」のみと明記されているため未着手（既存`handleRequestRemoveTab`は無変更）。フォルダごと削除される場合はセッションの参照先ファイルごと消滅し、フォルダを維持したまま登録解除するだけの場合もメモリ上に古い`tabId`キーのセッションが残るのみ（新規登録時は新しい`randomUUID()`が発行されるため、後から同じ`tabId`が再利用されて誤ったセッションが復活することはない）で、UIから到達・表示されることは無い。(b) ノードロック専用の新しい未保存編集確認ダイアログは追加していない（milestone doc・DESIGNv3 §1.11の指示通り、既存の`requestCloseCurrentMemo`の`window.confirm`フローをそのまま利用）。
+- 確認: `npm run typecheck`（`tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json`）エラーなし。`npx electron-vite build`成功（`out/main/index.js` 134.27kB / `out/preload/index.js` 9.29kB / `out/renderer/assets/index-*.js` 1,026.51kB）。実行時動作検証は未実施（tester範囲）。
+- reviewerへ静的レビューを依頼予定。コミット・プッシュは行っていない。
+
+## reviewer — M9c（ノードロック応用③: タブ切替時のセッション一括破棄）静的レビュー（ラウンド1）
+
+対象: M9c差分一式（`nodeLockSessionStore.ts`/`nodeLock.ts`拡張、`ipc-contract.ts`/`cryptoHandlers.ts`/`preload/index.ts`/`renderer/ipc.ts`配線、`App.tsx`の`selectTab`）。M9c-node-lock-tab-switch.md・DESIGNv3 §1.11・PLANv3 §5.5/§7.6と照合。
+
+- 指摘なし。最重要確認項目（`requestCloseCurrentMemo()`のawait完了後にのみタブ切替状態更新→`relockAllInTab`呼び出しが実行される順序）を`App.tsx` 790-816行目で確認。`requestCloseCurrentMemo()`が`false`を返すケース（キャンセル）は即`return`され以降のタブ切替・セッション破棄いずれにも到達しないことも確認。同一タブ再選択（`prevTabId === tabId`）はセッション破棄をスキップすることも確認。`deleteAllNodeLockSessionsForTab`の`"${tabId} "`前方一致は`tabId`が常に`randomUUID()`生成（空白を含まない）のため他タブキーとの誤マッチなし。ロック解除セッション配下のdirty編集は`requestCloseCurrentMemo`内で`lockContext`付き`ipc.saveMemo`によりawait保存済みであることも確認（セッション破棄より確実に先行）。新規コードに鍵・パスワード・復号平文のログ出力なし（`console.error`はpromise rejectionの汎用エラーオブジェクトのみ）。スコープ外とした`tab:remove`時の一括破棄未実装は、milestone docの明示的スコープ（呼び出し元はレンダラの既存タブ切替処理のみ）通りであり妥当と判断。
+- 判定: 指摘なし。developerへその旨報告。この後developerはtesterへ動作確認を依頼する想定。
+
+## tester — M9c（ノードロック応用③: タブ切替時のセッション一括破棄）動作検証（ラウンド1・実UI操作）
+
+対象: reviewer M9c ラウンド1 指摘なし後の一式。環境隔離: `out/`（`npx electron-vite build`で再ビルド、`out/main/index.js` 129.11kB / `out/preload/index.js` 9.29kB / `out/renderer/assets/index-*.js` 1,026.51kB、サイズはminify差程度でdeveloper報告と実質一致）+ビルド用最小`package.json`をリポジトリ直下`.tmp-tester-app/`（検証後削除済み）へコピーし`electron .tmp-tester-app`という位置引数形式で起動（本セッションのシェルも`ELECTRON_RUN_AS_NODE=1`のため`env -u ELECTRON_RUN_AS_NODE`を前置）。`--remote-debugging-port`でCDP接続し、Node組込み`WebSocket`で`Runtime.evaluate`により(a) 実際のタブバーDOM要素への`.click()`（本物のクリックイベント発火によるタブ切替、`selectTab`本体の実行経路）、(b) `document.execCommand('insertText', ...)`によるCodeMirrorエディタへの実入力、(c) `window.api.*`（ノードロックの施錠/解錠等、M9c非対象範囲）を組み合わせて検証。`npm run typecheck`エラーなし（再確認）。
+
+- シナリオ1（最重要）OK: タブA内`LockRootA`（子`SessionChild1`/`SessionChild2`）を`crypto.lockNode`→`crypto.unlockNode`で実名展開→実UIクリックでタブBへ切替→実UIクリックでタブAへ戻る→ツリーが`🔒 (ロック中)`プレースホルダに巻き戻っていることをDOM確認。その後`crypto.unlockNode`を再実行してエラーなく新しいセッションとして開始でき、内容（`LockRootA`/`SessionChild1`/`SessionChild2`）が正しく復元されることも確認。
+- シナリオ4（同一タブ再選択）OK: セッション展開中に同じタブAを再度クリックしても展開表示が維持され、破棄されないことを確認。
+- シナリオ5（複数・入れ子セッションの一括破棄）OK: 同一タブA内に`LockRootA`セッション（トップレベル）+その配下`SessionChild1`への入れ子ロックのセッション+別系統`LockRootC`セッション（トップレベル）の計3セッションを同時に開いた状態で実UIタブ切替（A→B→A）を行い、3つとも一括で破棄される（`LockRootA`・`LockRootC`とも`🔒`プレースホルダに戻り、一部だけ残る事象は無し）ことを確認。破棄後、3つとも元のパスワードで問題なく個別に再解錠でき中身も正しいことを確認（カスケード漏れなし）。
+- シナリオ2（順序保証・データ損失なし）主要部分はOK、ただし前提が実際の挙動と異なる点あり: `SessionChild2`を実UIクリックで開き`document.execCommand('insertText', ...)`で実入力しdirty化→未保存のままタブBへ実UIクリックで切替を試みたところ、**「未保存編集確認ダイアログ」は一切表示されず、即座に無言でタブが切り替わった**（`requestCloseCurrentMemo`の`om.lockToken`分岐, `App.tsx` 410-428行目が、確認なしで`ipc.saveMemo`による自動保存を行い常に`true`を返す実装のため）。ただし本来検証すべき核心（保存完了→タブ切替→セッション破棄の順序が守られ、データ損失が起きないこと）自体は成立していることを、タブA→再解錠→`memo.read`で`SessionChild2`の内容が入力した`DIRTY_EDIT_M9C_TEST`のまま正しく保存されていること、かつセッションはタブ切替後に正しく破棄（🔒プレースホルダに巻き戻り）されていることの両方で確認済み。
+- シナリオ3（キャンセル時の非破棄）**実施不能（前提となる操作導線が存在しないため未検証）**: シナリオ2の通りロック解除セッション配下のdirty編集には「未保存編集確認ダイアログ」自体が表示されず、常に無言で自動保存されてタブ切替が続行される実装のため、「ダイアログでキャンセルを選ぶ」という操作を行うこと自体ができない。
+  - 補足（コード解析による代替確認、Low・情報共有目的）: `App.tsx`の`om.lockToken`分岐は`ipc.saveMemo`が失敗（例:`CONFLICT`等）した場合のみ`return false`し、`selectTab`側もこれを受けて`return`するため、その場合はタブ切替・セッション破棄とも行われない（コード構造上、保存失敗時にセッションが誤破棄されることはない）。ただし実際のUI操作で「キャンセル」を選択できる導線としては存在しない。
+- 該当コード（`om.lockToken`のdirty時、確認ダイアログなしで自動保存）は`git diff HEAD -- src/renderer/App.tsx`で確認した限りM9c（本ラウンド）の差分には含まれず、M9a（`crypto:lockNode`/`unlockNode`の`lockContext`対応）で導入された既存の挙動であり、M9cは`selectTab`末尾に`relockAllInTab`呼び出しを追加しただけで`requestCloseCurrentMemo`本体には一切手を入れていない。reviewerのM9cラウンド1ログも「ロック解除セッション配下のdirty編集は`requestCloseCurrentMemo`内で`lockContext`付き`ipc.saveMemo`によりawait保存済み」と、確認ダイアログではなく自動保存である点を認識した上でM9c観点（順序保証）としては問題なしと判定している。
+- 一方、`DESIGNv3.md` §1.11の文言「ロック解除中の配下メモを編集中（dirty状態）のままタブを切り替えようとした場合、既存の未保存編集確認フロー（`requestCloseCurrentMemo`の`window.confirm`、既存パターン）がまず作用する」は、ロック解除セッション配下について文字通りには成立していない（`window.confirm`が使われるのは平文メモのみで、ロックセッション配下は無条件自動保存）。この乖離はM9a由来でM9cの差分外だが、milestone doc記載のシナリオ2/3の前提（依頼文の記述通り）とも食い違うため、念のため報告する。
+
+**判定: M9cのコア要件（`crypto:relockAllInTab`の一括破棄・同一タブ再選択スキップ・複数/入れ子セッションの一括破棄・順序保証によるデータ無損失）はすべてOK。ブロッキングな不具合なし。** 上記の「ロック解除セッション配下dirty編集に確認ダイアログが無い」点はM9c差分外のためdeveloperへの差し戻し対象とはしない（Low、情報共有のみ）。設計文書(DESIGNv3 §1.11)の記述と実装の乖離自体はM9a由来の既存事項であり、必要であればオーケストレーター判断で別途designerへの確認を検討されたい。
+
+### 環境・後片付け
+- 環境隔離: `out/`+最小`package.json`を`.tmp-tester-app/`（リポジトリ直下、検証後削除済み）へコピーし`electron .tmp-tester-app`で起動。テストデータは隔離ディレクトリ内`data/`（`m9cTabA`/`m9cTabB`）にのみ作成、検証後ディレクトリごと削除。
+- 後片付け: `.tmp-tester-app/`削除済み、scratchpad配下の一時ファイル（CDP評価用スクリプト）削除済み。検証後`tasklist`でelectron.exeプロセス0件を確認。
+- 副作用: なし（すべて隔離ディレクトリ内のローカルファイル操作・localhost CDPのみ）。検証前後で`git status --short config/`・`git status --short data/`がいずれも空であることを確認済み（実データに一切触れていない）。
+
+## tester — M10a（Markdown保存形式基盤・全文検索反映）動作検証（ラウンド1）
+
+対象: reviewer M10aラウンド1（ブロッキング指摘0件）通過後の一式。milestone doc（`docs/v3/milestones/M10a-markdown-format-core.md`）「reviewer/testerへの申し送り」4点＋依頼文の重点確認項目6点（申し送り4点＋全文検索のタグ誤ヒット確認＋外部変更検知）を実施。ライブプレビュー描画（M10b）・変換UIの導線（M10c）は今回スコープ外のためUI操作では検証不能な項目（`memo:convertFormat`）はIPC直叩きで検証した。
+
+環境隔離: `npx electron-vite build`で再ビルド（`out/main/index.js` 133.49kB / `out/preload/index.js` 9.61kB / `out/renderer/assets/index-*.js` 1,026.62kB、developer報告と一致）。`out/`+ビルド用最小`package.json`（`main: "./out/main/index.js"`）をリポジトリ直下`.tmp-tester-app/`（検証後削除済み）へコピーし、`env -u ELECTRON_RUN_AS_NODE electron .tmp-tester-app --remote-debugging-port=9333`という位置引数形式で起動（本セッションのシェルも`ELECTRON_RUN_AS_NODE=1`のため`env -u`で解除）。CDP（Node組込み`WebSocket`で`Runtime.evaluate`）経由で`window.api.*`を直接呼び出し検証（milestone doc記載の通り`memo:convertFormat`にUIボタンが無いため）。起動直後`tab.list()`が空配列、隔離ディレクトリ内`data/`が未生成であることを確認し環境分離を確認済み。
+
+- 申し送り1（`.md`のCRUD/リネーム/複製/移動が`.txt`と同様か）OK: `memo.create({format:'markdown'})`で`.md`ファイルが実際に作成されることを確認。本文を保存後、フォルダ内を実際に`ls`し**新しい`.txt`が生成されず`.md`本体のみが更新される**ことを確認（developer申告のバグ修正②の実地確認）。`memo.rename`/`memo.duplicate`/`memo.move`（別タブフォルダへ）いずれも実行後`ls`で拡張子が`.md`のまま維持されていることを確認（`.txt`化け無し、バグ修正①の実地確認）。
+- 申し送り2（`memo:convertFormat`後のメタJSON・全文検索インデックス追従）OK: `.md`→`.txt`変換後、`search.global`で本文中の`<span`文字列が検索対象になる（タグ除去なし=平文扱いに切り替わった）ことを確認、同名の別コピー（`.md`のまま）は引き続きタグ除去済みで一致することも確認（2エントリが独立して正しく追従、旧拡張子の残留インデックスなし）。`.tabtreenote.json`は元々`memoName`のみを保持し拡張子を持たない設計（reviewer確認済みの通り）であることをファイル内容で直接確認。
+- 申し送り3（暗号化`.md`メモの`format`フィールド・復号時の拡張子復元）OK: `.md`作成→`crypto.encryptMemo`→`.txtenc`ファイルを直接catし`"format":"markdown"`が書き込まれていることを確認→`crypto.open`→`crypto.saveEncrypted`（再暗号化）→再度`.txtenc`をcatし`"format":"markdown"`が再暗号化後も保持され続けることを確認（reviewerが要確認とした点）→`crypto.decryptMemoToPlain`→`ls`で`.md`拡張子として正しく復元され内容も一致することを確認。
+- 申し送り4（v1形式`.txtenc`の後方互換）OK: `.txt`（`format:'plain'`）を`crypto.encryptMemo`すると`.txtenc`に`format`キー自体が書き出されない（既定値省略の実装、v1ファイルと構造的に同一）ことを確認、この「`format`フィールドを持たない`.txtenc`」をそのまま`crypto.open`/`crypto.decryptMemoToPlain`したところエラーなく復号でき、`.txt`として正しく復元されることを確認。
+- 全文検索のタグ誤ヒット確認（依頼文項目5）OK: `.md`本文に`<span style="color:red">赤字</span>`を含む文を保存し`search.global(query:'テスト')`でヒットしタグ除去済みの`lineText`（`"テスト 赤字 content"`）が返ることを確認。同時に`search.global(query:'span')`/`query:'<span'`がいずれも0件（タグの記号列自体には誤ヒットしない）であることを確認。
+- 外部変更検知（依頼文項目6）OK: `evt:externalChange`/`evt:indexUpdated`を`window.api.events.on*`で購読した状態でアプリ経由でなく直接`.md`ファイルへ書き込み、両イベントが発火し（`changes:[{memoName, kind:'change'}]`）、直後の`search.global`で新しい本文がタグ除去済みでヒットすること・旧タグ内容が検索から消えていることを確認（`.txt`と同様に反映される、developerが追加修正したwatcher.tsの実地確認）。
+- ノードロックとの軽い共存確認（reviewer非ブロッキング指摘への依頼文の軽い確認、深追いせず）OK: `.md`メモを含むノードを`crypto.lockNode`→難読化名`.txtenc`化を確認→`crypto.unlockNode`で正常に復元（`memoName`が元に戻り内容も一致）→アプリ本体はクラッシュせず、CDP接続・以降のIPC呼び出しとも応答継続することを確認。reviewer指摘通りformat属性はロック中に内部的に失われるが（今回未対応事項として合意済み）、クラッシュ等の致命的問題は発生しなかった。
+- 追加確認（非ブロッキング、情報共有）: `memo:convertFormat`のNAME_DUPLICATE分岐（変換先拡張子で同名ファイルが既に存在する場合）は、アプリ内操作のみでは構造的に到達不能（`.txt`/`.md`は`scanTabFolder`ベースの統一名前空間で名前作成時点から重複がブロックされるため）。**アプリ外からファイルシステムを直接操作して同名`X.md`と`X.txt`を意図的に共存させた場合に限り**、`findMemoFile`が`.txt`を`.md`より優先して発見する実装（`memoFileService.ts` 121-138行目）のため、`convertFormat({targetFormat:'txt'})`は`NAME_DUPLICATE`エラーを返さず**`.txt`側が既にtargetFormatと一致しているという理由で無言のok:true（実際には何も変換していない）を返す**ことを実機で確認した。ユーザーが自力でExplorer等から同名ファイルを作らない限り再現しない極めて狭いシナリオであり、暗号化データの露出やファイル破損等の実害は無い（意図した`.md`ファイル自体は無傷で残る）が、milestone doc記載の「変換先で同名ファイルが既に存在する場合はNAME_DUPLICATE」という文言と実際の挙動（この特定の優先順位絡みのケースでは無言success）が食い違う点として情報共有する。ブロッキングとは判断しない（対応要否はdeveloper/designer判断に委ねる）。
+- 実機確認中に踏んだ自分自身のテストスクリプトの誤り（アプリ側の不具合ではない）: `memo.save`/`crypto.saveEncrypted`呼び出し時に型契約と異なる値（`encoding:'utf8'`（正しくは`'utf-8'`）、`eol:'LF'`（正しくは小文字`'lf'`））を渡してしまい、前者は`UNKNOWN`エラー＋`atomicWrite`内の一時ファイル1個が隔離ディレクトリに残留、後者は当該`.txtenc`が`DECRYPT_FAILED`として読めなくなった（型契約を破った入力に対する妥当な防御的拒否であり、アプリの不具合ではない）。いずれも隔離ディレクトリ内のみで発生し実データには無関係、ディレクトリごと削除済み。
+
+**判定: 申し送り1〜4・依頼文の重点確認項目（全文検索タグ誤ヒット、外部変更検知、ノードロックとの軽い共存）すべてOK。ブロッキングな不具合なし。developerへの差し戻し不要。** 上記「NAME_DUPLICATE分岐が外部ファイル操作由来の名前衝突で無言successになる」点のみ非ブロッキングの情報共有として報告する（外部改ざんが前提の極めて狭いシナリオ、実害なし）。
+
+### 環境・後片付け
+- 環境隔離: `out/`+ビルド用最小`package.json`を`.tmp-tester-app/`（リポジトリ直下、検証後削除済み）へコピーし`electron .tmp-tester-app --remote-debugging-port=9333`で起動。テストデータは隔離ディレクトリ内`data/`（`testtab`/`testtab2`、メモ`mdmemo1renamed`/`encmd1`/`encmd2`/`v1enc`/`dupcheck`系/`mdtest3`等）にのみ作成、検証後ディレクトリごと削除。
+- 後片付け: `.tmp-tester-app/`削除済み（`ls`で存在しないことを確認）、scratchpad配下のCDP評価用一時スクリプトも同セッションのscratchpad内のみで完結（プロジェクト外）。検証後`netstat`でポート9333が閉じたこと・`taskkill /T /F`でelectron.exeプロセスツリー（4プロセス）を全て終了したことを確認。
+- 副作用: なし（すべて隔離ディレクトリ内のローカルファイル操作・localhost CDPのみ、外部API/Webhook等への通信は一切行っていない）。検証前後で`git status --short config/`・`git status --short data/`・`git status --short`全体（`.tmp-tester-app`を含む新規未追跡物なし）がいずれも意図した差分のみ（developerの実装差分のみ、テスト起因の残留物なし）であることを確認済み。
+
+## developer — M10a（Markdown保存形式基盤・全文検索反映）実装
+
+対象: v3 M10a（`docs/v3/milestones/M10a-markdown-format-core.md`、DESIGNv3 §2.4/§2.5/§2.6 Q11、PLANv3 §2.3/§5.8-5.9）。`.md`拡張子を`.txt`と同格の「平文相当」第三拡張子としてファイル層/IPC/全文検索に反映し、`memo:convertFormat`（新規）・`.txtenc`の`format`フィールドを実装。M8/M9（ノードロック）とは独立、依存・被依存なし。ライブプレビュー描画（M10b）・ツールバー/変換UI（M10c）は対象外。
+
+- **`src/shared/constants.ts`**: `MEMO_EXT_MARKDOWN='.md'`、`MARKDOWN_ALLOWED_TAGS=['span','img'] as const`（milestone doc「developer裁量」通り、M10bが同一定数を再利用する想定で先出し定義）を追加。
+- **`src/main/fs/memoFileService.ts`**（中心的な変更）: `ScannedMemo`/`findMemoFile`の戻り値に`format:'plain'|'markdown'`を追加し`scanTabFolder`/`findMemoFile`が`.md`を認識するよう拡張。**発見した既存バグ2件を本milestoneのゴール（「`.txt`と全く同様に動作する」）達成に必須な修正として合わせて修正**: (1) `renameMemoFile`/`duplicateMemoFile`/`moveMemoFileToFolder`/`copyMemoFileToFolder`が拡張子を`encrypted`のみから`MEMO_EXT_PLAIN`固定で導出しており、`.md`メモをリネーム/複製/移動/コピーすると`.txt`に化ける欠落があったため、新設した`extOfFound`ヘルパーで元拡張子を維持するよう統一。(2) `saveMemo`が保存先パスを`MEMO_EXT_PLAIN`に決め打ちしていたため、`.md`メモを保存すると横に空の`.txt`が新規生成される（`.md`側は更新されない）欠落があったため、`findMemoFile`で既存ファイルの実拡張子を解決してから書き込むよう修正（未作成時のみ`.txt`を既定に後退。`.txtenc`が見つかった場合は`NAME_INVALID`で拒否する安全ガードも追加、平文保存チャネルでの誤上書きを防止）。`createEmptyMemoFile`に`format`引数（既定`'plain'`）を追加。新規`convertMemoFileFormat`（`memo:convertFormat`本体、拡張子のみリネーム・本文無変更、変換先重複は`NAME_DUPLICATE`）。
+- **`src/main/watch/watcher.ts`**（milestone docのファイル一覧に無いが、拡張子分岐の一貫性のため追加で修正）: `processSettledEvent`の拡張子判定（外部変更の経路②）が`.txtenc`/`.txt`のみを認識しており、`.md`ファイルの外部変更（他エディタでの編集等）が全文検索インデックス/`evt:externalChange`に一切反映されない欠落があったため`MEMO_EXT_MARKDOWN`分岐を追加。
+- **`src/main/search/searchIndex.ts`**: 新規`stripMarkdownTags`（`<span>`は記号のみ除去し内側テキストを残す、`<img>`は要素ごと除去、正規表現ベース簡易実装）と`computeIndexedContent`を追加。`updateMemo`に`format`引数（既定`'plain'`）を追加し`.md`のみタグ除去してから格納。`indexTab`（起動時構築・タブ登録時）も同様に`.md`をタグ除去。
+- **`src/main/crypto/encFormat.ts`**: `TxtEncFile`/`BuildTxtEncFileParams`に`format?:'plain'|'markdown'`を追加（省略時'plain'、`hint`と同じ「既定値なら書き出さない」流儀）。`parseTxtEncFile`は未知の値を破損扱いで`null`に統一。
+- **`src/main/crypto/sessionKeyStore.ts`**: `SessionKeyEntry`に`format?`を追加（`hint`と同じく再暗号化に必要な最小限の情報として`crypto:open`/`crypto:encryptMemo`時点で保持し、`crypto:saveEncrypted`/`crypto:changePassword`の再暗号化のたびに保持し続ける。**発見した潜在バグとして事前に対応**: この保持が無いと`.md`として暗号化したメモを保存/パスワード変更するたびに`format`がヘッダから欠落し、復号時に`.txt`へ誤って復元されるデータ属性の消失が起きるため）。
+- **`src/main/ipc/cryptoHandlers.ts`**: `crypto:encryptMemo`が`found.format`から自動判定して`.txtenc`へ反映。`crypto:decryptMemoToPlain`が`.txtenc`の`format`に従い`.txt`/`.md`いずれかへ復元（省略時'plain'＝既存`.txtenc`の後方互換）。`crypto:open`/`crypto:saveEncrypted`/`crypto:changePassword`はセッション/既存ヘッダの`format`を再暗号化のたびに引き継ぐ。
+- **`src/main/ipc/memoHandlers.ts`**: `memo:create`に`format`引数を配線（`createEmptyMemoFile`/インデックス反映とも）。`memo:save`成功後、実拡張子を`findMemoFile`で確認しインデックス反映時にタグ除去要否を切り替え。新規`memo:convertFormat`ハンドラ（milestone doc通りIPCハンドラ本体のみ、確認ダイアログ等の呼び出し元UIはM10cスコープ）。**developer判断（設計拡張ではなく縮小的な安全策）**: 引数型`MemoConvertFormatArgs`はmilestone doc記載通り`lockContext?`を持つが、ロック解除セッション配下のメモは常に難読化名の`.txtenc`として保存され`.txt`/`.md`の拡張子概念自体を持たず、DESIGNv3/PLANv3にセッションメンバー単位の`format`追跡の定義が無い（M10aはM8/M9と独立スコープのため新設もしない）ため、`lockContext`指定時は`NAME_INVALID`で明示的に拒否するのみとした（新しい格納方式を推測で実装しない判断）。
+- **`src/renderer/components/dialogs/PropertiesDialog.tsx`**（milestone docのファイル一覧に無いが表示欠落のため追加で修正）: プロパティ画面のファイル名表示が`encrypted`のみから`.txt`/`.txtenc`を決め打ちしていたため、`.md`メモのプロパティを開くと拡張子が`.txt`と誤表示される欠落があった。`filePath`（真実源）のbasenameから拡張子込みのファイル名を取得するよう修正（取得失敗時のみ従来の決め打ちへ後退）。
+- **`src/shared/ipc-contract.ts`/`src/preload/index.ts`/`src/renderer/ipc.ts`**: `memo:convertFormat`チャネル・`MemoConvertFormatArgs`・`PreloadApi.memo.convertFormat`をフルスタックで配線（既存チャネルの慣例通り、UIボタン/メニューは追加していない）。`MemoCreateArgs`に`format?`を追加。
+- **意図的にスコープ外とした事項（milestone doc通り）**: `memo:convertFormat`の呼び出し元UI（変換前の装飾/画像検出・確認ダイアログ、`.txt`⇔`.md`変換コマンド自体の導線）、新規メモ作成時の「通常メモ/Markdownメモ」選択UI、ライブプレビュー描画・サニタイズ（DOMPurify等）はいずれもM10b/M10cスコープのため未着手。`tabService.ts`はmilestone docのファイル一覧に記載があるが、実際に拡張子判定を行う`scanTabFolder`は`memoFileService.ts`側に定義されており（v1 M1時点の既存のファイル構成、tabService.ts自体に拡張子のハードコードは無し）、対象関数を修正済みのため変更不要と判断した。
+- 確認: `npx tsc --noEmit -p tsconfig.json`・`npx tsc --noEmit -p tsconfig.node.json`とも成功。`npx electron-vite build`成功（`out/main/index.js` 133.49kB / `out/preload/index.js` 9.61kB / `out/renderer/assets/index-*.js` 1,026.62kB）。実行時動作検証は未実施（tester範囲）。
+- reviewerへ静的レビューを依頼予定。コミット・プッシュは行っていない。
+
+## reviewer — M10a（Markdown保存形式基盤・全文検索反映）静的レビュー（ラウンド1）
+
+対象: src/shared/constants.ts（`MEMO_EXT_MARKDOWN`/`MARKDOWN_ALLOWED_TAGS`）、src/main/fs/memoFileService.ts（`extOfFound`/`findMemoFile`/`scanTabFolder`/`saveMemo`/`createEmptyMemoFile`/`convertMemoFileFormat`/rename・duplicate・move・copy）、src/main/watch/watcher.ts、src/main/search/searchIndex.ts（`stripMarkdownTags`/`computeIndexedContent`/`updateMemo`/`indexTab`）、src/main/crypto/encFormat.ts、src/main/crypto/sessionKeyStore.ts、src/main/ipc/cryptoHandlers.ts（encryptMemo/decryptMemoToPlain/open/saveEncrypted/changePassword）、src/main/ipc/memoHandlers.ts（create/save/convertFormat）、src/renderer/components/dialogs/PropertiesDialog.tsx、src/shared/ipc-contract.ts・src/preload/index.ts・src/renderer/ipc.ts の配線一式。M10a-markdown-format-core.md「reviewer/testerへの申し送り」4点、DESIGNv3 §2.4/§2.5/§2.6 Q11、PLANv3 §2.3/§5.8/§5.9、00-core-principles.md §1/§10と照合。
+
+- 申し送り1（`.md`のCRUD/移動が`.txt`と同様か）OK: `extOfFound`ヘルパーへ拡張子維持ロジックを一元化した上で`renameMemoFile`/`duplicateMemoFile`/`moveMemoFileToFolder`/`copyMemoFileToFolder`全てが元拡張子（`.txt`/`.md`/`.txtenc`）を正しく維持することをコードトレースで確認。`saveMemo`も`findMemoFile`で実拡張子を解決してから書き込み、未作成時のみ`.txt`既定へ後退、`.txtenc`検出時は`NAME_INVALID`で誤上書きを防止する実装を確認。`isMemoNameTaken`（memoHandlers.ts 83-100行目）は`scanTabFolder`の`memoName`（拡張子を含まないキー）ベースのため`.txt`/`.md`/`.txtenc`が自然に統一名前空間になっており、00-core-principles.md §11の既存原則を`.md`追加後も維持できていることを確認（`tree:updateStructure`等の重複判定も同じ`scanTabFolder`経由のため波及なし）。
+- 申し送り2（`memo:convertFormat`後のメタJSON・全文検索インデックス追従、旧拡張子エントリ残留なし）OK: `convertMemoFileFormat`は拡張子のみリネームで`memoName`自体は不変のため、`metaStore`のノード参照（`memoName`キー）・全文検索インデックス（`tabId`+`memoName`キー）とも旧/新拡張子で別エントリになる余地が無い（残留の心配自体が構造的に発生しない設計）ことを確認。ハンドラは変換直後に`readMemo`で読み直し`updateMemoIndex(..., targetFormat)`を呼び、`.md`→タグ除去/`.txt`→無加工の索引内容切り替えが正しく反映されることを確認。
+- 申し送り3（暗号化`.md`メモの`format`フィールド・復号時の拡張子復元）OK: `crypto:encryptMemo`が`findMemoFile`で得た`found.format`を`buildTxtEncFile`へそのまま渡し、`crypto:decryptMemoToPlain`が`.txtenc`の`format`（省略時'plain'）から復元先拡張子を判定するロジックを確認。`crypto:open`/`crypto:saveEncrypted`/`crypto:changePassword`は`sessionKeyStore`の`format`（`hint`と同じ「再暗号化に必要な最小限情報」パターン）を経由して再暗号化のたびに引き継がれることをコードトレースで確認（`saveEncrypted`は`session.format`を、`changePassword`は`loaded.file.format`を、それぞれ新しい`buildTxtEncFile`呼び出しへ渡す）。`.txt`との取り違えは確認できず。
+- 申し送り4（v1形式`.txtenc`の後方互換）OK: `parseTxtEncFile`は`v.format`が`undefined`の場合のみ許容し`format: undefined`を返す（未知の値は破損扱いで`null`）。`decryptMemoToPlain`/`crypto:open`とも`format === 'markdown' ? 'markdown' : 'plain'`の三項式で`undefined`を`'plain'`へフォールバックしており、`format`フィールドを持たない既存`.txtenc`もマイグレーション不要でそのまま読める。`buildTxtEncFile`も`'markdown'`のときのみ`format`キーを書き出す（`hint`と同じ既定値省略の流儀）ため、v1ファイルへ書き戻す場合も不要なフィールド追加が起きない。
+- developer判断5(a)（`memo:convertFormat`の`lockContext`指定時`NAME_INVALID`拒否）OK: ロック解除セッション配下は`.txtenc`固定で拡張子概念自体が無く、DESIGNv3/PLANv3ともセッションメンバー単位の`format`追跡を定義していないため、新設せず明示拒否する判断は妥当。
+- developer判断5(b)（watcher.ts/PropertiesDialog.tsxの追加修正）OK: watcher.tsは`processSettledEvent`の拡張子判定に`.md`分岐が無いと外部変更が全文検索/`evt:externalChange`へ反映されず「`.txt`と全く同様に動作する」というM10aゴールを満たさないため必須の修正であり、既存の`.txt`/`.txtenc`分岐と同一パターンでの追加を確認。PropertiesDialog.tsxも`encrypted`のみからの拡張子決め打ちを`filePath`実体ベースへ修正しており、表示バグとして正当な追加修正と判断。いずれもスコープ逸脱ではなく整合性維持に必要な範囲。
+- セキュリティ（00-core-principles.md §10）: 新規/変更コード（encFormat.ts, sessionKeyStore.ts, cryptoHandlers.ts, searchIndex.ts, memoFileService.ts）に鍵・パスワード・復号平文のログ出力・ハードコードなし。`console.*`呼び出しの追加なし。
+- 参考（非ブロッキング、対応不要）: (1) `searchIndex.ts`の`stripMarkdownTags`は`'img'`/`'span'`をハードコードした正規表現で除去しており、`constants.ts`の`MARKDOWN_ALLOWED_TAGS`定数（M10a/M10b共通の想定）を実際には参照していない。現時点では値が完全に一致しているため機能上の不整合は無いが、将来M10bで定数側のタグ種類が増えた場合に本関数だけ追従し忘れるリスクがある。(2) `src/main/crypto/nodeLock.ts`の`lockNode`（198-213行目付近）は`.txtenc`化する際に`buildTxtEncFile`へ`format`を渡しておらず、ノードロック対象に`.md`メモが含まれるとロックした瞬間に`format`が失われる（以後そのサブツリーは「一方通行の金庫」＝DESIGNv3 §1.12により平文へ戻る経路が無いため、恒久的に`markdown`属性が失われる）。ただしM8/M9a〜c/M10a/M10b/M10cのいずれの milestone doc も相互に「依存関係: 無い」と明記しており、ロック中コンテンツはライブプレビュー対象にもならない設計のため、現状は observable な悪影響が無い。今後M10b/M10c側でロック解除セッション中コンテンツにMarkdown関連機能を広げる際は、このformat消失を許容するか否かをdesignerへ確認することを推奨（M10aの実装自体に不備があるとは判断しない）。
+- 判定: ブロッキング指摘なし。申し送り1〜4・developer判断5(a)(b)ともクリア。tester へ進行可。
+
+## developer — M10b（0. 前提: format伝播 + 装飾ライブプレビュー描画・サニタイズ・右クリック装飾コマンド）実装
+
+対象: docs/v3/milestones/M10b-markdown-live-preview.md 全体（「0. 前提: format伝播の実装」必須先行作業＋通常の装飾ライブプレビュー描画）。DESIGNv3 §1.13/§2、PLANv3 §0/§4/§5.6/§7.8。M10a完了後にreviewerが発見した「ノードロックが`.txtenc`化時にMarkdownの`format`フィールドを引き継がない」ギャップの是正（0節）と、右クリック装飾コマンド・CodeMirror ViewPluginによるライブ描画・DOMPurifyベースのサニタイズ（本体）の両方が対象。M10c（ツールバー・画像貼り付け・ソース/プレビュー切替UI・変換UI）はスコープ外。
+
+### 0. format伝播（milestone doc記載の関数変更一覧どおりに実装、設計判断のやり直しなし）
+- **`src/shared/models.ts`**: `NodeLockBlob`に`formatMap: Record<string, 'plain'|'markdown'>`、`TreeNode`に`readonly format?: 'plain'|'markdown'`を追加。
+- **`src/shared/ipc-contract.ts`**: `CryptoOpenResult`に`format: 'plain'|'markdown'`（必須）を追加。`EditorReportActiveArgs.active`に`format?`を追加（**developer判断・milestone doc記載外の補完**: 右クリックメニュー「文字色/太字/文字サイズ」を`.md`メモ編集時のみ追加するという本マイルストーンのゴールを満たすには、メニューを組み立てる**メインプロセス**（`main/index.ts`の`context-menu`ハンドラ）が現在開いているメモのMarkdown判定を知る必要があるが、既存の`activeMemoState`（M4新設、dirty状態通知と同じ経路）には`format`が無かったため、既存パターンを踏襲し相乗りさせた。新規IPCチャネルは追加していない）。`MarkdownDecorationCommand`型と`EditorMenuCommandPayload`への`{kind:'decoration'}`分岐を追加。
+- **`src/main/crypto/nodeLockSessionStore.ts`**: `NodeLockSessionEntry.formatMap`追加。`buildSessionTreeNodes(children, lockToken, formatMap)`にシグネチャ変更（非ロックノードに`format`付与、入れ子ロック済みプレースホルダは`undefined`のまま）。`buildOriginTreeNode`も同様に対応。
+- **`src/main/crypto/nodeLock.ts`**: `readSubtreeMember`が`format`も返す（`parentEntry`指定時は`parentEntry.formatMap[n.memoName] ?? 'plain'`、個々の`.txtenc`ヘッダは参照しない）。`lockNode`が`formatMap`を構築し`NodeLockBlob`へ格納、`buildTxtEncFile`へ`format`を渡す（自己記述性のための多重化）、入れ子ロック時は親の`formatMap`からも削除。`unlockNode`のセッション構築時`formatMap: blob.formatMap ?? {}`（後方互換フォールバック）。`reencryptSessionBlob`が`formatMap`を含めて再暗号化。`writeSessionMemoContent`に`format`引数を追加（必須、呼び出し元が明示的に決定、内部で`formatMap`更新はしない）。
+- **`src/main/ipc/memoHandlers.ts`**: `createMemoInSession`に`format`引数追加（`memo:create`ハンドラの`lockContext`分岐から`args.format`を配線）。`renameMemoInSession`/`deleteMemosInSession`/`duplicateMemoInSession`/`moveWithinSession`（コピー分岐）/`moveIntoSession`が`nameMap`と並行して`formatMap`も更新。`memo:save`ハンドラの`lockContext`分岐は`entry.formatMap[args.memoName] ?? 'plain'`をそのまま`writeSessionMemoContent`へ渡す（内容だけの保存、変更しない）。`memo:read`ハンドラは変更なし（milestone doc記載通り）。
+- **`src/main/fs/metaStore.ts`**: `reconcile`の`scannedEntry`分岐・`extras`（孤児）分岐の双方に`format: scannedEntry.encrypted ? undefined : (format==='markdown'?'markdown':'plain')`を追加（暗号化済みノードは実体不明のため`undefined`のまま）。
+- **`src/main/ipc/cryptoHandlers.ts`**: `crypto:open`ハンドラの戻り値に`format`を追加（`setSessionKey`へ渡す判定ロジックを再利用）。
+
+### レンダラ側の`format`判定方針（§0.7、developer裁量）
+- `src/renderer/editor/eolKeeper.ts`の`OpenMemoState`に`format?`を追加し`createOpenMemoState`の第5引数とした。平文メモ/ロック解除セッション配下メモを開く主経路（`App.tsx`の`openMemoByName`）は`findTreeNodeInScope(tree, memoName, lockToken)?.format`（クリックされた行そのもの由来のツリー状態、scope-qualified）で解決。全文検索ジャンプ（`handleJumpToHit`）・`memo:`リンク遷移（`openMemoDirect`）はセッション対象外前提のためscope省略の`findTreeNode`によるbest-effort解決とした（タブ切替直後の一瞬のズレ等はライブプレビュー表示のみに影響する非致命的事項と判断、milestone doc「developer裁量」の範囲内）。外部変更の静かな反映・競合解決の「自分の内容を維持」等、内容だけが変わり拡張子が変わらない経路は直前の`openMemo.format`/`om.format`をそのまま引き継いだ。M6個別暗号化の`crypto:open`（`unlockToOpen`）は`CryptoOpenResult.format`をそのままローカル状態として保持（`TreeNode.format`が`encrypted:true`の間`undefined`のままな設計のため、milestone doc §0.7 2つ目の判定方針どおり）。`reportActiveMemo`の呼び出し全箇所（`null`渡し以外）に同様の`format`を伝播させ、main側`activeMemoState`まで届くようにした。
+
+### 装飾ライブプレビュー描画・サニタイズ・右クリック装飾コマンド（本体）
+- **`src/shared/constants.ts`**: `MARKDOWN_ALLOWED_SPAN_STYLE_PROPS`/`MARKDOWN_ALLOWED_IMG_ATTRS`/`MARKDOWN_IMAGE_SRC_PATTERN`を追加（`MARKDOWN_ALLOWED_TAGS`はM10aで先出し済み）。
+- **`src/renderer/editor/markdownSanitize.ts`（新規）**: DOMPurifyを`ALLOWED_TAGS:['span','img']`+`ALLOWED_ATTR:['style','src','width','height']`で使用。`style`属性はDOMPurify標準機能だけでは足りないため`uponSanitizeAttribute`フックでCSSプロパティ単位フィルタ（`color`/`font-size`/`font-weight`のみ許可、`url()`/`expression()`/`javascript:`混入も安全側で追加除去）を実装。`img`の`src`は`ALLOWED_URI_REGEXP`（既定はdata:を許可しないため明示指定）+フック内二重検証で`MARKDOWN_IMAGE_SRC_PATTERN`（data:image/…;base64のみ）に絞り込み、`width`/`height`も数値(+%)以外を除去。`<script>`・`on*`イベント属性は許可リスト外のため常に除去される（DOMPurifyの既定動作＋本実装のALLOWED_ATTR絞り込みの二重防御）。
+- **`src/renderer/editor/markdownDecorations.ts`（新規）**: CodeMirror `ViewPlugin`。独自の完全なHTMLパーサは実装せず、装飾コマンドが生成する既知のタグ形（`<span style="...">...</span>`/`<img ...>`）のみを正規表現で検出し、一致範囲だけを`sanitizeMarkdownFragment`でサニタイズした上で`Decoration.replace`+`WidgetType`（`innerHTML`にサニタイズ済みHTMLを設定）へ差し替える。**一致しない任意のテキスト（`<script>`等を含む）は一切HTMLとして解釈されずCodeMirrorの通常プレーンテキストとして表示される**ため、正規表現が拾わなかった不正なタグ文字列がそのまま実行されるような経路は無い（regex一致→DOMPurifyサニタイズ→安全なDOM構築、の一方向のみ）。文書変更のたびに全文書を再スキャンする（個人用メモの想定規模ではviewport分割等の最適化は不要と判断）。
+- **`src/renderer/editor/decorationCommands.ts`（新規）**: 既存`textCommands.ts`と同じ`changeByRange`パターン（1操作=1トランザクション=Undo1回, DESIGNv3 §2.2）。選択範囲の直前直後が正確に`<span style="...">`/`</span>`で囲まれている場合は既存styleへプロパティを足す/同値なら外す（トグル）、全プロパティが無くなればタグごと除去（アンラップ）。囲まれていなければ新規ラップ。色/文字サイズの「解除」メニュー項目は`value:''`を渡すことで既存値と無関係に常に除去する専用パスとした。
+  - **既知の限界（developer判断、reviewer確認事項）**: ネストしたspan（選択範囲が既存装飾の内側の一部のみに掛かる場合等）の厳密な構文解析は行わない簡易実装。この場合`applyOrToggleSpanStyle`は新規ネストしたspanを生成するが、`markdownDecorations.ts`の非貪欲な`</span>`一致検出は最初に現れる`</span>`までしか対応範囲を認識しないため、ネストしたspanを含む複雑な入れ子構造の見た目描画が崩れる可能性がある（実データ・セキュリティには影響しない、見た目のみの制約）。DESIGNv3 §2.7が構造記法を対象外としている範囲に収まる判断だが、reviewerの判断を仰ぐ。
+- **`src/renderer/components/Editor/CodeMirrorEditor.tsx`**: `markdown?: boolean`propを追加（非制御コンポーネントのためマウント時にのみ評価、`markdown`時のみ`buildMarkdownDecorationExtension()`を組み込む。M10c予定のソース/プレビュー切替が動的トグルを担う想定はmilestone doc記載通り）。`CodeMirrorEditorHandle`に`runDecorationCommand`を追加。
+- **`src/renderer/App.tsx`**: `CodeMirrorEditor`に`markdown={openMemo.format==='markdown'}`を配線。`evt:editorMenuCommand`の`kind:'decoration'`ケースを追加し`editorRef.current?.runDecorationCommand(payload)`へ委譲。
+- **`src/main/index.ts`**: 既存の`context-menu`ハンドラ内、`active.format==='markdown'`のときのみ「装飾」サブメニュー（太字/文字色5色+解除/文字サイズ3段階+解除、いずれも`hasSelection`時のみ有効）を追加し`evt:editorMenuCommand`（`kind:'decoration'`）を送出する。色/サイズの具体的な選択肢はDESIGNv3に明記が無いため developer 判断で決定（既存の「書式」サブメニューと同水準の簡素な構成）。
+- **`src/main/watch/activeMemoState.ts`**: `ActiveMemoState`に`format?`を追加（`editor:reportActive`ハンドラ経由でそのまま保持）。
+- **`electron.vite.config.ts`**: CSPの`img-src`に`'self' data:`を追加（既定は`default-src 'self'`のみで`data:`画像が読み込めないため。画像貼り付けUI自体はM10cスコープだが、サニタイズ+描画自体は本マイルストーンで実装するため、既存`.md`ファイルに手動で埋め込まれた画像等も表示できるようにする安全側の対応）。
+- **新規依存**: `dompurify`（`npm install`で追加、`package.json`/`package-lock.json`反映済み。型は同梱のための`@types/dompurify`は不要）。
+
+### 意図的にスコープ外とした事項（milestone doc通り）
+- ツールバー・ソース/プレビュー切替UI・画像貼り付け（`.md`メモ作成時の選択導線含む）・`memo:convertFormat`のUI導線はいずれもM10cスコープのため未着手。
+
+### 確認
+- `npm run typecheck`（`tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json`）エラーなし。`npx electron-vite build`成功（`out/main/index.js` 137.78kB / `out/preload/index.js` 9.61kB / `out/renderer/assets/index-*.js` 1,101.63kB）。実行時動作検証は未実施（tester範囲）。
+- 参考（非ブロッキング・M10bの差分外）: `src/main/crypto/sessionKeyStore.ts`が本セッション開始時点で（自分は一切触れていないにもかかわらず）`git diff`上バイナリ差分として表示される状態だった（ファイル内容自体はテキストとして正常に読める。`makeKey`の`` `${tabId} ${memoName}` ``のテンプレートリテラル内、本来の半角スペースの位置に`0x00`バイトが1個混入しておりgitのバイナリ判定を誘発している模様だが、機能上は`makeKey`の生成/参照が常に同一ロジックのため実害なし）。M10a完了時点で既に作業ツリーに存在していた状態と推測され、本マイルストーンの実装では一切変更していない。
+
+reviewerへ静的レビューを依頼予定。コミット・プッシュは行っていない。
+
+## reviewer — M10b 静的レビュー（ラウンド1）
+
+対象: 上記developerエントリ全体（§0 format伝播 + 装飾ライブプレビュー描画・サニタイズ・右クリック装飾コマンド）。
+
+- **結果: 指摘なし（OK）**。
+- 確認した主な観点:
+  - サニタイズ（最重要）: `markdownSanitize.ts`のDOMPurify設定（`ALLOWED_TAGS`/`ALLOWED_ATTR`/`ALLOWED_URI_REGEXP`）+`uponSanitizeAttribute`フック（style属性のプロパティ単位フィルタ、img/srcの二重検証、width/height数値検証）と、`markdownDecorations.ts`の正規表現マッチング（一致しない任意テキストは装飾HTMLとして解釈されない設計）の組み合わせで、`<script>`/`on*`/`javascript:`/許可外CSSプロパティが除去されることをコードレベルで確認した。多層防御になっており妥当。
+  - 装飾コマンド実行後の本文形式（`decorationCommands.ts`）: `<span style="...">`のラップ/アンラップ/トグルロジックを確認。見た目とデータの分離は保たれている。
+  - Undo単位: `changeByRange`+単一`view.dispatch(state.update(spec))`で1トランザクション=1Undoになっていることを確認（既存`textCommands.ts`と同パターン）。
+  - §0 format伝播: milestone doc §0.1〜§0.6の関数変更一覧と実装（`models.ts`/`ipc-contract.ts`/`nodeLockSessionStore.ts`/`nodeLock.ts`/`memoHandlers.ts`/`metaStore.ts`/`cryptoHandlers.ts`）を1件ずつ突合し、記載通りであることを確認。
+  - developer判断項目（`EditorReportActiveArgs.active.format`追加、レンダラformat解決のbest-effort方針、右クリック装飾サブメニュー構成、ネストしたspanの既知の限界）: いずれも設計文書と矛盾せず妥当と判断（ネストしたspanの限界は見た目のみでセキュリティ・データ整合性に影響しない旨disclosure済みであり許容）。
+  - `sessionKeyStore.ts`のバイナリ差分: developer記載の通りM10b差分外として無視。
+- tester（実UI検証）へ進めてよい。milestone doc「reviewer/testerへの申し送り」記載のノードロック往復・セッション内新規作成/リネーム/複製・境界跨ぎ移動・M6個別暗号化開封・`.txt`誤判定なしの各シナリオを重点確認対象として引き継ぐ。
+
+## tester — M10b（0. 前提: format伝播 + 装飾ライブプレビュー描画・サニタイズ・右クリック装飾コマンド）動作検証（2回目の試行）
+
+対象: reviewer OK後のM10b全体。1回目のtester試行は原因不明のまま約1時間応答が止まり（developer側でプロセス強制終了・環境再構築済み）、本ラウンドはユーザー指示により**Electronのネイティブ右クリックコンテキストメニューをCDP合成マウス操作で開いてクリックする自動化を避け**、CodeMirrorエディタのDOMへ`document.execCommand('insertText', ...)`で直接HTML文字列を入力し保存後の状態を確認する方式、およびIPC（`window.api.*`）直叩きを中心に検証した。
+
+- **結果: 指摘なし（OK）**。
+
+### 環境
+- `npx electron-vite build`成功を確認後、ビルド成果物（`out/`）と最小`package.json`をリポジトリ直下`.tmp-tester-app/`へコピーし、`env -u ELECTRON_RUN_AS_NODE npx electron --remote-debugging-port=9333 .tmp-tester-app`で起動（`--user-data-dir`には頼らない方式、`.tmp-tester-app/config`/`data`が新規作成されたことで隔離を確認）。CDP（`ws://127.0.0.1:9333/devtools/page/...`）へNode 24の組み込み`WebSocket`/`fetch`で接続し、`Runtime.evaluate`で`window.api.*`のIPC呼び出しやDOM操作・クリックを実行するスクリプト（scratchpad配下、リポジトリ非汚染）を都度使用。各コマンドは15秒程度のタイムアウトを設定し無期限待機を回避した。
+
+### 1.【最重要】サニタイズ確認
+- `.md`メモ（`sanitize-test`）へ`memo:save`で`<span style="color:red">ok</span><script>alert(1)</script><img src=x onerror=alert(1)><span style="color:blue;position:fixed;top:0" onclick="alert(1)">test2</span>`を保存し、UIでツリーから開いてライブプレビュー描画を確認。
+  - `color:red`のspanのみ`.md-decoration`として正しく装飾描画（`style="color: red"`のみ残存）。
+  - `<script>alert(1)</script>`は装飾パターン（span/img専用の正規表現）に一致せず、CodeMirror上でエスケープされたプレーンテキスト（`&lt;script&gt;...`）として表示され実行されない。
+  - `<img src=x onerror=alert(1)>`は`.md-decoration`内で`<img>`まで縮退（`src`が許可パターン`data:image/...;base64`に一致せず除去、`onerror`も許可属性外のため除去）。実際にDOM上`img`要素に`src`属性が無いことを確認（`getAttribute('src')===null`）。
+  - `onclick`付きの最後のspanは、装飾コマンドが生成する正規表現（`<span\s+style="[^"<>]*">`＝style属性以外を持たない形のみ許容）に一致しないため装飾化されずプレーンテキストとしてエスケープ表示（onclickは発火しない。より安全側に倒れている）。
+  - `window.alert`実行の兆候（レンダラのブロッキング/ハング）なし。CDP evalは都度正常応答した。
+  - ディスク上の実ファイル（`.tmp-tester-app/data/tester-m10b/sanitize-test.md`）を直接catし、保存された内容が上記タグ込みのプレーンテキストのまま（サニタイズや変換をされていない生Markdown）であることを確認（見た目とデータの分離）。
+
+### 2. 装飾コマンド実行相当の内容保存後の本文形式
+- 上記の通り、`.md`ファイルの実体は常にタグ込みプレーンテキストのまま。別途`m6-md-test`（M6個別暗号化）でも`document.execCommand('insertText', ...)`で`<span style="font-weight:bold">boldtext</span><script>alert(2)</script>`を`.cm-content`へ直接入力し、`font-weight: bold`のみ残った`.md-decoration`描画と、scriptタグの非実行（エスケープ表示）を確認。
+
+### 3. 右クリック「装飾」メニュー実操作・Undo単位
+- ユーザー指示に基づき、ネイティブ右クリックメニューをCDP合成クリックで開く自動化は今回**実施しなかった**（1回目の試行がこの操作近辺で約1時間ハングした前例があるため、時間予算超過リスクを避けて代替検証に一本化）。`decorationCommands.ts`のラップ/アンラップ/トグルロジック、Undo単位（`changeByRange`+単一`dispatch`）はreviewerが静的レビューでOK済み。本ラウンドでは実際の装飾描画パイプライン（生テキスト→正規表現一致→サニタイズ→ウィジェット描画）をDOM直接操作で通しで確認し、この部分は動作を実証済み。
+
+### 4〜7. ノードロック交差対応（重点）
+- `.md`メモ（`sanitize-test`、`crypto.lockNode`→`crypto.unlockNode`→`crypto.relockNode`→`crypto.unlockNode`の1往復以上）を通じ、`unlockNode`の返却`tree`の`format`が一貫して`"markdown"`のまま維持されることを確認。
+- ロック解除セッション中に`memo.create`（`lockContext`指定、`format:'markdown'`）で新規`.md`メモ（`session-new-md`）を作成→内容保存→relock→再unlockでも`format:"markdown"`を維持。
+- 通常領域の`.md`メモ（`outer-move-test`）を`memo.move`（`destLockContext`指定、srcLockContext省略＝外→内）でセッション配下へ移動→relock→再unlockでも`format:"markdown"`を維持。
+- セッション内での`memo.rename`（`outer-move-test`→`outer-move-test-renamed`）・`memo.duplicate`後もrelock→再unlockで両方とも`format:"markdown"`を維持することを確認。
+
+### 8. M6個別暗号化開封時のformat
+- 通常領域に`.md`メモ（`m6-md-test`）を作成→`crypto.encryptMemo`→`crypto.open`で、返却値`format:"markdown"`を確認。UIでも同メモをパスワード入力ダイアログ経由で開封し、`document.execCommand('insertText', ...)`で入力したspanタグが正しくライブプレビュー装飾されることを確認（レンダラ側のローカル状態保持が機能）。
+
+### 9. `.txt`メモの誤判定なし
+- 通常領域の`.txt`メモ（`plain-txt-test`）で`tab.openTree`の返却値が`format:"plain"`であることを確認。UIでも同メモへ`<span style="color:red">notdecorated</span>`を保存・表示させ、`.md-decoration`が一切生成されずエスケープされたプレーンテキストのまま表示されることを確認（逆方向の取り違えなし）。
+
+### 後片付け
+- `.tmp-tester-app/`削除済み（`git status`で確認、リポジトリに残留物なし）。
+- 起動した全`electron.exe`プロセス（4個）を`taskkill /F /T`で終了し、`tasklist`で残存プロセス無しを確認。
+- リポジトリ直下の実データ用`config/app-settings.json`（`.gitignore`対象、developerの実データ）は本セッション中一切書き込まれていないことをmtime確認（セッション開始前のタイムスタンプのまま）＋テスト用タブ/メモ名（`tester-m10b`等）が含まれていないことをgrepで確認。`data/`フォルダも同様に無変更。
+
+## developer — M10c（Markdownツールバー・ソース/プレビュー切替・画像貼り付け・変換UI）実装
+
+対象: v3 M10c（`docs/v3/milestones/M10c-markdown-toolbar-ui.md`、DESIGNv3 §2.1/§2.2/§2.4/§2.5/§2.6、PLANv3 §5.7/§5.8のUI側）。M10a/M10b（既にreviewer/tester通過済み）を前提に、専用ツールバー・ソース/プレビュー切替・画像貼り付け・`.txt`⇔`.md`変換UI・新規メモ作成時の形式選択を実装。M8/M9（ノードロック）とは独立、依存・被依存なし。
+
+- **着手前の設計矛盾の発見・designer確認（本セッション）**: `docs/v3/DESIGNv3.md` §2.5/`PLANv3.md` §5.7/M10cのmilestone docはいずれも画像貼り付けの挿入テキストを Markdown記法 `` `![](data:image/png;base64,...)` `` と記載していたが、M10bで既に実装・レビュー/テスト済みのライブプレビュー描画エンジン（`markdownDecorations.ts`の`IMG_PATTERN`）は`<img ...>` HTMLタグのみを検出する設計であり、`MARKDOWN_ALLOWED_TAGS`/`MARKDOWN_ALLOWED_IMG_ATTRS`/`MARKDOWN_IMAGE_SRC_PATTERN`（`constants.ts`）もHTML `<img>`タグの属性（src/width/height）を前提に定義されている（`![]()`記法にはwidth/height概念自体が無い）。両者は非互換のため、`![]()`をそのまま挿入するとM10bのプレビューエンジンが検出できずM10cのゴール自体が達成できない矛盾だった。designerへ確認し、**`<img src="data:image/...">`（HTMLタグ）を使う判断で確定**（M10bの`markdownDecorations.ts`/`markdownSanitize.ts`/`constants.ts`は無改造）。`docs/v3/DESIGNv3.md` §2.5も designer がこの判断に合わせて更新済み（`![]()`表記を`<img>`表記へ修正）。
+- **新規ファイル**:
+  - `src/renderer/editor/imagePaste.ts` — クリップボード/ドロップ画像の貼り付け（`EditorView.domEventHandlers`の`paste`/`drop`）。`FileReader.readAsDataURL`でBlobをそのまま`data:<mime>;base64,...`へ変換（MIME判定を手動実装しない）。`Blob.size`（実バイト数）が`MARKDOWN_IMAGE_SIZE_WARN_BYTES`超なら`onImageReady`コールバック（App.tsx側の確認ダイアログ）へ委譲し、続行後にのみ挿入する`insert`クロージャを渡す。EditorView破棄後（非同期完了までの間にメモ切替）の誤挿入は`view.dom.isConnected`で防御。**developer判断**: `<img>`に`width`/`height`属性は付与しない（許可リストには含まれるが必須ではない。固定属性を付けるとCSSの`max-width:100%`縮小時に`height:auto`が無いと縦横比が崩れる懸念があり実装を単純に保った。念のため`.md-decoration img`のCSSに`height: auto`を追加済み）。
+  - `src/renderer/components/Editor/MarkdownToolbar.tsx` — ライブプレビュー編集中専用ツールバー（`.md`メモを開いている間のみApp.tsxが表示）。ソース/プレビュー切替ボタンと`.md`→`.txt`変換ボタン（暗号化メモ・ノードロックセッション配下では非表示）を含む。配置・ボタン構成はmilestone doc記載通りdeveloper裁量。
+- **`src/shared/constants.ts`**: `MARKDOWN_IMAGE_SIZE_WARN_BYTES = 500 * 1024`を追加（milestone doc記載の目安値をそのまま採用）。
+- **`src/renderer/editor/codeMirrorSetup.ts`**: `EditorCompartments`に`preview: Compartment`を追加、`buildPreviewExtension(enabled)`/`reconfigurePreview(view, compartments, enabled)`を新設（`readOnly`と同じパターン）。ソース/プレビュー切替を**再マウントせずCompartment経由で動的反映**することで、M10bの`markdownDecorations.ts`コメント「この ON/OFF を担う想定」に対応し、切替時にカーソル位置/Undo履歴/スクロール位置/本文が一切変化しないことを保証する（milestone docの申し送り「切替時に本文が変化しないか」に対応）。
+- **`src/renderer/components/Editor/CodeMirrorEditor.tsx`**: `previewMode?: boolean`（既定true）・`onImagePasteRequest?`propを追加。マウント時の静的組み込みだった`buildMarkdownDecorationExtension()`直接呼び出しを、新設の`preview` Compartment経由（`buildPreviewExtension(markdown && previewMode)`）に置き換え、`previewMode`変更を監視する専用effectを追加（`markdown`が false の`.txt`メモでは常に何もしない）。画像貼り付け拡張（`markdown`時のみ）もマウント時に組み込み、コールバックは他の`onLinkClick`等と同じref経由パターンで常に最新を参照する。
+- **`src/renderer/components/Tree/Tree.tsx`**: `onRequestCreate`propに`format?: 'plain'|'markdown'`引数を追加。右クリック「メモを作成」（背景メニュー・行メニューの両方）を「通常メモ」「Markdownメモ」を選べるサブメニュー（既存の`submenu`機構を使用、`ContextMenu.tsx`は無改造）に変更（DESIGNv3 §2.4「新規メモ作成時に通常メモ/Markdownメモを選べるようにする」）。ツリーが空の場合の即席作成ボタン（`tree-empty-state`）は簡素さを優先しplain既定のまま変更していない（developer判断、右クリックで作成し直せる）。
+- **`src/renderer/App.tsx`**:
+  - `previewMode` state（既定true）を追加。メモ切替・reloadGeneration変化のたびに既定へリセットするeffectを追加（DESIGNv3 §2.1「ライブプレビュー方式をデフォルトにする」）。
+  - `handleImagePasteRequest` — 実際に検出したサイズ（約◯MB）を明記した確認ダイアログ（既存`ConfirmDialog`）を表示し、続行時のみ`request.insert()`を呼ぶ（DESIGNv3 §2.6）。
+  - `handleConvertFormat('txt'|'md')` — 既存の`memo:convertFormat`（M10a実装済み）を呼ぶ。`.md`→`.txt`のみ、現在の本文（`contentLF`、未保存の編集も含めて検出することで保存前の装飾/画像も見逃さない）に対し`/<span[\s>]/i`・`/data:image\//i`で装飾/画像を検出し、検出時のみ確認ダイアログ（DESIGNv3 §2.4の定型文そのまま）を表示。成功後は`openMemo.format`をローカル更新し、`reloadGeneration`をインクリメントしてCodeMirrorEditorを再マウント（`markdown` propはマウント時固定のため、format反転を反映するには再マウントが必要。本文=contentLFは変換で変化しないためそのまま引き継ぐ）、`refreshTree`でツリー側の`format`も最新化。暗号化メモ・ノードロックセッション配下は対象外（M10a既存仕様）としてボタン自体を非表示にする防御に加え、ハンドラ内でも同条件で早期returnする多層防御。
+  - `handleRequestCreate`に`format`引数を追加し`ipc.createMemo`へ配線。**stale closure対策**: 作成直後に呼ぶ`openMemoByName`へ`formatHint`（新設の5番目の引数、下記）として作成時に確定済みの`effectiveFormat`を明示的に渡す（直前の`setTree`/`refreshTree`はReactの状態更新が非同期のため、同一イベントハンドラ内で`openMemoByName`が参照する`tree`はまだ更新前のスナップショットのままで、`findTreeNodeInScope`によるツリー逆引きでは新規作成した`.md`メモの`format`を取得できずライブプレビューが初回から有効にならない不具合になるため）。セッション配下作成時のローカル`TreeNode`にも`format`を追加。
+  - `openMemoByName`に`formatHint?: 'plain'|'markdown'`引数を追加（`formatHint ?? findTreeNodeInScope(...)`で優先。既存の他の呼び出し元は未指定のまま＝挙動不変）。
+  - JSX: 既存`app__editor-toolbar`（共通、常時表示）に「Markdownに変換」ボタンを追加（`format!=='markdown' && !encrypted && !lockToken`の時のみ）。`openMemo.format==='markdown'`の時のみ`MarkdownToolbar`を`app__editor-toolbar`の直下に表示。`CodeMirrorEditor`へ`previewMode`/`onImagePasteRequest`を配線。
+- **`src/renderer/App.css`**: `.app__markdown-toolbar`系クラス（既存`.app__theme-toggle`/`.app__theme-toggle--active`と同じ見た目パターン）を追加。`.md-decoration img`に`height: auto`を追加（imagePaste.tsは既定でwidth/height属性を付与しないが、手動編集等で付与された場合の縦横比崩れに対する防御）。
+- **意図的にスコープ外とした事項**: 新しいIPCチャネルは追加していない（画像埋め込み・変換前検出はすべてレンダラ内完結、PLANv3 §5.7/§5.8「IPC不要」通り）。main/index.tsのネイティブ右クリックメニュー（M10bで追加済みの「装飾」サブメニュー）への変換コマンド追加は行っていない（milestone docの「ツールバー等のUIから」を満たすには既存の`app__editor-toolbar`/`MarkdownToolbar`で十分と判断、M10bの既承認コードへの追加変更を避けた）。
+- 確認: `npm run typecheck`（`tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json`）エラーなし。`npx electron-vite build`成功（`out/main/index.js` 141.68kB / `out/preload/index.js` 9.61kB / `out/renderer/assets/index-*.js` 1,109.51kB）。実行時動作検証は未実施（tester範囲）。
+- reviewerへ静的レビューを依頼予定。コミット・プッシュは行っていない。
+
+## reviewer — M10c（Markdownツールバー・ソース/プレビュー切替・画像貼り付け・変換UI）静的レビュー（ラウンド1）
+
+対象: M10c差分一式（imagePaste.ts/MarkdownToolbar.tsx新規、codeMirrorSetup.ts/CodeMirrorEditor.tsx/Tree.tsx/App.tsx/App.css/constants.ts拡張）。DESIGNv3 §2.1/§2.2/§2.4/§2.5/§2.6・milestone doc「reviewer/testerへの申し送り」3項目・developer自身の優先確認事項6点と照合。
+
+- M10c-R1-01 [Medium] NG（1回目）: `imagePaste.ts`の`isImageFile`（貼り付け/ドロップ共通）は`file.type.startsWith('image/')`という緩い判定のみで受け入れるが、描画時のサニタイズ（`markdownSanitize.ts`が参照する`MARKDOWN_IMAGE_SRC_PATTERN = /^data:image\/(png|jpe?g|gif|webp);base64,/`）はpng/jpeg/jpg/gif/webpのみ許可する狭い許可リスト。両者が不整合なため、`.bmp`/`.svg`/`.tiff`/`.ico`等（ドロップ経路ではOS拡張子から実MIMEが付与されうる）を貼り付け/ドロップすると、Base64化されて`<img src="data:image/bmp;base64,...">`のようなタグが本文へ挿入されるが、プレビュー描画時にサニタイズフックが`src`属性ごと除去（`uponSanitizeAttribute`）し、警告もエラーも出さないまま「空の壊れた画像ウィジェット」が残る。巨大なBase64データが本文に永久に埋め込まれたまま、ユーザーはソース表示に切り替えて生タグを目視で探す以外に気づく・除去する手段が無い。修正方針: 貼り付け/ドロップ時点で`MARKDOWN_IMAGE_SRC_PATTERN`相当（またはMIME側の同等リスト）でファイル種別を絞り込み、非対応形式は無警告で無視するか、対応形式外である旨をユーザーに知らせる。
+- 良好点: `.md`→`.txt`変換前検出（`/<span[\s>]/i`・`/data:image\//i`、未保存の`contentLF`基準）は最重要確認項目として想定される装飾/画像混在ケースを正しく検出し、無害な本文では無警告（milestone doc最重要項目クリア）。ソース/プレビュー切替はCodeMirror `preview` Compartment経由で実装され、本文・カーソル位置・Undo履歴を変えずにON/OFFできる（再マウント無し、ViewPluginの残留無し）。画像サイズ警告は`Blob.size`（Base64化前の実バイト数）を`MARKDOWN_IMAGE_SIZE_WARN_BYTES`と比較しており計算・表示（MB換算）とも正しい。新規IPCチャネルの追加は無く（preload/index.ts・ipc-contract.ts未変更を確認）、貼り付けた`<img>`は既存M10bのサニタイズ経路をそのまま通る。`openMemoByName`/`handleRequestCreate`の`formatHint`によるstale closure対策は、`tree`state更新の非同期性を正しく踏まえた妥当な実装。暗号化/ノードロックセッション配下での変換ボタン非表示は既存の「ロック」ボタン非表示パターンと一貫したUX判断で問題なし。
+
+## developer — M10c-R1-01 修正（1回目の修正）
+
+reviewerの提案通り、`imagePaste.ts`の受け入れ判定を`MARKDOWN_IMAGE_SRC_PATTERN`（サニタイズ許可リストと同一の正規表現）で行うよう変更し、非対応形式（bmp/svg/tiff等）検出時はユーザーへ知らせる（無警告での無視ではなく、後者の方針を採用）。
+
+- **`src/renderer/editor/imagePaste.ts`**: `isImageFile`（緩い`image/*`判定）を`isSupportedImageFile`へ置き換え、`MARKDOWN_IMAGE_SRC_PATTERN.test(`data:${file.type};base64,`)`で判定（`constants.ts`の許可リストを二重管理せず同一の正規表現をそのまま再利用、基準のズレを構造的に防止）。`ImagePasteExtensionOptions`に`onUnsupportedImage?: () => void`を追加。`paste`/`drop`ハンドラとも、`image/*`とは判定できた時点で`preventDefault`した上で非対応形式なら`onUnsupportedImage`を呼んで終了する（挿入は行わない）。
+- **`src/renderer/components/Editor/CodeMirrorEditor.tsx`**: `onUnsupportedImagePaste?: () => void`propを追加し、既存の`onImagePasteRequest`と同じref経由パターンで配線。
+- **`src/renderer/App.tsx`**: `handleUnsupportedImagePaste`を追加し`setStatusMessage('この画像形式はサポートされていません（対応形式: png, jpg, jpeg, gif, webp）。')`を表示。`CodeMirrorEditor`へ配線。
+- 確認: `npx tsc --noEmit -p tsconfig.json`エラーなし。`npx electron-vite build`成功。
+- reviewerへ再レビューを依頼（同一指摘への2回目の依頼として、直前のreviewerエージェントへ継続送信予定）。
+
+## reviewer — M10c-R1-01 修正確認（ラウンド2）
+
+対象: src/renderer/editor/imagePaste.ts の `isSupportedImageFile`（新設）・`paste`/`drop`ハンドラ、CodeMirrorEditor.tsx（`onUnsupportedImagePaste` prop配線）、App.tsx（`handleUnsupportedImagePaste`）。旧`isImageFile`の残存無しをリポジトリ全体で確認（背景で並行起動されていた可能性のあるdeveloperエージェントによる競合/重複編集は検出されず、developer報告通り単一のimagePaste.tsのみ存在）。
+
+- M10c-R1-01 OK（解消）: `isSupportedImageFile`が`MARKDOWN_IMAGE_SRC_PATTERN`（`constants.ts`、サニタイズ側と完全同一の正規表現をimport、二重管理なし）を`data:${file.type};base64,`に対して適用しており、png/jpeg/jpg/gif/webp以外（bmp/svg/tiff/ico等）は`data:image/xxx;base64,`が非マッチとなり正しく弾かれることをパターン照合で確認。`paste`/`drop`とも「`image/*`と判定できた時点でのみ`preventDefault`」→「`isSupportedImageFile`で非対応なら`onUnsupportedImage`を呼び`handleImageBlob`を一切呼ばずreturn」という順序になっており、非対応形式のBase64が本文へ挿入される経路が無くなったことを確認。非画像コンテンツ（`item.kind!=='file'`や`type`が`image/`で始まらない）は従来通り`continue`/`return false`でブラウザ既定動作に委ねられ、既存の非画像貼り付け挙動への回帰もなし。
+- 配線確認: `CodeMirrorEditor.tsx`の`onUnsupportedImagePaste`は既存`onImagePasteRequest`と同じref経由パターン（`onUnsupportedImagePasteRef`、useEffect依存配列に追加済み）でstale closureの懸念なし。`App.tsx`の`handleUnsupportedImagePaste`は`setStatusMessage`で対応形式を明記した通知を表示するのみで新規IPC・秘密情報の追加なし。
+- 判定: ブロッキング指摘なし。M10c-R1-01は解消。developer への差し戻し不要。tester へ進行可。
+
+## tester — M10c（Markdownツールバー・ソース/プレビュー切替・画像貼り付け・変換UI）動作検証（1回目の試行）
+
+対象: reviewer OK後のM10c全体。ビルド成果物（`out/`）を`.tmp-tester-app/`（隔離コピー、`--user-data-dir`は使わずelectronの位置引数でこのフォルダ自体をロード）へコピーし、`--remote-debugging-port`経由でCDPから`window.api.*`直叩き＋DOM操作（ネイティブ右クリックメニューのCDP合成クリックは使用せず、`ContextMenu.tsx`は自前React実装のためDOM `contextmenu`イベント直接dispatchで安全に操作）で検証。
+
+- **結果: M10c-T1-01 [Critical] NG（1回目）**。他の最重要確認項目（`.md`→`.txt`変換前ダイアログ、ソース/プレビュー切替の本文非改変、画像サイズ警告閾値、新規作成時のformat選択導線）は全てPASS。
+
+### 1.【最重要】`.md`→`.txt`変換前ダイアログ: PASS
+- 装飾タグ（`<span style="color:red">`）を含む本文で`.txtに変換`ボタンを押すと確認ダイアログ（milestone doc記載の定型文そのまま）が表示されることを確認。画像データURI（`<img src="data:image/png;base64,...">`）のみを含む本文でも同様にダイアログ表示を確認。装飾/画像を含まない本文（`clean-test`）では無警告で即座に`.txt`へ変換される（ステータス「通常のテキスト形式（.txt）に変換しました。」）ことを確認。3パターンとも設計通り。
+
+### 2. ソース/プレビュー切替: PASS
+- `deco-test`（`<span style="color:red">hello</span> world`）でプレビュー/ソースを切替え、文字数カウンタ（42文字）がどちらのモードでも変わらないこと、切替後に`memo:read`で読み直した実ファイル内容のハッシュが保存時と完全一致すること（`a4787ea9...`）を確認。本文（doc本体）は一切変化しない。
+
+### 3. 画像貼り付けサイズ警告閾値: PASS（ただし4のバグと直結）
+- 600KB（614400バイト、閾値500KB超）の疑似画像ペースト（`ClipboardEvent`合成）で確認ダイアログが表示され、メッセージが「この画像は約0.6MBです」と実バイト数と整合する表示になることを確認。100KB（閾値未満）の画像は無警告で即挿入されることを確認。閾値判定・表示自体は正しい。
+
+### 4. 新規作成時のformat選択導線: PASS
+- ツリー背景の右クリックメニュー「メモを作成」▸「通常メモ」/「Markdownメモ」のサブメニューから作成すると、それぞれ`.txt`/`.md`拡張子でファイルが作成され、`.md`作成時は作成直後から（再読み込み不要で）`MarkdownToolbar`が表示されることを確認（`formatHint`のstale closure対策が機能）。`.txt`→`.md`変換もトップレベルの「Markdownに変換」ボタンから正しく動作し、変換後`MarkdownToolbar`が現れることを確認。
+
+### 【Critical】M10c-T1-01: 500KB超の画像を実際に挿入すると、レンダラ全体が数分間（実測約5〜9分、CPU使用時間は継続的に増加＝ビジーループ状態）完全にフリーズする
+- 手順: `.md`メモを開いた状態で600KB（614400バイト）の疑似PNG画像をペースト→サイズ警告ダイアログの「挿入」を押下（`MARKDOWN_IMAGE_SIZE_WARN_BYTES`の想定挙動どおり、警告後に続行できるはずの操作）。
+- 結果: 挿入直後からレンダラプロセス（CDP `Runtime.evaluate`が`1+1`のような軽量な式でも応答しない）が完全に無応答になった。Windowsプロセスの累積CPU時間を計測すると継続的に増加しており（約130秒→約650秒→約818秒と時間経過に比例して増え続ける）、単なる遅い処理ではなく実質的なビジーループ状態。約5分待って一度応答が返ったが、直後の別操作で再びCPU使用量が際限なく増加する無応答状態に戻り、合計で8〜9分待ってようやく再度応答した。ユーザー体感としては「アプリがクラッシュ/ハングした」としか見えないレベル。
+- 切り分け: 同じ長さ（819200文字、画像タグなしの単純な`'A'.repeat(819200)`のプレーンテキスト1行）を`.md`メモに保存して開いただけでも、`<span>`/`<img>`タグを一切含まないにもかかわらず同様の数分間ハングを再現した。したがって`markdownSanitize.ts`のDOMPurify処理自体が主因ではなく、`.md`メモを開いている間常時有効な`markdownDecorations.ts`の`ViewPlugin`（`update.docChanged || update.viewportChanged`のたびに`view.state.doc.toString()`で全文書を毎回文字列化し正規表現2種を全文書に対して実行する設計、131-88行目コメント「文書変更のたびに全文書を再スキャンする」）が、極端に長い1行（横スクロールを要する行）に対してCodeMirrorが内部的に発生させる`viewportChanged`（水平スクロール位置計算等に伴う再計測）を繰り返しトリガーし、そのたびに高コストな全文書再スキャンが多重に走ることで指数的/多重的に悪化している可能性が高い（developer側での実測・要修正、tester側では原因箇所の推定まで）。
+- 影響範囲: `DESIGNv3 §2.6`は画像サイズの目安を「数百KB〜1MB」としており、500KBはその下限として意図的に選ばれている（AGENT_LOG該当箇所参照）。つまり500KB〜1MB程度の画像は「警告は出るが続行すれば正常に使える」ことが設計上の前提だが、実際には警告を承知の上で続行した瞬間に数分間の完全フリーズという、想定を大きく超える重大な副作用が発生する。スマートフォンのスクリーンショット等、日常的に数百KB〜1MB程度の画像は珍しくなく、実運用で高確率に踏むシナリオ。
+- 再現条件・環境: `.tmp-tester-app`隔離コピー環境、`electron`(ビルド成果物`out/`)、Windows。手動再現手順は上記の通りシンプルで、developer環境でも同条件（`.md`メモへ600KB程度の画像貼り付け→警告ダイアログで「挿入」）で再現するはず。
+
+### 後片付け
+- 起動した`electron.exe`プロセスは全て`Stop-Process -Force`で終了、`Get-Process electron`で残存なしを確認。
+- `.tmp-tester-app/`・`.tmp-tester-app2/`（2回目に使った隔離コピー）とも削除済み、`git status`で残留物なしを確認。
+- リポジトリ直下の実データ用`config/app-settings.json`（developerの実データ）はセッション開始前からの`LastWriteTime`（2026/07/26 22:55:17）のまま変化なし、`data/`フォルダにも本セッション中の書き込みなしを確認。
+
+### 判定
+M10c-T1-01（Critical、1回目の指摘）をdeveloperへ差し戻し。他の全確認項目（最重要の`.md`→`.txt`変換ダイアログ、ソース/プレビュー切替、画像サイズ警告閾値・表示精度、新規作成format選択導線、`.txt`⇔`.md`双方向変換）はPASS。
+
+## developer — M10c-T1-01 fix (round 1)
+
+Target: `src/renderer/editor/links.ts` (`LINK_PATTERN`). This is the 1st fix round for M10c-T1-01 (Critical, reported by tester as a multi-minute renderer freeze when inserting/opening a `.md` memo containing one extremely long line, e.g. a >500KB pasted image's base64 data).
+
+- **Root cause found — different from tester's hypothesis.** Tester's report speculated the culprit was `markdownDecorations.ts`'s `ViewPlugin` re-scanning the full document on `viewportChanged` (not just `docChanged`), possibly amplified by CodeMirror's own line-wrap layout cost for a pathologically long single line. I independently verified this via a series of standalone Electron/Node probes (built outside the repo diff, in a temp Electron script using the project's own `@codemirror/*`/`dompurify` packages via an import map, then deleted) before implementing anything:
+  1. A raw DOM layout-cost probe (creating a `wordWrap`-styled `<div>` with a huge unbroken run of text and measuring `getBoundingClientRect()` synchronously) showed only tens-to-hundreds of ms even at 800K characters — ruling out "browser word-wrap layout for a huge unbroken line" as the bottleneck by itself.
+  2. A faithful re-implementation of the exact `markdownDecorations.ts` `ViewPlugin` (same `SPAN_PATTERN`/`IMG_PATTERN` regexes, same `docChanged || viewportChanged` trigger, same `sanitizeMarkdownFragment`/DOMPurify call with the real hooks from `markdownSanitize.ts`, same widget `innerHTML` rendering), mounted in a real (visible, non-throttled) `EditorView` with `EditorView.lineWrapping`, showed **no** pathological behavior at any tested length up to 1.4M characters (worst case ~520ms total, `updateCount` staying at 1–3 regardless of length) — this rules out `markdownDecorations.ts` (both the `viewportChanged` trigger and CodeMirror's own layout) as the cause. (I did NOT change `viewportChanged` → `docChanged` in `markdownDecorations.ts`, since the data shows it isn't the culprit; changing it would not have fixed the bug and would be an unverified guess.)
+  3. Suspecting another `docChanged`-triggered full-document regex extension not covered by probe (2), I checked `links.ts`'s `buildLinkExtension`/`detectLinks`, which also re-scans the whole document via `LINK_PATTERN` on every `docChanged`. Its email-address alternative `[A-Za-z0-9][A-Za-z0-9._%+-]*@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+` has an **unbounded quantifier before a required `@`**. Timed directly (plain Node, no Electron) against a large base64-like string containing no `@` (exactly what an inserted `<img src="data:image/...;base64,...">` payload — or tester's plain `'A'.repeat(819200)` isolation case — looks like): 10K chars → 56ms, 50K → 1.4s, 100K → 5.65s. This is quadratic (25x length → ~25x time, 4x length → ~4.07x time), because every one of the ~n valid start positions (any alnum char) triggers an O(n) greedy-scan-then-backtrack search for an `@` that never arrives. Extrapolating this measured O(n²) curve to n≈819,200 (tester's exact repro length) predicts ≈6.1 minutes — matching tester's observed "5+ minutes then a further 8–9 minutes total" almost exactly (the repeated freezes are explained by `docChanged` firing again on subsequent edits/interactions, re-triggering the same O(n²) scan each time).
+- **Fix**: bounded the email alternative's quantifiers in `LINK_PATTERN` — local part `{0,63}` (RFC 5321 local-part practical limit is 64 octets, and the pattern already requires 1 leading char, so `1+63`), each domain label `{1,63}` (DNS label limit), up to `{1,8}` dot-separated labels (generous headroom for realistic domains). This bounds the worst-case backtracking cost per start position to a small constant instead of O(n), making the whole-document scan O(n) again regardless of content.
+- **Verification (before touching the real file)**: re-ran the same timing probe with the bounded pattern — 10K → 2ms, 100K → 20ms, 400K → 78ms, 800K → 163ms, 1.4M → 259ms (linear, no blowup at any scale tested). Also ran a correctness sanity check comparing the original vs. bounded pattern's matches on 5 representative strings (a realistic email with `+`/`.`/multi-label domain, a `memo:` link, an `https://` URL, a Windows file path, and plain text with no links) — all 5 produced byte-identical matches between the original and bounded patterns, confirming no behavior change for realistic content.
+- All standalone probe scripts (Electron/Node scripts + a small importmap-based HTML harness) used for this investigation were created outside the tracked source tree (repo root as `*.tmp.*`, deleted after use) and are not part of this diff; `git status` confirms only `src/renderer/editor/links.ts` and this `AGENT_LOG.md` entry changed.
+- Confirmed: `npm run typecheck` (`tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json`) no errors. `npx electron-vite build` succeeded (`out/main/index.js` 137.78kB / `out/preload/index.js` 9.61kB / `out/renderer/assets/index-*.js` 1,110.34kB). Did not additionally re-run the full end-to-end GUI repro (paste a 600KB image and wait) myself, since that is tester's role per workflow and the regex-level fix was verified directly against the exact reported input shape/size at the code unit responsible; the standalone-probe verification above already goes beyond the usual "light check" given the severity and the cost of a full GUI repro cycle (tester's own repro took 8–9 minutes).
+- Audited the rest of `src/renderer/editor/*.ts` for the same bug class (unbounded quantifier immediately before a required literal that may be entirely absent from adversarial/long input): `SPAN_PATTERN`/`IMG_PATTERN` (`markdownDecorations.ts`) use a lazy `[\s\S]*?` or a single non-nested quantified char class — no similar risk. `checkboxClick.ts` only inspects the clicked line's prefix, not a full-doc regex. `decorationCommands.ts` has no such pattern (grep confirmed). No other instance found.
+- Requesting reviewer re-review (1st fix round for M10c-T1-01), then tester re-verification (1st fix round for M10c-T1-01) using the original repro steps (paste a >500KB image into a `.md` memo and confirm the warning dialog's "挿入"). Not committed/pushed (working tree changes only).
+
+## reviewer — M10c-T1-01 fix (round 1) static review
+
+対象: `src/renderer/editor/links.ts` の `LINK_PATTERN`（メールアドレス代替の量指定子境界化）のみ。developer所見（tester仮説=markdownDecorations.tsではなくlinks.tsのメールアドレス代替の非境界量指定子がO(文書長²)の根本原因）を静的に検証。
+
+- OK（指摘なし）: 境界化後のパターン（local `{0,63}`/label `{1,63}`/labels `{1,8}`）は各開始位置あたりの最悪バックトラックコストを定数（最大約512文字相当）に抑えるため文書全体でO(n)に収まることを構造的に確認（ネストした量指定子だが各ラベルは`\.`で区切られ曖昧な再分割が起きないため指数的爆発の余地なし）。境界値（RFC 5321実務上限64/DNSラベル上限63/ラベル数8）は妥当、現実的なメールアドレス（複数ラベル・`+`/`.`含む）を誤って弾く回帰なし。
+- `markdownDecorations.ts`不変更の判断は妥当と判断: `SPAN_PATTERN`/`IMG_PATTERN`は`<span`/`<img`という稀な固定リテラルから開始するため、任意の英数字位置ごとに再試行される`LINK_PATTERN`のメール代替とは異なり全文書に対するO(n²)化の対象クラスに該当しないことを独立に確認（developerの実測ベース判断を静的解析の観点からも支持）。
+- developerが同種バグクラスについて監査したと申告した他ファイル（`checkboxClick.ts`/`decorationCommands.ts`（`LOOKBEHIND_WINDOW`境界あり）/`markdownSanitize.ts`/`imagePaste.ts`/`constants.ts`の`MARKDOWN_IMAGE_SRC_PATTERN`）も独自に確認し、同種の脆弱性クラスなしを確認。
+- 設計適合性: `docs/v3`配下にはメールアドレス検出の正規表現仕様の明記なし（PLAN.md §5.8/§2.8は「メール検出」を要求するのみで正規表現形式は未規定）、developerの「開発者裁量のヒューリスティック」という説明と矛盾なし。
+- セキュリティ: 秘密情報のログ出力・ハードコードなし。diffはlinks.tsの`LINK_PATTERN`定数とドキュメントコメントのみ（無関係な変更なし）。
+- コメントブロックは根拠（脆弱性クラス・実測値・境界値の出典）を十分に記載しておりリポジトリの規約に沿う。
+
+## tester — M10c-T1-01 fix (round 1) re-verification — **PASS**
+
+Target: reviewer OK後の `links.ts` の `LINK_PATTERN` 境界化修正。ラウンド1のテスターが報告した正確な再現手順（600KB画像貼り付け＋「挿入」、および画像タグ無しの単純な819,200文字1行のみでの再現）でそのまま再検証。ビルド成果物（`out/`）を`.tmp-tester-appN/`（隔離コピー、`--user-data-dir`は使わず位置引数でこのフォルダをロード。実データ用`config/app-settings.json`のタイムスタンプは検証前後で不変=07/26 22:55のまま、実データへの影響なしを確認）へコピーし、`--remote-debugging-port`経由でCDPから`window.api.*`直叩き＋DOM操作（右クリックネイティブメニューは使用せず、CodeMirrorエディタへの`ClipboardEvent`合成dispatchのみ）で検証。
+
+- **結果: 指摘なし（OK）。M10c-T1-01は解消。M10c全体クローズ可。**
+
+### 1.【最重要】600KB画像ペースト→「挿入」の回帰確認: PASS
+- `.md`メモ（`img-test`）を開いた状態でCodeMirrorエディタへ614400バイト（600KB, `image/png`）の`File`を含む`ClipboardEvent`をdispatch（`imagePaste.ts`の`paste`ハンドラが`preventDefault`したことを確認）。
+- サイズ警告ダイアログが「この画像は約0.6MBです。挿入すると動作が重くなる可能性があります。挿入しますか？」（ラウンド1と同一文言・実バイト数と整合）で表示されたことを確認。
+- 「挿入」ボタンをクリック後、**フリーズなし**。クリック直後のCDP `Runtime.evaluate('Date.now()')`が3msで応答、以後2秒間隔×3回のポーリングもいずれも2〜3msで応答（ラウンド1は8〜9分間無応答だった箇所）。
+- ステータスバーが即座に「819234 文字 / 1 行」「自動保存しました（img-test）」へ更新されたことを確認。ディスク上の実ファイル（`.tmp-tester-appN/data/tester-m10c-r2/img-test.md`）を直接読み取り、819234バイト・1行・`<img src="data:image/png;base64,...">`で開始することを確認（挿入内容の整合性も問題なし）。
+- 隔離環境の`electron.exe`各プロセスのCPU使用時間（`Get-CimInstance Win32_Process`経由）も検証終了時点で数秒程度に留まり、ラウンド1で見られた「時間経過に比例して増え続ける」ビジーループの兆候なし。
+
+### 2. 画像タグ無し・単純な819,200文字1行の分離ケース再確認: PASS
+- `<span>`/`<img>`を一切含まない`'A'.repeat(819200)`のみを本文とする`.md`メモ（`long-line-test`）を`memo:save`で直接保存し、ツリーから開くクリック操作を実行。クリック自体が8msで完了し、直後・2秒後のCDP応答もそれぞれ3〜4msで、フリーズは一切再現しなかった。
+
+### 3. リンク/メール検出の回帰スポットチェック: PASS
+- `.md`メモ（`link-sanity`）に実在的なメールアドレス（`+`/`.`/複数ラベルドメイン含む`john.doe+work123@example.co.jp`）、`memo:img-test`、`https://example.com/path?x=1`、Windowsファイルパス（`C:\Users\test\note.txt`）を含む本文を保存・オープンし、`.cm-link`クラスが付与された要素のテキストを取得したところ、上記4件すべてが過不足なく検出・装飾されていることを確認（境界化前後で挙動差なし、developer/reviewerの回帰確認結果と一致）。
+
+### 4. スモークチェック: PASS
+- 上記手順一式（タブ作成・登録、メモ作成、`memo:save`/`memo:read`、ツリー描画・クリック選択、ダイアログ表示・ボタン操作、自動保存）を通じてアプリが正常に機能し続けていることを確認。他の優先確認項目（`.md`⇔`.txt`変換ダイアログ・ソース/プレビュー切替・画像サイズ警告精度・新規メモformat選択導線）はラウンド1で既にPASS済みのため本ラウンドでは再実施せず（依頼内容通り）。
+
+### 後片付け
+- 起動した`electron.exe`プロセスは全て`Stop-Process -Force`で終了、`Get-Process electron`で残存なしを確認。
+- `.tmp-tester-appN/`は削除済み、`git status`で残留物なしを確認。
+- リポジトリ直下の実データ用`config/app-settings.json`（`LastWriteTime` 2026/07/26 22:55、developerの実データ）は検証前後で不変、`data/`フォルダへの書き込みも本セッション中は隔離コピー配下のみで実データ側への影響なし。
+- なお検証開始前、developerのラウンド1修正調査で使われた`probe-driver.tmp.js`（削除済みのはずのスクリプト）を指すorphanな`electron.exe`プロセスが8個残存しているのを発見し、実データとは無関係（既定の`%APPDATA%\Electron`ユーザーデータ）であることを確認の上、本検証開始前に全て終了させた（developer側への申し送り: 一時プローブスクリプト起動時はプロセスの後片付け＝`Stop-Process`まで含めて完了させること）。
+
+### 判定
+M10c-T1-01（Critical）は解消。ラウンド1で指摘したCritical不具合の再現手順（600KB画像挿入・819,200文字単純長大行の両方）とも、修正後は数分間のフリーズが完全に解消され、CDP応答は一貫して数ミリ秒台。既存のリンク/メール検出機能への回帰もなし。**M10c全体を完了として報告可能。**
+- 判定: ブロッキング指摘なし。developer への差し戻し不要。tester へ進行可。
