@@ -125,7 +125,8 @@ export async function openTabTree(
   const folderResult = getTabFolderPath(tabId);
   if (!folderResult.ok) return folderResult;
 
-  const loaded: LoadedMeta = await loadTabMeta(folderResult.value);
+  // tabId を渡し、既存のロック解除セッション（v3 M8）があれば展開表示する（metaStore.reconcile 参照）。
+  const loaded: LoadedMeta = await loadTabMeta(folderResult.value, tabId);
   if (loaded.recovered && loaded.recoveredMessage && onRecovered) {
     onRecovered(loaded.recoveredMessage);
   }
