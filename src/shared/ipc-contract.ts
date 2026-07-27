@@ -23,6 +23,7 @@ import type {
   SaveResult,
   SearchHit,
   TabInfo,
+  TreeNode,
   TreeSnapshot
 } from './models';
 
@@ -51,7 +52,13 @@ export const IpcChannels = {
     /** プロパティ表示（ファイル情報+文字数カウント, ユーザー要望）。 */
     getProperties: 'memo:getProperties',
     /** エクスプローラでファイルを選択表示する（プロパティ画面「ファイルの場所を開く」）。 */
-    revealInFolder: 'memo:revealInFolder'
+    revealInFolder: 'memo:revealInFolder',
+    /**
+     * v3 M10a: `.txt`⇔`.md`変換（拡張子のみリネーム、本文は無変更, DESIGNv3 §2.4）。
+     * 呼び出し元UI（変換前の装飾/画像検出・確認ダイアログ）は M10c スコープ
+     * （docs/v3/milestones/M10a-markdown-format-core.md）。
+     */
+    convertFormat: 'memo:convertFormat'
   },
   tree: {
     updateStructure: 'tree:updateStructure'
@@ -67,7 +74,15 @@ export const IpcChannels = {
     open: 'crypto:open',
     saveEncrypted: 'crypto:saveEncrypted',
     changePassword: 'crypto:changePassword',
-    lock: 'crypto:lock'
+    lock: 'crypto:lock',
+    /** v3 M8: サブツリーをロックする（docs/v3/milestones/M8-node-lock-core.md）。 */
+    lockNode: 'crypto:lockNode',
+    /** v3 M8: ロック中サブツリーをパスワードで復号しセッション開始する。 */
+    unlockNode: 'crypto:unlockNode',
+    /** v3 M8: 単一ロックセッションの明示的破棄（ファイル操作なし）。 */
+    relockNode: 'crypto:relockNode',
+    /** v3 M9c: 指定タブに紐づく全ロックセッションを一括破棄（タブ切替時用, ファイル操作なし）。 */
+    relockAllInTab: 'crypto:relockAllInTab'
   },
   link: {
     openExternal: 'link:openExternal',
@@ -175,6 +190,8 @@ export interface TabOpenFolderArgs {
 export interface MemoReadArgs {
   tabId: string;
   memoName: string;
+  /** v3 M9a: 指定時はロック解除セッション配下の実名として解決する（PLANv3 §5.3）。 */
+  lockContext?: LockContext;
 }
 
 export interface MemoReadWithEncodingArgs {
@@ -190,6 +207,8 @@ export interface MemoSaveArgs {
   eol: Eol;
   encoding: MemoReadResult['encoding'];
   expectedHash?: string;
+  /** v3 M9a: 指定時はロック解除セッション配下の実名として解決する（PLANv3 §5.3）。 */
+  lockContext?: LockContext;
 }
 
 export interface MemoCreateArgs {
@@ -197,12 +216,22 @@ export interface MemoCreateArgs {
   name: string;
   position: AddPosition;
   anchorMemoName?: string;
+  /**
+   * v3 M10a: 'markdown' 指定時は拡張子 `.md` でファイル作成する（省略時 'plain' = `.txt`,
+   * DESIGNv3 §2.4）。作成先UI（「通常メモ」「Markdownメモ」の選択導線）は M10c スコープ
+   * （docs/v3/milestones/M10a-markdown-format-core.md）。
+   */
+  format?: 'plain' | 'markdown';
+  /** v3 M9a: 指定時はロック解除セッション配下へ作成する（PLANv3 §5.3）。 */
+  lockContext?: LockContext;
 }
 
 export interface MemoRenameArgs {
   tabId: string;
   oldName: string;
   newName: string;
+  /** v3 M9a: 指定時はロック解除セッション配下の実名リネームとして解決する（PLANv3 §5.3）。 */
+  lockContext?: LockContext;
 }
 
 export interface MemoGetPropertiesArgs {
@@ -259,13 +288,25 @@ export type EditorTextCommand =
   | 'spacesToTabs'
   | 'toggleCheckbox';
 
+/**
+ * v3 M10b: Markdown装飾コマンド（右クリックメニュー「文字色/太字/文字サイズ」, DESIGNv3 §2.2）。
+ * `src/renderer/editor/decorationCommands.ts` が `<span style="...">` のラップ/アンラップとして
+ * 実行する。`value: ''`（色/文字サイズ解除の明示メニュー項目）は既存の同値トグルとは別に、常に
+ * 対応する CSS プロパティを除去する特別値として扱う（decorationCommands.ts 参照）。
+ */
+export type MarkdownDecorationCommand =
+  | { command: 'color'; value: string }
+  | { command: 'bold' }
+  | { command: 'fontSize'; value: string };
+
 /** `evt:editorMenuCommand` のペイロード。 */
 export type EditorMenuCommandPayload =
   | { kind: 'textCommand'; command: EditorTextCommand }
   | { kind: 'setWrap'; wrap: 'none' | 'chars' | 'window' }
   | { kind: 'toggleLineNumbers' }
   | { kind: 'toggleWhitespace' }
-  | { kind: 'fontSize'; action: 'increase' | 'decrease' | 'reset' };
+  | { kind: 'fontSize'; action: 'increase' | 'decrease' | 'reset' }
+  | ({ kind: 'decoration' } & MarkdownDecorationCommand);
 
 /** `evt:metaRecovered` のペイロード（00-core-principles.md §9）。 */
 export interface MetaRecoveredPayload {
@@ -300,11 +341,15 @@ export interface MemoDeleteArgs {
   memoNames: string[];
   /** 既定（未指定/false）はごみ箱送り。true はユーザー承諾後の直接削除（無確認で true にしないこと）。 */
   forceDirect?: boolean;
+  /** v3 M9a: 指定時はロック解除セッション配下の実名として解決する（PLANv3 §5.3）。 */
+  lockContext?: LockContext;
 }
 
 export interface MemoDuplicateArgs {
   tabId: string;
   memoName: string;
+  /** v3 M9a: 指定時はロック解除セッション配下の実名として解決する（PLANv3 §5.3）。 */
+  lockContext?: LockContext;
 }
 
 export interface MemoMoveArgs {
@@ -321,12 +366,32 @@ export interface MemoMoveArgs {
   destAnchorMemoName?: string;
   /** true = コピー（元を残す）、false/未指定 = 移動（DESIGN §2.2 の Ctrl 併用コピー）。 */
   copy: boolean;
+  /**
+   * v3 M9b: 移動元がロック解除セッション配下の場合に指定する（PLANv3 §5.4「境界を跨ぐ移動・
+   * コピー」）。「一方通行の金庫」（DESIGNv3 §1.12）: 指定時（内→外、または destLockContext が
+   * 異なる別ロックの場合）は `LOCK_BOUNDARY_VIOLATION` で禁止する。省略時（通常領域）は既存v1と
+   * 同じ挙動。
+   */
+  srcLockContext?: LockContext;
+  /**
+   * v3 M9b: 移動先がロック解除セッション配下の場合に指定する（PLANv3 §5.4）。`srcLockContext`
+   * 省略時（通常領域→セッション配下、「外→内」）は許可し、対象を難読化名へリネーム+暗号化して
+   * dest側セッションの`nameMap`/`children`/`claimedTokens`へ組み込む。`srcLockContext`指定時は
+   * `lockToken`が同一の場合のみ許可（境界を跨がない通常の構造変更、PLANv3 §5.3）。
+   */
+  destLockContext?: LockContext;
 }
 
 export interface TreeUpdateStructureArgs {
   tabId: string;
   /** 新しいツリー構造全体（並び順・階層・開閉・ラベルを含む）。実ファイル集合と厳密一致すること。 */
   treeStructure: MetaTreeNode[];
+  /**
+   * v3 M9a: 指定時は `treeStructure` をロック解除セッション配下の実行時構造（実名ベース、
+   * 起点ノード自身を除く子ツリー）として解釈し、対象セッションの `nameMap` と厳密一致するか
+   * 検証する（PLANv3 §5.3）。
+   */
+  lockContext?: LockContext;
 }
 
 /** `evt:trashFallback` のペイロード（ごみ箱送り失敗 → UI で直接削除確認, PLAN §2.7/§2.6）。 */
@@ -407,7 +472,19 @@ export interface ConflictPayload {
 
 /** `editor:reportActive` の引数（M4 新設、上記 `IpcChannels.editor.reportActive` の説明を参照）。 */
 export interface EditorReportActiveArgs {
-  active: { tabId: string; memoName: string; dirty: boolean } | null;
+  active: {
+    tabId: string;
+    memoName: string;
+    dirty: boolean;
+    /**
+     * 【2026-07-26追記・v3 M10b】現在開いているメモがMarkdown（`.md`由来）かどうか
+     * （developer判断: 既存の dirty 通知と同じ経路に相乗りさせる。main側の右クリックメニュー
+     * （main/index.ts の `context-menu` ハンドラ）が「文字色/太字/文字サイズ」項目を`.md`メモ
+     * 編集時のみ追加するために必要、docs/v3/milestones/M10b-markdown-live-preview.md ゴール）。
+     * `undefined`=不明（判定不能時は装飾メニューを出さない安全側）。
+     */
+    format?: 'plain' | 'markdown';
+  } | null;
 }
 
 /**
@@ -492,6 +569,13 @@ export interface CryptoOpenResult {
   contentLF: string;
   eol: Eol;
   hash: string;
+  /**
+   * 【2026-07-26追記・v3 M10b前提】このメモがMarkdown（`.md`由来）かどうか（`.txtenc`ヘッダの
+   * `format` 省略時は 'plain'）。M6個別暗号化を`crypto:open`で開封した場合、`TreeNode.format`は
+   * 当該ノードが`encrypted:true`の間`undefined`のままのため、レンダラはこちらをローカル状態として
+   * 保持しライブプレビュー判定に使う（docs/v3/milestones/M10b-markdown-live-preview.md §0.1/§0.7）。
+   */
+  format: 'plain' | 'markdown';
 }
 
 export interface CryptoSaveEncryptedArgs {
@@ -512,6 +596,86 @@ export interface CryptoChangePasswordArgs {
 export interface CryptoLockArgs {
   tabId: string;
   memoName: string;
+}
+
+// ---------------------------------------------------------------------------
+// v3 M8: ノード単位パスワードロック（crypto:lockNode / unlockNode / relockNode）の引数/返却型
+// （docs/v3/DESIGNv3.md §1、docs/v3/PLANv3.md §2.1/§4、docs/v3/milestones/M8-node-lock-core.md）。
+// v3 M9a で `lockContext`（ロック解除セッション配下での構造変更・入れ子ロック用引数, PLANv3 §2.2/§7.4、
+// docs/v3/milestones/M9a-node-lock-session-ops.md）を追加した。
+// ---------------------------------------------------------------------------
+
+/**
+ * v3 M9a: ロック解除セッションを指す共通引数（PLANv3 §1.4/§2.2）。`lockToken` は
+ * `crypto:unlockNode` が返した値と同一（起点ノード自身の難読化ファイル名）。
+ * `memo:read`/`memo:save`/`memo:create`/`memo:rename`/`memo:delete`/`memo:duplicate`/
+ * `tree:updateStructure`/`crypto:lockNode`/`crypto:unlockNode` の各引数に任意項目として追加する。
+ * 省略時は既存v1と完全に同じ挙動（タブ直下の可視ツリー・実ファイルが対象, PLANv3 §2.2）。
+ */
+export interface LockContext {
+  lockToken: string;
+}
+
+export interface CryptoLockNodeArgs {
+  tabId: string;
+  /**
+   * 対象ノード（`lockContext` 省略時は現在の可視ツリー上の memoName。指定時は対象セッションの
+   * 実行時構造上の実名, 入れ子ロック, PLANv3 §7.4）。起点+配下全体がロック対象になる。
+   */
+  memoName: string;
+  password: string;
+  /** 任意のパスワードヒント（`lock.hint` に平文保存。UI 側で警告表示すること）。 */
+  hint?: string;
+  /** 指定時: 既に別ロックの解除セッション内にあるノードを起点にロックする（入れ子ロック）。 */
+  lockContext?: LockContext;
+}
+
+export interface CryptoUnlockNodeArgs {
+  tabId: string;
+  /** ロック中ノード（難読化トークン）の memoName。 */
+  memoName: string;
+  password: string;
+  /** 指定時: 既に別ロックの解除セッション内にあるノードを起点に解除する（入れ子ロック）。 */
+  lockContext?: LockContext;
+}
+
+/** `crypto:unlockNode` の返却型。`tree` は起点ノード自身を含む単一要素配列（M8-node-lock-core.md §5.2）。 */
+export interface CryptoUnlockNodeResult {
+  lockToken: string;
+  tree: TreeNode[];
+}
+
+export interface CryptoRelockNodeArgs {
+  tabId: string;
+  lockToken: string;
+}
+
+/**
+ * v3 M9c: `crypto:relockAllInTab`（タブ切替時のセッション一括破棄, docs/v3/DESIGNv3.md §1.11・
+ * docs/v3/PLANv3.md §5.5/§7.6、docs/v3/milestones/M9c-node-lock-tab-switch.md）。
+ * 対象タブに紐づく全ロックセッション（入れ子ロックの子セッション含む）を一括破棄する。
+ */
+export interface CryptoRelockAllInTabArgs {
+  tabId: string;
+}
+
+// ---------------------------------------------------------------------------
+// v3 M10a: Markdown保存形式基盤（`memo:convertFormat`）の引数/返却型
+// （docs/v3/DESIGNv3.md §2.4/§2.5、docs/v3/PLANv3.md §2.3、
+// docs/v3/milestones/M10a-markdown-format-core.md）。
+// ---------------------------------------------------------------------------
+
+export interface MemoConvertFormatArgs {
+  tabId: string;
+  memoName: string;
+  targetFormat: 'txt' | 'md';
+  /**
+   * ロック解除セッション配下のメモは常に難読化名の `.txtenc` として保存され、`.txt`/`.md` の
+   * 拡張子概念自体を持たない（DESIGNv3/PLANv3にセッションメンバー単位の format 追跡は定義が無く、
+   * M10a は M8/M9 と独立スコープのため新設しない, developer 判断）。指定時はハンドラが
+   * `NAME_INVALID` で明示的に拒否する（型としては milestone doc のシグネチャ通り受け付ける）。
+   */
+  lockContext?: LockContext;
 }
 
 /**
@@ -560,6 +724,8 @@ export interface PreloadApi {
     move(args: MemoMoveArgs): Promise<Result<void>>;
     getProperties(args: MemoGetPropertiesArgs): Promise<Result<MemoProperties>>;
     revealInFolder(args: MemoRevealInFolderArgs): Promise<Result<void>>;
+    /** v3 M10a: `.txt`⇔`.md`変換（拡張子のみリネーム、本文は無変更）。 */
+    convertFormat(args: MemoConvertFormatArgs): Promise<Result<MemoInfo>>;
   };
   tree: {
     updateStructure(args: TreeUpdateStructureArgs): Promise<Result<void>>;
@@ -596,6 +762,14 @@ export interface PreloadApi {
     changePassword(args: CryptoChangePasswordArgs): Promise<Result<void>>;
     /** セッション鍵破棄（再ロック）。 */
     lock(args: CryptoLockArgs): Promise<Result<void>>;
+    /** v3 M8: サブツリーをロックする（起点+配下全体を難読化名+.txtenc化）。 */
+    lockNode(args: CryptoLockNodeArgs): Promise<Result<void>>;
+    /** v3 M8: ロック中サブツリーをパスワードで復号しセッション開始する。 */
+    unlockNode(args: CryptoUnlockNodeArgs): Promise<Result<CryptoUnlockNodeResult>>;
+    /** v3 M8: 単一ロックセッションの明示的破棄（ファイル操作なし）。 */
+    relockNode(args: CryptoRelockNodeArgs): Promise<Result<void>>;
+    /** v3 M9c: 指定タブに紐づく全ロックセッションを一括破棄（タブ切替時用、ファイル操作なし）。 */
+    relockAllInTab(args: CryptoRelockAllInTabArgs): Promise<Result<void>>;
   };
   events: {
     /** `evt:metaRecovered` を購読する。返り値の関数を呼ぶと購読解除する。 */
