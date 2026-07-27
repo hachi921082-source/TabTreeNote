@@ -30,3 +30,9 @@ desktop.ini
 # Editor
 .vscode/*
 !.vscode/extensions.json
+
+# Stray/unintentional copies and unfinished reference translations (2026-07-27, user decision)
+/AGENT_LOG - コピー.md
+/HANDOFF - コピー.md
+/docs/00-core-principles.ja.md
+/docs/data-model.ja.md
