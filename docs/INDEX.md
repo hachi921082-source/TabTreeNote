@@ -40,3 +40,26 @@
 ## M7完成後の変更ログ
 
 - [post-M7-changes.md](post-M7-changes.md) — M0〜M7完成後、実機確認を通じて行ったバグ修正・仕様変更・新機能追加のまとめ（正式なマイルストーン計画を経ずチャットで都度実装したもの）。ポータブル化（設定/データのexe基準保存）、多重起動防止、ツリー右クリックメニュー整理、エディタ右クリックメニュー拡充、編集ロック、UI文字サイズ設定等。
+
+## v3 追加機能（設計・実装計画確定、マイルストーン分割済み・実装未着手）
+
+- [v3/DESIGNv3.md](v3/DESIGNv3.md) — ノード（サブツリー）単位のパスワードロック、Markdown＋ライブプレビューの2機能に関する設計ドキュメント（`DESIGN.md`/`PLAN.md`はv1スコープの正本のまま変更せず、この2機能に限りDESIGNv3.mdが正本）。設計内容はユーザー確認済み。
+- [v3/PLANv3.md](v3/PLANv3.md) — 上記2機能の実装計画（DESIGNv3.mdを実装可能な粒度へ具体化。IPC設計・ファイル構成・データモデル・処理フロー・実装補完事項§7を含む）。ユーザー確認済み。
+
+### v3マイルストーン別ドキュメント一覧
+
+| M | ドキュメント | 一行概要 | 依存 |
+|---|-------------|----------|------|
+| M8 | [v3/milestones/M8-node-lock-core.md](v3/milestones/M8-node-lock-core.md) | ノードロック基盤: 単発のロック/解除/再ロック、難読化ファイル名、ブロブ暗号化、`claimedTokens`による孤児ファイル対策 | v1 M1/M2/M6 |
+| M9a | [v3/milestones/M9a-node-lock-session-ops.md](v3/milestones/M9a-node-lock-session-ops.md) | ノードロック応用①: セッション中の構造変更（作成/リネーム/削除/複製）、入れ子ロック | M8必須 |
+| M9b | [v3/milestones/M9b-node-lock-boundary-move.md](v3/milestones/M9b-node-lock-boundary-move.md) | ノードロック応用②: 境界を跨ぐ移動・コピー（一方通行の金庫） | M9a必須 |
+| M9c | [v3/milestones/M9c-node-lock-tab-switch.md](v3/milestones/M9c-node-lock-tab-switch.md) | ノードロック応用③: タブ切替時のセッション一括破棄 | M8必須（M9a/M9bとは独立、M9a後推奨） |
+
+> 元は単一の[M9-node-lock-session-ops.md](v3/milestones/M9-node-lock-session-ops.md)だったが、実行コストが大きいためユーザー判断でM9a/M9b/M9cへ3分割（経緯・全体像は元ファイル参照）。
+| M10a | [v3/milestones/M10a-markdown-format-core.md](v3/milestones/M10a-markdown-format-core.md) | Markdown①: 保存形式基盤・全文検索反映（`.md`拡張子対応、`memo:convertFormat`、暗号化`format`フィールド） | v1 M1/M3/M6（M8/M9とは独立） |
+| M10b | [v3/milestones/M10b-markdown-live-preview.md](v3/milestones/M10b-markdown-live-preview.md) | Markdown②: 装飾ライブプレビュー描画・サニタイズ・右クリック装飾コマンド | M10a必須 |
+| M10c | [v3/milestones/M10c-markdown-toolbar-ui.md](v3/milestones/M10c-markdown-toolbar-ui.md) | Markdown③: ツールバー・ソース/プレビュー切替・画像貼り付け・`.txt`⇔`.md`変換UI | M10a/M10b必須 |
+
+> 元は単一の[M10-markdown-preview.md](v3/milestones/M10-markdown-preview.md)だったが、実行コストが大きいためユーザー判断でM10a/M10b/M10cへ3分割（経緯・全体像は元ファイル参照）。
+
+developerへの実装依頼はまだ行っていない。ユーザーからの明示的な着手指示を待つ。
