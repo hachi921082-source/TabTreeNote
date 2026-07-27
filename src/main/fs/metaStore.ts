@@ -20,6 +20,7 @@ import type { AddPosition } from '@shared/ipc-contract';
 import { atomicWrite } from './atomicWrite';
 import { scanTabFolder, type ScannedMemo } from './memoFileService';
 import { migrateSchema } from '../util/migrate';
+import { buildOriginTreeNode, getNodeLockSession } from '../crypto/nodeLockSessionStore';
 
 export interface LoadedMeta {
   tree: TreeNode[];
@@ -56,14 +57,78 @@ function generateFlatMeta(scanned: ScannedMemo[]): MetaTreeNode[] {
     .map((s) => ({ memoName: s.memoName, expanded: true, children: [] }));
 }
 
-/** メタの MetaTreeNode[] と実ファイル走査結果を突合し、実行時用 TreeNode[] を構築する。 */
-function reconcile(metaTree: MetaTreeNode[], scanned: ScannedMemo[]): TreeNode[] {
+/**
+ * 【v3 M8】ツリー全体を再帰的に走査し、ロック中ノード（`lock` フィールドを持つノード）が
+ * 占有する難読化ファイル名（`lock.claimedTokens`、起点ノード自身を含む）を集める。
+ * `metaStore`/`memoHandlers` の「実ファイル/メタ突合」ロジックが、ロック中ノードの子孫の
+ * 難読化ファイルを孤児として誤ってツリーへ露出させないために使う（PLANv3 §7.1、最重要）。
+ */
+export function collectClaimedTokens(tree: readonly MetaTreeNode[]): Set<string> {
+  const out = new Set<string>();
+  function walk(nodes: readonly MetaTreeNode[]): void {
+    for (const node of nodes) {
+      if (node.lock) {
+        for (const token of node.lock.claimedTokens) out.add(token);
+      }
+      walk(node.children);
+    }
+  }
+  walk(tree);
+  return out;
+}
+
+/**
+ * 【v3 M8】ツリー全体からロック中ノード（`lock` フィールドを持つノード）を memoName（難読化名）
+ * キーで収集する。`memo:*`/`tree:updateStructure` 等、クライアント（実行時 TreeNode ベース）が
+ * 送ってくる構造には `lock` フィールドが含まれない（TreeNode に存在しないため）ため、メタJSON
+ * 保存直前にこの情報で `lock` を再付与し、ロックブロブの消失を防ぐ用途で使う。
+ */
+export function collectLockedNodesByName(tree: readonly MetaTreeNode[]): Map<string, MetaTreeNode> {
+  const out = new Map<string, MetaTreeNode>();
+  function walk(nodes: readonly MetaTreeNode[]): void {
+    for (const node of nodes) {
+      if (node.lock) out.set(node.memoName, node);
+      walk(node.children);
+    }
+  }
+  walk(tree);
+  return out;
+}
+
+/**
+ * メタの MetaTreeNode[] と実ファイル走査結果を突合し、実行時用 TreeNode[] を構築する。
+ * `tabId` 指定時（`tab:openTree` からの呼び出しのみ）は、ロック中ノードに対応する
+ * ロック解除セッション（`nodeLockSessionStore`）が既に存在する場合、🔒 プレースホルダの
+ * 代わりに復号済みの実行時構造をその場で展開する。これにより、ロック解除セッション中に他の
+ * 操作（別メモの作成・削除等）で `tab:openTree` が再取得されても、既に開いているセッションが
+ * 🔒 表示へ巻き戻らない（v3 M8。tabId 未指定の他の呼び出し元は常にプレースホルダのままでよい
+ * ＝ `loaded.tree` を実際に使うのは `tabService.openTabTree` のみのため影響なし）。
+ */
+function reconcile(metaTree: MetaTreeNode[], scanned: ScannedMemo[], tabId?: string): TreeNode[] {
   const scannedMap = new Map(scanned.map((s) => [s.memoName, s]));
   const usedNames = new Set<string>();
+  // 【v3 M8】ロック中ノードが占有する難読化ファイル名は、対応するメタノードが無くても
+  // 孤児（フラット追加対象）として扱わない（PLANv3 §7.1）。
+  for (const token of collectClaimedTokens(metaTree)) usedNames.add(token);
 
   function reconcileList(nodes: MetaTreeNode[]): TreeNode[] {
     const out: TreeNode[] = [];
     for (const node of nodes) {
+      if (node.lock) {
+        // ロック中ノード: 実ファイル（起点ノード自身の難読化名 .txtenc）が存在する前提で、
+        // memoName は常に無視して「🔒(ロック中)」表示、children は常に空扱い（DESIGNv3 §1.2/§1.6）。
+        usedNames.add(node.memoName);
+        const session = tabId ? getNodeLockSession(tabId, node.memoName) : undefined;
+        out.push(session ? buildOriginTreeNode(session, node.memoName) : {
+          memoName: node.memoName,
+          encrypted: true,
+          expanded: false,
+          children: [],
+          nodeLocked: true
+        });
+        continue;
+      }
+
       const reconciledChildren = reconcileList(node.children);
       const scannedEntry = scannedMap.get(node.memoName);
       if (scannedEntry) {
@@ -75,6 +140,10 @@ function reconcile(metaTree: MetaTreeNode[], scanned: ScannedMemo[]): TreeNode[]
           label: node.label,
           editor: node.editor,
           locked: node.locked,
+          // 【2026-07-26追記・v3 M10b前提】暗号化済みノードは ScannedMemo.format が実体を反映しない
+          // 便宜上のプレースホルダ'plain'のため undefined のままにする（実体はパスワード復号を
+          // 経ないと分からないため, DESIGNv3 §1.13「伝播の設計」2、M10b-markdown-live-preview.md §0.5）。
+          format: scannedEntry.encrypted ? undefined : (scannedEntry.format === 'markdown' ? 'markdown' : 'plain'),
           children: reconciledChildren
         });
       } else {
@@ -91,13 +160,25 @@ function reconcile(metaTree: MetaTreeNode[], scanned: ScannedMemo[]): TreeNode[]
   const extras = scanned
     .filter((s) => !usedNames.has(s.memoName))
     .sort((a, b) => a.memoName.localeCompare(b.memoName, 'ja'))
-    .map((s): TreeNode => ({ memoName: s.memoName, encrypted: s.encrypted, expanded: true, children: [] }));
+    .map(
+      (s): TreeNode => ({
+        memoName: s.memoName,
+        encrypted: s.encrypted,
+        expanded: true,
+        // 【2026-07-26追記・v3 M10b前提】上の scannedEntry 分岐と同じ条件分岐（M10b-markdown-live-preview.md §0.5）。
+        format: s.encrypted ? undefined : (s.format === 'markdown' ? 'markdown' : 'plain'),
+        children: []
+      })
+    );
 
   return [...reconciled, ...extras];
 }
 
-/** タブフォルダのメタを読み込み、実ファイルと突合した実行時ツリーを返す（復旧カスケード込み）。 */
-export async function loadTabMeta(folderPath: string): Promise<LoadedMeta> {
+/**
+ * タブフォルダのメタを読み込み、実ファイルと突合した実行時ツリーを返す（復旧カスケード込み）。
+ * `tabId` は v3 M8 のロック解除セッション展開表示にのみ使う任意引数（`reconcile` 参照）。
+ */
+export async function loadTabMeta(folderPath: string, tabId?: string): Promise<LoadedMeta> {
   const scanned = await scanTabFolder(folderPath);
   const primaryPath = metaFilePath(folderPath);
   const bakPath = `${primaryPath}${BACKUP_SUFFIX}`;
@@ -132,7 +213,7 @@ export async function loadTabMeta(folderPath: string): Promise<LoadedMeta> {
     }
   }
 
-  return { tree: reconcile(metaTree, scanned), metaTree, recovered, recoveredMessage };
+  return { tree: reconcile(metaTree, scanned, tabId), metaTree, recovered, recoveredMessage };
 }
 
 /** タブフォルダのメタ JSON をアトミック保存する（メタ JSON へ書き出すのは常に MetaTreeNode）。 */
