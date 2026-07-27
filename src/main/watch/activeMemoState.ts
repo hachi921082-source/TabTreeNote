@@ -14,6 +14,12 @@ export interface ActiveMemoState {
   tabId: string;
   memoName: string;
   dirty: boolean;
+  /**
+   * 【2026-07-26追記・v3 M10b】現在開いているメモがMarkdown（`.md`由来）かどうか
+   * （main/index.ts の `context-menu` ハンドラが「文字色/太字/文字サイズ」メニュー項目を
+   * `.md`メモ編集時のみ追加するために使う）。`undefined`=不明。
+   */
+  format?: 'plain' | 'markdown';
 }
 
 let current: ActiveMemoState | null = null;
