@@ -23,6 +23,7 @@ import { defaultKeymap, history, historyKeymap, indentLess, insertNewlineKeepInd
 import { indentUnit } from '@codemirror/language';
 import { search, searchKeymap } from '@codemirror/search';
 import type { AppSettings } from '@shared/models';
+import { buildMarkdownDecorationExtension } from './markdownDecorations';
 
 /** 'chars'（文字数指定）折り返し時の既定幅。M7 で設定可能な数値項目を追加するまでの固定値
  * （AppSettings/MemoEditorSettings に文字数フィールドが無いため、data-model.md 未変更の
@@ -66,6 +67,13 @@ export interface EditorCompartments {
   activeLine: Compartment;
   /** 外部変更競合ダイアログ表示中のエディタ入力ロック用（M4, DESIGN §3.3「解決中ロック」）。 */
   readOnly: Compartment;
+  /**
+   * 【v3 M10c】ソース/プレビュー切替（Markdownライブプレビュー装飾のON/OFF）。`.md`メモでのみ
+   * 使用する。Compartment 化することで、CodeMirrorEditor を再マウントせずに（＝カーソル位置/
+   * Undo履歴/スクロール位置を保持したまま）切り替えられる（M10b の markdownDecorations.ts
+   * コメント「この ON/OFF を担う想定」に対応する実装）。
+   */
+  preview: Compartment;
 }
 
 export function createCompartments(): EditorCompartments {
@@ -76,7 +84,8 @@ export function createCompartments(): EditorCompartments {
     whitespace: new Compartment(),
     font: new Compartment(),
     activeLine: new Compartment(),
-    readOnly: new Compartment()
+    readOnly: new Compartment(),
+    preview: new Compartment()
   };
 }
 
@@ -150,6 +159,20 @@ export function buildReadOnlyExtension(readOnly: boolean): Extension {
  */
 export function reconfigureReadOnly(view: EditorView, compartments: EditorCompartments, readOnly: boolean): void {
   view.dispatch({ effects: compartments.readOnly.reconfigure(buildReadOnlyExtension(readOnly)) });
+}
+
+/**
+ * 【v3 M10c】ソース/プレビュー切替の拡張内容。`enabled`（プレビューON）のときのみ M10b の
+ * ライブプレビュー装飾（`buildMarkdownDecorationExtension`）を組み込む。`.md`メモでのみ呼ばれる想定
+ * （`.txt`メモは常に `markdown=false` で `preview` Compartment 自体が空のまま）。
+ */
+export function buildPreviewExtension(enabled: boolean): Extension {
+  return enabled ? [buildMarkdownDecorationExtension()] : [];
+}
+
+/** ソース/プレビュー切替を既存 EditorView へ反映する（M10c。本文・カーソル位置は変化しない）。 */
+export function reconfigurePreview(view: EditorView, compartments: EditorCompartments, enabled: boolean): void {
+  view.dispatch({ effects: compartments.preview.reconfigure(buildPreviewExtension(enabled)) });
 }
 
 /** カーソル位置/選択範囲から文字数・行数・カーソル行列を計算する（ステータスバー表示用, DESIGN §2.3）。 */
