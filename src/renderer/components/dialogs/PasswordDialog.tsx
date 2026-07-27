@@ -4,7 +4,14 @@
 import { useState, type FormEvent } from 'react';
 import { Modal } from './Modal';
 
-export type PasswordDialogMode = 'setup' | 'unlockToOpen' | 'unlockToDecrypt' | 'changePassword';
+export type PasswordDialogMode =
+  | 'setup'
+  | 'unlockToOpen'
+  | 'unlockToDecrypt'
+  | 'changePassword'
+  // v3 M8: ノードロック（既存M6暗号化ダイアログの見た目・確認再入力ルールを流用, DESIGNv3 §1.11）。
+  | 'lockNode'
+  | 'unlockNode';
 
 export interface PasswordDialogSubmitValues {
   password?: string;
@@ -26,14 +33,18 @@ const TITLES: Record<PasswordDialogMode, string> = {
   setup: 'パスワードを設定して暗号化',
   unlockToOpen: 'パスワードを入力',
   unlockToDecrypt: '暗号化を解除',
-  changePassword: 'パスワードを変更'
+  changePassword: 'パスワードを変更',
+  lockNode: 'パスワードを設定してサブツリーをロック',
+  unlockNode: 'ロックを解除'
 };
 
 const SUBMIT_LABELS: Record<PasswordDialogMode, string> = {
   setup: '暗号化する',
   unlockToOpen: '開く',
   unlockToDecrypt: '解除する',
-  changePassword: '変更する'
+  changePassword: '変更する',
+  lockNode: 'ロックする',
+  unlockNode: '解除する'
 };
 
 /** 忘失時は復旧不能（バックドア/マスターキーは無い）ことの警告文（DESIGN §2.9）。 */
@@ -48,9 +59,12 @@ export function PasswordDialog({ mode, memoName, errorMessage, onCancel, onSubmi
   const [newPassword, setNewPassword] = useState('');
   const [confirmNewPassword, setConfirmNewPassword] = useState('');
 
-  const isSetup = mode === 'setup';
+  // v3 M8: lockNode は setup（新規パスワード+確認再入力+ヒント）と、unlockNode は
+  // unlockToOpen/unlockToDecrypt（パスワードのみ）と同じ入力フォーム形状を流用する
+  // （既存M6暗号化ダイアログの見た目・確認再入力ルールを流用, DESIGNv3 §1.11）。
+  const isSetup = mode === 'setup' || mode === 'lockNode';
   const isChangePassword = mode === 'changePassword';
-  const isUnlock = mode === 'unlockToOpen' || mode === 'unlockToDecrypt';
+  const isUnlock = mode === 'unlockToOpen' || mode === 'unlockToDecrypt' || mode === 'unlockNode';
 
   const setupMismatch = isSetup && confirmPassword.length > 0 && password !== confirmPassword;
   const changeMismatch = isChangePassword && confirmNewPassword.length > 0 && newPassword !== confirmNewPassword;
@@ -76,7 +90,11 @@ export function PasswordDialog({ mode, memoName, errorMessage, onCancel, onSubmi
   return (
     <Modal title={TITLES[mode]} onClose={onCancel}>
       <form className="password-dialog" onSubmit={handleSubmit}>
-        <p className="password-dialog__memo-name">対象メモ: {memoName}</p>
+        {/* v3 M8: unlockNode の memoName は内部の難読化トークン（意味の無いランダム文字列）の
+            ため、ユーザーには表示しない（DESIGNv3 §1.2「🔒以外の情報を一切見せない」）。 */}
+        <p className="password-dialog__memo-name">
+          {mode === 'unlockNode' ? '対象: 🔒 (ロック中)' : `対象メモ: ${memoName}`}
+        </p>
 
         {isUnlock && (
           <>
