@@ -15,13 +15,18 @@ import {
   type CryptoDecryptToPlainArgs,
   type CryptoEncryptMemoArgs,
   type CryptoLockArgs,
+  type CryptoLockNodeArgs,
   type CryptoOpenArgs,
   type CryptoOpenResult,
+  type CryptoRelockAllInTabArgs,
+  type CryptoRelockNodeArgs,
   type CryptoSaveEncryptedArgs,
+  type CryptoUnlockNodeArgs,
+  type CryptoUnlockNodeResult,
   type IndexUpdatedPayload
 } from '@shared/ipc-contract';
 import type { MemoInfo, Result, SaveResult } from '@shared/models';
-import { MEMO_EXT_ENCRYPTED, MEMO_EXT_PLAIN, SCRYPT_DEFAULTS } from '@shared/constants';
+import { MEMO_EXT_ENCRYPTED, MEMO_EXT_MARKDOWN, MEMO_EXT_PLAIN, SCRYPT_DEFAULTS } from '@shared/constants';
 import { err, ok, wrapHandler } from '../util/result';
 import { getTabFolderPath } from '../fs/tabService';
 import { findMemoFile, readMemo, validateExistingMemoNameForPath } from '../fs/memoFileService';
@@ -35,6 +40,7 @@ import { decryptBuffer, deriveKey, encryptBuffer, generateIv, generateSalt } fro
 import { buildTxtEncFile, parseTxtEncFile, serializeTxtEncFile, type TxtEncFile } from '../crypto/encFormat';
 import { deleteSessionKey, getSessionKey, setSessionKey } from '../crypto/sessionKeyStore';
 import { updateMemo as updateMemoIndex } from '../search/searchIndex';
+import { lockNode, relockAllInTab, relockNode, unlockNode } from '../crypto/nodeLock';
 
 function emitIndexUpdated(event: IpcMainInvokeEvent, tabId: string): void {
   const payload: IndexUpdatedPayload = { tabId };
@@ -85,12 +91,15 @@ export function registerCryptoHandlers(): void {
       const plaintext = Buffer.from(plainRead.value.contentLF, 'utf-8');
       const { ivB64, tagB64, ciphertextB64 } = encryptBuffer(key, iv, plaintext);
 
+      // 【v3 M10a】元ファイルの拡張子(.txt/.md)から format を自動判定しヘッダへ反映する
+      // （DESIGNv3 §2.5 Q8。新規IPCパラメータは不要、既存 found.format をそのまま使う）。
       const container = buildTxtEncFile({
         saltB64: salt.toString('base64'),
         ivB64,
         tagB64,
         eol: plainRead.value.eol,
         hint: args.hint,
+        format: found.format,
         ciphertextB64,
         kdf: SCRYPT_DEFAULTS
       });
@@ -121,7 +130,8 @@ export function registerCryptoHandlers(): void {
         key,
         saltB64: container.kdf.saltB64,
         kdf: { N: container.kdf.N, r: container.kdf.r, p: container.kdf.p, keyLen: container.kdf.keyLen },
-        hint: args.hint
+        hint: args.hint,
+        format: found.format
       });
 
       return ok<MemoInfo>({ memoName: args.memoName, encrypted: true });
@@ -158,7 +168,11 @@ export function registerCryptoHandlers(): void {
       const restored = restoreEol(contentLF, loaded.file.eol);
       const data = encodeText(restored, 'utf-8');
 
-      const plainPath = join(folderPath, `${args.memoName}${MEMO_EXT_PLAIN}`);
+      // 【v3 M10a】.txtenc の format フィールドに従い .txt/.md いずれかへ復元する（DESIGNv3 §2.5 Q8。
+      // フィールド省略時は 'plain' 扱い＝既存 .txt へ復元する後方互換, data-model.md §3）。
+      const restoredFormat: 'plain' | 'markdown' = loaded.file.format === 'markdown' ? 'markdown' : 'plain';
+      const plainExt = restoredFormat === 'markdown' ? MEMO_EXT_MARKDOWN : MEMO_EXT_PLAIN;
+      const plainPath = join(folderPath, `${args.memoName}${plainExt}`);
       await atomicWrite(plainPath, data);
 
       // 逆方向（暗号化解除）はユーザーが明示的に意図した通常操作のため、平文原本削除のような
@@ -172,7 +186,7 @@ export function registerCryptoHandlers(): void {
         throw e;
       }
 
-      updateMemoIndex(args.tabId, args.memoName, false, contentLF);
+      updateMemoIndex(args.tabId, args.memoName, false, contentLF, restoredFormat);
       emitIndexUpdated(event, args.tabId);
       deleteSessionKey(args.tabId, args.memoName);
 
@@ -209,14 +223,19 @@ export function registerCryptoHandlers(): void {
         return err('DECRYPT_FAILED', decryptFailedMessage(loaded.file.hint), found.path);
       }
 
+      // 【v3 M10a/M10b】.txtenc ヘッダの format を引き継ぐ（省略時は 'plain'、data-model.md §3）。
+      // setSessionKey へ渡す値と同じ判定ロジックを CryptoOpenResult.format にも反映する
+      // （2026-07-26追記・v3 M10b前提、docs/v3/milestones/M10b-markdown-live-preview.md §0.6）。
+      const format: 'plain' | 'markdown' = loaded.file.format === 'markdown' ? 'markdown' : 'plain';
       setSessionKey(args.tabId, args.memoName, {
         key,
         saltB64: loaded.file.kdf.saltB64,
         kdf: { N: loaded.file.kdf.N, r: loaded.file.kdf.r, p: loaded.file.kdf.p, keyLen: loaded.file.kdf.keyLen },
-        hint: loaded.file.hint
+        hint: loaded.file.hint,
+        format
       });
 
-      return ok<CryptoOpenResult>({ contentLF: plaintext.toString('utf-8'), eol: loaded.file.eol, hash });
+      return ok<CryptoOpenResult>({ contentLF: plaintext.toString('utf-8'), eol: loaded.file.eol, hash, format });
     })
   );
 
@@ -254,12 +273,15 @@ export function registerCryptoHandlers(): void {
       const plaintext = Buffer.from(args.contentLF, 'utf-8');
       const { ivB64, tagB64, ciphertextB64 } = encryptBuffer(session.key, iv, plaintext);
 
+      // 【v3 M10a】format はセッション鍵ストアに保持している値（crypto:open/crypto:encryptMemo
+      // 時点で .txtenc ヘッダから引き継いだもの）をそのまま維持する（再暗号化のたびに落とさない）。
       const container = buildTxtEncFile({
         saltB64: session.saltB64,
         ivB64,
         tagB64,
         eol: args.eol,
         hint: session.hint,
+        format: session.format,
         ciphertextB64,
         kdf: session.kdf
       });
@@ -309,12 +331,15 @@ export function registerCryptoHandlers(): void {
       const newKey = await deriveKey(args.newPassword, newSalt, SCRYPT_DEFAULTS);
       const { ivB64, tagB64, ciphertextB64 } = encryptBuffer(newKey, newIv, plaintext);
 
+      // 【v3 M10a】format は既存 .txtenc ヘッダの値をそのまま引き継ぐ（パスワード変更で
+      // 落とさない、data-model.md §3）。
       const container = buildTxtEncFile({
         saltB64: newSalt.toString('base64'),
         ivB64,
         tagB64,
         eol: loaded.file.eol,
         hint: loaded.file.hint,
+        format: loaded.file.format,
         ciphertextB64,
         kdf: SCRYPT_DEFAULTS
       });
@@ -333,7 +358,8 @@ export function registerCryptoHandlers(): void {
           key: newKey,
           saltB64: container.kdf.saltB64,
           kdf: { N: container.kdf.N, r: container.kdf.r, p: container.kdf.p, keyLen: container.kdf.keyLen },
-          hint: loaded.file.hint
+          hint: loaded.file.hint,
+          format: loaded.file.format === 'markdown' ? 'markdown' : 'plain'
         });
       }
 
@@ -351,5 +377,44 @@ export function registerCryptoHandlers(): void {
       deleteSessionKey(args.tabId, args.memoName);
       return ok(undefined);
     })
+  );
+
+  // --- v3 M8/M9a: crypto:lockNode（サブツリーをロック。lockContext指定時は入れ子ロック,
+  // docs/v3/milestones/M8-node-lock-core.md / M9a-node-lock-session-ops.md） ---
+  ipcMain.handle(
+    IpcChannels.crypto.lockNode,
+    wrapHandler(async (event: IpcMainInvokeEvent, args: CryptoLockNodeArgs): Promise<Result<void>> => {
+      const result = await lockNode(args.tabId, args.memoName, args.password, args.hint, args.lockContext);
+      if (result.ok) {
+        // ロック対象配下の名前を全文検索インデックスから除去済み（nodeLock.ts 内）のため、
+        // レンダラ側の検索結果表示を最新化させる（既存 M6 パターンと同様）。
+        emitIndexUpdated(event, args.tabId);
+      }
+      return result;
+    })
+  );
+
+  // --- v3 M8/M9a: crypto:unlockNode（ロック中サブツリーを復号しセッション開始。lockContext
+  // 指定時は入れ子ロックの解除） ---
+  ipcMain.handle(
+    IpcChannels.crypto.unlockNode,
+    wrapHandler(
+      async (_event: IpcMainInvokeEvent, args: CryptoUnlockNodeArgs): Promise<Result<CryptoUnlockNodeResult>> =>
+        unlockNode(args.tabId, args.memoName, args.password, args.lockContext)
+    )
+  );
+
+  // --- v3 M8: crypto:relockNode（単一ロックセッションの明示的破棄。ファイル操作なし） ---
+  ipcMain.handle(
+    IpcChannels.crypto.relockNode,
+    wrapHandler((_event: IpcMainInvokeEvent, args: CryptoRelockNodeArgs): Result<void> => relockNode(args.tabId, args.lockToken))
+  );
+
+  // --- v3 M9c: crypto:relockAllInTab（タブ切替時のセッション一括破棄。relockNode のループ相当、
+  // ファイル操作なし。対象タブにセッションが1件も無い場合も何もせず成功扱い＝冪等,
+  // docs/v3/milestones/M9c-node-lock-tab-switch.md） ---
+  ipcMain.handle(
+    IpcChannels.crypto.relockAllInTab,
+    wrapHandler((_event: IpcMainInvokeEvent, args: CryptoRelockAllInTabArgs): Result<void> => relockAllInTab(args.tabId))
   );
 }
