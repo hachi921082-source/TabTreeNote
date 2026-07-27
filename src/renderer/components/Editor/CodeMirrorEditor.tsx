@@ -12,15 +12,17 @@ import { forwardRef, useEffect, useImperativeHandle, useRef } from 'react';
 import { EditorSelection, EditorState } from '@codemirror/state';
 import { EditorView } from '@codemirror/view';
 import type { AppSettings } from '@shared/models';
-import type { EditorTextCommand } from '@shared/ipc-contract';
+import type { EditorTextCommand, MarkdownDecorationCommand } from '@shared/ipc-contract';
 import {
   INITIAL_SELECTION,
+  buildPreviewExtension,
   buildReadOnlyExtension,
   buildStaticExtensions,
   computeEditorStats,
   createCompartments,
   initialCompartmentExtensions,
   reconfigureEditorSettings,
+  reconfigurePreview,
   reconfigureReadOnly,
   type EditorCompartments,
   type EditorSettings,
@@ -29,10 +31,14 @@ import {
 import { buildCheckboxClickExtension } from '../../editor/checkboxClick';
 import { buildLinkExtension, type DetectedLink } from '../../editor/links';
 import { runTextCommand } from '../../editor/textCommands';
+import { runDecorationCommand } from '../../editor/decorationCommands';
+import { buildImagePasteExtension, type PendingImageInsert } from '../../editor/imagePaste';
 
 /** 親（App.tsx）が ref 経由で呼べる命令的 API（ユーザー要望: 右クリックメニューの元に戻す/変換等）。 */
 export interface CodeMirrorEditorHandle {
   runTextCommand: (command: EditorTextCommand) => void;
+  /** v3 M10b: 文字色/太字/文字サイズの装飾コマンド（右クリックメニュー）。 */
+  runDecorationCommand: (command: MarkdownDecorationCommand) => void;
 }
 
 /**
@@ -61,6 +67,30 @@ export interface CodeMirrorEditorProps {
   linkOpenTrigger: AppSettings['links']['openTrigger'];
   /** リンククリック時のコールバック（実際の外部起動/`memo:` 遷移は呼び出し側=App.tsx に委譲, M5）。 */
   onLinkClick: (link: DetectedLink) => void;
+  /**
+   * v3 M10b: 現在のメモがMarkdown（`.md`由来）かどうか。true の場合のみライブプレビュー描画
+   * （`markdownDecorations.ts` の ViewPlugin）・画像貼り付け（M10c, `imagePaste.ts`）を組み込む。
+   * 非制御コンポーネントのため、この値はマウント時にのみ評価する（メモ切替は親が `key` を変えて
+   * 再マウントさせる既存方針, DESIGN §2.3 コメント冒頭参照）。
+   */
+  markdown?: boolean;
+  /**
+   * v3 M10c: ソース/プレビュー切替。`markdown` が true の場合のみ意味を持つ（既定 true=プレビュー
+   * 表示）。非制御の `markdown` と異なり、こちらは Compartment 経由で動的に反映される
+   * （再マウントせずカーソル位置/Undo履歴/スクロール位置を維持したまま切り替わる）。
+   */
+  previewMode?: boolean;
+  /**
+   * v3 M10c: 画像貼り付け/ドロップでサイズ警告閾値を超えた場合に呼ばれる（`markdown` が true の
+   * 場合のみ）。呼び出し側（App.tsx）が実際のサイズを含む確認ダイアログを表示し、続行時に
+   * `request.insert()` を呼ぶ。閾値以下の場合はこのコールバックを経由せず直接挿入される。
+   */
+  onImagePasteRequest?: (request: PendingImageInsert) => void;
+  /**
+   * 【v3 M10c, reviewer指摘 M10c-R1-01 対応】貼り付け/ドロップされた画像がライブプレビューの
+   * サニタイズ許可リスト外の形式（bmp/svg等）だった場合に呼ばれる（`markdown` が true の場合のみ）。
+   */
+  onUnsupportedImagePaste?: () => void;
 }
 
 export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, CodeMirrorEditorProps>(function CodeMirrorEditor(
@@ -74,7 +104,11 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, CodeMirrorEdi
     autoFocus = true,
     revealTarget = null,
     linkOpenTrigger,
-    onLinkClick
+    onLinkClick,
+    markdown = false,
+    previewMode = true,
+    onImagePasteRequest,
+    onUnsupportedImagePaste
   },
   ref
 ) {
@@ -89,13 +123,19 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, CodeMirrorEdi
   const onSaveRef = useRef(onSave);
   const onLinkClickRef = useRef(onLinkClick);
   const linkOpenTriggerRef = useRef(linkOpenTrigger);
+  // v3 M10c: 画像貼り付けのサイズ警告コールバックも他コールバックと同じ ref 経由パターン
+  // （マウント時に組み込む拡張から常に最新のコールバックを参照するため）。
+  const onImagePasteRequestRef = useRef(onImagePasteRequest);
+  const onUnsupportedImagePasteRef = useRef(onUnsupportedImagePaste);
   useEffect(() => {
     onChangeRef.current = onChange;
     onStatsRef.current = onStats;
     onSaveRef.current = onSave;
     onLinkClickRef.current = onLinkClick;
     linkOpenTriggerRef.current = linkOpenTrigger;
-  }, [onChange, onStats, onSave, onLinkClick, linkOpenTrigger]);
+    onImagePasteRequestRef.current = onImagePasteRequest;
+    onUnsupportedImagePasteRef.current = onUnsupportedImagePaste;
+  }, [onChange, onStats, onSave, onLinkClick, linkOpenTrigger, onImagePasteRequest, onUnsupportedImagePaste]);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -121,8 +161,23 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, CodeMirrorEdi
         }),
         // 行頭チェックボックスのクリック直接トグル（ユーザー要望）。
         buildCheckboxClickExtension(),
+        // v3 M10c: 画像貼り付け/ドロップ（`.md`メモのみ。`markdown` は非制御なのでマウント時の値で
+        // 固定するが、コールバック自体は ref 経由で常に最新を参照する, onLinkClick と同じパターン）。
+        ...(markdown
+          ? [
+              buildImagePasteExtension({
+                onImageReady: (request) => onImagePasteRequestRef.current?.(request),
+                onUnsupportedImage: () => onUnsupportedImagePasteRef.current?.()
+              })
+            ]
+          : []),
         ...initialCompartmentExtensions(compartments, settings),
-        compartments.readOnly.of(buildReadOnlyExtension(readOnly))
+        compartments.readOnly.of(buildReadOnlyExtension(readOnly)),
+        // v3 M10c: Markdownライブプレビュー描画のON/OFF（ソース/プレビュー切替）。`markdown` が
+        // false のメモでは常に空（`.txt`にプレビュー概念は無い）。`markdown` 自体は非制御コンポーネント
+        // のためマウント時の値で固定するが、`previewMode` はこの Compartment 経由で動的に反映される
+        // （下の専用 effect 参照）。
+        compartments.preview.of(buildPreviewExtension(markdown && previewMode))
       ]
     });
 
@@ -162,6 +217,16 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, CodeMirrorEdi
     reconfigureReadOnly(view, compartments, readOnly);
   }, [readOnly]);
 
+  // v3 M10c: ソース/プレビュー切替を既存 EditorView へ Compartment 経由で反映する（readOnly と
+  // 同じパターン。再マウントしないため本文/カーソル位置/Undo履歴は変化しない）。`markdown` が
+  // false（`.txt`メモ等）の場合は常に何もしない（マウント時から Compartment が空のまま）。
+  useEffect(() => {
+    const view = viewRef.current;
+    const compartments = compartmentsRef.current;
+    if (!view || !compartments || !markdown) return;
+    reconfigurePreview(view, compartments, previewMode);
+  }, [previewMode, markdown]);
+
   // 全文検索結果からのジャンプ（M3-②）。マウント用 effect より後に宣言しているため、
   // 同一コミット内で viewRef.current が確実に設定済みの状態で参照できる。
   const lastRevealTokenRef = useRef<number | null>(null);
@@ -187,6 +252,10 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, CodeMirrorEdi
       runTextCommand: (command: EditorTextCommand) => {
         const view = viewRef.current;
         if (view) runTextCommand(view, command);
+      },
+      runDecorationCommand: (command: MarkdownDecorationCommand) => {
+        const view = viewRef.current;
+        if (view) runDecorationCommand(view, command);
       }
     }),
     []
