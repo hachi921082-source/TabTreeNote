@@ -17,7 +17,7 @@
 import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
 import type { CryptoUnlockNodeResult, LockContext } from '@shared/ipc-contract';
-import { MEMO_EXT_ENCRYPTED, SCRYPT_DEFAULTS } from '@shared/constants';
+import { MEMO_EXT_ENCRYPTED, MEMO_EXT_MARKDOWN, MEMO_EXT_PLAIN, SCRYPT_DEFAULTS } from '@shared/constants';
 import type { Eol, MetaTreeNode, NodeLock, NodeLockBlob, Result, SaveResult } from '@shared/models';
 import { err, ok } from '../util/result';
 import { getTabFolderPath } from '../fs/tabService';
@@ -37,8 +37,10 @@ import {
   setNodeLockSession,
   type NodeLockSessionEntry
 } from './nodeLockSessionStore';
-import { removeMemo as removeMemoFromIndex } from '../search/searchIndex';
+import { removeMemo as removeMemoFromIndex, updateMemo as updateMemoIndex } from '../search/searchIndex';
 import { hashBytes } from '../util/hash';
+import { restoreEol } from '../fs/eol';
+import { encodeText } from '../fs/encoding';
 
 /** 誤パスワード時のメッセージにヒントを付与する（既存 M6 パターンと同一）。 */
 function decryptFailedMessage(hint: string | undefined): string {
@@ -380,6 +382,190 @@ export async function unlockNode(
   //    buildOriginTreeNode/buildSessionTreeNodes を使うため、ロジックを二重管理しない）。
   const revealed = buildOriginTreeNode(entry, lockToken);
   return ok({ lockToken, tree: [revealed] });
+}
+
+/**
+ * v3 §1.14: `crypto:removeNodeLock`（ロックの恒久的解除。`lockNode` と対称に、対象ロックを永久に
+ * 取り除き起点+配下全体を「二度と保護されない」通常状態へ昇格させる, docs/v3/DESIGNv3.md §1.14）。
+ * `lockContext` 省略時: タブ直下のメタツリー上で対象を解決し、復号したメンバーを実名の平文
+ * `.txt`/`.md` ファイルへ変換する（既存 `crypto:decryptMemoToPlain` と同じ EOL 復元・拡張子決定
+ * ロジック）。
+ * `lockContext` 指定時（対象自体が入れ子ロック）: 親セッションの `entry.children` 上で対象を解決し、
+ * 復号したメンバーを親セッションの鍵で再暗号化して同一トークンへ上書きし `entry.nameMap`/
+ * `entry.formatMap`/`children` へマージする（2026-07-29追記・developer-lite照会への回答・
+ * designer-lite確認: ディスク上で一度も無防備な平文にならない、§1.14「入れ子ロックとの関係」）。
+ * 入れ子ロック（未解除）に到達したら復号せずそのまま`lock`を保持した状態で昇格させる（ブラック
+ * ボックスとして丸ごと保持、中身には一切触れない）。
+ * セッションの有無を問わず常に `password` から新規に鍵を導出する（既存セッション鍵は使い回さない、
+ * M6 `crypto:decryptMemoToPlain` と同じ規律）。
+ */
+export async function removeNodeLock(
+  tabId: string,
+  memoName: string,
+  password: string,
+  lockContext?: LockContext
+): Promise<Result<void>> {
+  const folder = getTabFolderPath(tabId);
+  if (!folder.ok) return folder;
+  const folderPath = folder.value;
+
+  // 1. 対象ロックの解決（unlockNode と同じ探索パターン。placeholder/既に開いているセッションの
+  //    起点いずれから呼ばれても、対象は常にこの「対象自身のトークン」で一意に解決できる）。
+  let lock: NodeLock;
+  let parentEntry: NodeLockSessionEntry | undefined;
+  let parentLockToken: string | undefined;
+  let loadedMetaTree: MetaTreeNode[] | undefined;
+  let siblings: MetaTreeNode[];
+  let index: number;
+
+  if (lockContext) {
+    const entry = getNodeLockSession(tabId, lockContext.lockToken);
+    if (!entry) {
+      return err('LOCK_SESSION_NOT_FOUND', 'ロックセッションが見つかりません（既に再ロックされた可能性があります）。');
+    }
+    const location = findNode(entry.children, memoName);
+    if (!location || !location.node.lock) {
+      return err('NOT_FOUND', `ロック中のメモが見つかりません: ${memoName}`, folderPath);
+    }
+    lock = location.node.lock;
+    parentEntry = entry;
+    parentLockToken = lockContext.lockToken;
+    siblings = location.siblings;
+    index = location.index;
+  } else {
+    const loaded = await loadTabMeta(folderPath);
+    loadedMetaTree = loaded.metaTree;
+    const location = findNode(loaded.metaTree, memoName);
+    if (!location || !location.node.lock) {
+      return err('NOT_FOUND', `ロック中のメモが見つかりません: ${memoName}`, folderPath);
+    }
+    lock = location.node.lock;
+    siblings = location.siblings;
+    index = location.index;
+  }
+
+  // 2. password+salt+kdf から鍵導出→blobCiphertextB64をIV+tagで復号。
+  const key = await deriveKey(password, Buffer.from(lock.saltB64, 'base64'), lock.kdf);
+  let blobPlain: Buffer;
+  try {
+    blobPlain = decryptBuffer(key, lock.ivB64, lock.tagB64, lock.blobCiphertextB64);
+  } catch {
+    return err('DECRYPT_FAILED', decryptFailedMessage(lock.hint), folderPath);
+  }
+  let blob: NodeLockBlob;
+  try {
+    blob = JSON.parse(blobPlain.toString('utf-8')) as NodeLockBlob;
+  } catch {
+    return err('DECRYPT_FAILED', 'ロック情報の形式が不正です（読み込めません）。', folderPath);
+  }
+
+  // 3. 昇格後に可視化される実名の集合を求める。children を再帰的に辿るが、途中で lock を持つ
+  //    ノード（入れ子ロック）に到達したらそこで再帰を止め、その子孫の実名は集合に含めない。
+  const restoreNames: string[] = [blob.realMemoName];
+  (function collectRestoreNames(nodes: MetaTreeNode[]): void {
+    for (const n of nodes) {
+      if (n.lock) continue;
+      restoreNames.push(n.memoName);
+      collectRestoreNames(n.children);
+    }
+  })(blob.children);
+
+  // 4. 名前衝突チェック（新規・確定）。moveIntoSession と同じ全件先行チェック・全か無かのパターン。
+  //    自動リネームは行わない。1件でも衝突があればバッチ全体を NAME_DUPLICATE で拒否する。
+  const existingNames = new Set<string>();
+  if (parentEntry) {
+    for (const n of Object.keys(parentEntry.nameMap)) existingNames.add(n);
+  } else if (loadedMetaTree) {
+    (function collectAllNames(nodes: MetaTreeNode[]): void {
+      for (const n of nodes) {
+        existingNames.add(n.memoName);
+        collectAllNames(n.children);
+      }
+    })(loadedMetaTree);
+    existingNames.delete(memoName); // 対象自身（差し替えられる位置）は除外する。
+  }
+  const conflicts = restoreNames.filter((n) => existingNames.has(n));
+  if (conflicts.length > 0) {
+    return err('NAME_DUPLICATE', `名前が重複しています: ${conflicts.join(', ')}`, folderPath);
+  }
+
+  // 5. 部分木の各メンバー（起点＋非入れ子ロックの子孫）について、nameMap[realName] が指す
+  //    トークンの .txtenc を対象自身の鍵で復号するところまでは共通。その後の書き込み方は
+  //    lockContext の有無で分岐する。
+  for (const realName of restoreNames) {
+    const token = blob.nameMap[realName];
+    if (!token) continue; // 型上ありえない（restoreNames は blob.nameMap のキー集合の部分集合）。
+    const oldPath = join(folderPath, `${token}${MEMO_EXT_ENCRYPTED}`);
+    const raw = await fs.readFile(oldPath).catch(() => null);
+    if (!raw) return err('NOT_FOUND', `メモが見つかりません: ${realName}`, oldPath);
+    const file = parseTxtEncFile(raw);
+    if (!file) return err('DECRYPT_FAILED', 'ファイル形式が不正です（読み込めません）。', oldPath);
+    let plaintext: Buffer;
+    try {
+      plaintext = decryptBuffer(key, file.cipher.ivB64, file.cipher.tagB64, file.ciphertextB64);
+    } catch {
+      return err('DECRYPT_FAILED', 'ロック情報の復号に失敗しました。', oldPath);
+    }
+    const contentLF = plaintext.toString('utf-8');
+    const format: 'plain' | 'markdown' = blob.formatMap[realName] ?? 'plain';
+
+    if (!parentEntry) {
+      // lockContext 省略時（トップレベル対象）: 実名の平文 .txt/.md ファイルへ変換する。新ファイル
+      // 永続化確認後、旧トークンの .txtenc を削除する（既存 lockNode/decryptMemoToPlain と同じ
+      // 「新規fsync確認後に旧ファイル削除」の順序）。全文検索インデックスへ追加する。
+      const restored = restoreEol(contentLF, file.eol);
+      const data = encodeText(restored, 'utf-8');
+      const plainExt = format === 'markdown' ? MEMO_EXT_MARKDOWN : MEMO_EXT_PLAIN;
+      const newPath = join(folderPath, `${realName}${plainExt}`);
+      await atomicWrite(newPath, data);
+      await deleteConvertedSourceFile(oldPath);
+      updateMemoIndex(tabId, realName, false, contentLF, format);
+    } else {
+      // lockContext 指定時（対象自体が入れ子ロック）: 実名ファイルへは変換せず、親セッションの鍵
+      // （parentEntry.key）で再暗号化し、メンバーが既に持っていたトークンと同じ .txtenc パスへ
+      // 上書きする（トークンはロック時点で既にフォルダ全体で一意に採番済みであり他から参照されない
+      // ため、新規トークン採番・別名での書込み＋旧ファイル削除は不要）。全文検索インデックスへの
+      // 追加は行わない（§1.7 Q1「セッション中も除外し続ける」を維持）。
+      const written = await writeSessionMemoContent(folderPath, parentEntry, token, contentLF, file.eol, undefined, format);
+      if (!written.ok) return written;
+      parentEntry.nameMap[realName] = token;
+      parentEntry.formatMap[realName] = format;
+    }
+  }
+
+  // 6. 復号・昇格済みの実名 MetaTreeNode[]（入れ子ロックノードは lock を保持したまま無改変で
+  //    含む＝ blob.children はそのまま流用できる）を、対象ノードがあった位置へ差し替える。
+  const restoredNode: MetaTreeNode = {
+    memoName: blob.realMemoName,
+    expanded: true,
+    children: blob.children
+  };
+  siblings[index] = restoredNode;
+
+  // 7. 永続化。lockContext 省略時はそのままタブのメタJSONを保存。指定時（入れ子解除）は親
+  //    セッションを再暗号化・保存する（祖先を辿る処理は persistNodeLockSession が担う）。
+  if (parentEntry && parentLockToken) {
+    const persisted = await persistNodeLockSession(tabId, parentLockToken);
+    if (!persisted.ok) return persisted;
+  } else if (loadedMetaTree) {
+    await saveTabMeta(folderPath, loadedMetaTree);
+  }
+
+  // 8. セッション後始末: 対象ノード自身の nodeLockSessionStore エントリ（あれば）を破棄する。
+  //    加えて、手順3で「入れ子ロックとしてそのまま昇格させた」各ノードについて、万一その入れ子
+  //    ロックの解除セッションが偶然張られたままだった場合も同様に破棄する。
+  deleteNodeLockSession(tabId, memoName);
+  (function discardNestedSessions(nodes: MetaTreeNode[]): void {
+    for (const n of nodes) {
+      if (n.lock) {
+        deleteNodeLockSession(tabId, n.memoName);
+      } else {
+        discardNestedSessions(n.children);
+      }
+    }
+  })(blob.children);
+
+  return ok(undefined);
 }
 
 /**
