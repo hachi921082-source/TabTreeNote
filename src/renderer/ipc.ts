@@ -13,6 +13,7 @@ import type {
   CryptoOpenResult,
   CryptoRelockAllInTabArgs,
   CryptoRelockNodeArgs,
+  CryptoRemoveNodeLockArgs,
   CryptoSaveEncryptedArgs,
   CryptoUnlockNodeArgs,
   CryptoUnlockNodeResult,
@@ -121,6 +122,7 @@ export const ipc = {
   unlockNode: (args: CryptoUnlockNodeArgs): Promise<Result<CryptoUnlockNodeResult>> => window.api.crypto.unlockNode(args),
   relockNode: (args: CryptoRelockNodeArgs): Promise<Result<void>> => window.api.crypto.relockNode(args),
   relockAllInTab: (args: CryptoRelockAllInTabArgs): Promise<Result<void>> => window.api.crypto.relockAllInTab(args),
+  removeNodeLock: (args: CryptoRemoveNodeLockArgs): Promise<Result<void>> => window.api.crypto.removeNodeLock(args),
 
   onMetaRecovered: (handler: (payload: MetaRecoveredPayload) => void): (() => void) =>
     window.api.events.onMetaRecovered(handler),
