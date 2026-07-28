@@ -113,6 +113,8 @@ interface CryptoDialogRequest {
   mode: PasswordDialogMode;
   tabId: string;
   memoName: string;
+  /** v3 §1.14: `removeNodeLock` 専用。対象自体が入れ子ロックの場合の親セッション情報。 */
+  lockContext?: LockContext;
 }
 
 interface NameDialogRequest {
@@ -1260,21 +1262,27 @@ export function App() {
   );
 
   // --- v3 M8: ノードロック（DESIGNv3 §1、docs/v3/milestones/M8-node-lock-core.md） ---
-  // 既存M6の暗号化ダイアログ導線をそのまま流用する（DESIGNv3 §1.11）。dirty ガードは対象外
-  // （ロック対象は選択中のノード自体であり、現在開いているメモとは独立した操作のため）。
+  // 既存M6の暗号化ダイアログ導線をそのまま流用する（DESIGNv3 §1.11）。
   const handleRequestLockNode = useCallback(
-    (memoName: string) => {
+    async (memoName: string) => {
       if (!selectedTabId) return;
-      // 開いている(現在表示中の)メモがロック対象配下に含まれる場合は先に閉じてもらう
-      // （ロック実行で実ファイルが難読化名へリネーム+暗号化されるため, developer 判断）。
+      // 開いている(現在表示中の)メモがロック対象配下に含まれる場合、M6の「ロック」ボタン
+      // （handleLockMemo）と同じパターンで先に自動的に閉じる（未保存の変更があれば
+      // requestCloseCurrentMemo が確認/自動保存を行う。キャンセルされたらロックも中止する,
+      // docs/post-M10-changes.md「Lock-while-memo-is-open UX friction」）。
       if (openMemo && openMemo.tabId === selectedTabId && treeNodeContains(tree, memoName, openMemo.memoName)) {
-        setStatusMessage('ロック対象のメモが開いています。先に閉じて（別のメモを開くかタブを切り替えて）からロックしてください。');
-        return;
+        if (!(await requestCloseCurrentMemo())) return;
+        setOpenMemo(null);
+        setContentLF('');
+        setDirty(false);
+        setEditorStats(null);
+        setConflictInfo(null);
+        reportActiveMemo(null);
       }
       setCryptoDialog({ mode: 'lockNode', tabId: selectedTabId, memoName });
       setCryptoDialogError(null);
     },
-    [selectedTabId, openMemo, tree]
+    [selectedTabId, openMemo, tree, requestCloseCurrentMemo, reportActiveMemo]
   );
 
   const handleRequestUnlockNode = useCallback(
@@ -1284,6 +1292,48 @@ export function App() {
       setCryptoDialogError(null);
     },
     [selectedTabId]
+  );
+
+  // --- v3 §1.14: ロックの恒久的解除（不可逆、docs/v3/DESIGNv3.md §1.14） ---
+  const handleRequestRemoveNodeLock = useCallback(
+    async (targetToken: string, lockContextToken: string | undefined) => {
+      if (!selectedTabId) return;
+      const tabId = selectedTabId;
+      // 対象配下で現在開いている(かつdirtyな)メモがあれば、先に自動保存を済ませてから進める
+      // （§1.11「自動保存優先」、DESIGNv3 §1.14「未保存編集との関係」）。ロック中サブツリー配下の
+      // メモは常にセッション経由でのみ開けるため、`openMemo.lockToken === targetToken` で
+      // 過不足なく判定できる（起点自身・子孫いずれを開いていてもこのセッションの lockToken が
+      // 付与される）。
+      if (openMemo && openMemo.tabId === tabId && openMemo.lockToken === targetToken) {
+        if (!(await requestCloseCurrentMemo())) return;
+        setOpenMemo(null);
+        setContentLF('');
+        setDirty(false);
+        setEditorStats(null);
+        setConflictInfo(null);
+        reportActiveMemo(null);
+      }
+      // 不可逆であることを明示する確認ダイアログ（既存 ConfirmDialog を流用, DESIGNv3 §1.14
+      // 「操作フロー」手順1）。続けてパスワード入力ダイアログへ進む（手順2・3）。
+      setConfirmDialog({
+        title: 'ロックを完全に解除',
+        message:
+          'この操作を行うと、このロックは完全に解除され、配下のすべてのメモが二度と保護されない通常の状態に戻ります。この操作は取り消せません。続行しますか？',
+        confirmLabel: '完全に解除する',
+        danger: true,
+        onConfirm: () => {
+          setConfirmDialog(null);
+          setCryptoDialog({
+            mode: 'removeNodeLock',
+            tabId,
+            memoName: targetToken,
+            lockContext: lockContextToken ? { lockToken: lockContextToken } : undefined
+          });
+          setCryptoDialogError(null);
+        }
+      });
+    },
+    [selectedTabId, openMemo, requestCloseCurrentMemo, reportActiveMemo]
   );
 
   const handleCryptoDialogCancel = useCallback(() => {
@@ -1335,7 +1385,7 @@ export function App() {
   const handleCryptoDialogSubmit = useCallback(
     (values: PasswordDialogSubmitValues) => {
       if (!cryptoDialog) return;
-      const { mode, tabId, memoName } = cryptoDialog;
+      const { mode, tabId, memoName, lockContext } = cryptoDialog;
       void (async () => {
         if (mode === 'setup') {
           const res = await ipc.encryptMemo({ tabId, memoName, password: values.password ?? '', hint: values.hint });
@@ -1418,6 +1468,21 @@ export function App() {
               setTree((prev) => updateTreeNode(prev, memoName, () => revealed));
             }
             setStatusMessage('ロックを解除しました。');
+          } else {
+            setCryptoDialogError(res.error.message);
+          }
+          return;
+        }
+        if (mode === 'removeNodeLock') {
+          // v3 §1.14: ロックを恒久的に解除する（不可逆、DESIGNv3 §1.14）。構造変更が複数ファイルへ
+          // 及ぶため、lockNode 成功時と同様にディスク側の最新状態を再取得して表示する
+          // （ローカルでのツリー再構築は行わない）。
+          const res = await ipc.removeNodeLock({ tabId, memoName, password: values.password ?? '', lockContext });
+          if (res.ok) {
+            setCryptoDialog(null);
+            setCryptoDialogError(null);
+            setStatusMessage('ロックを完全に解除しました。');
+            await refreshTree(tabId);
           } else {
             setCryptoDialogError(res.error.message);
           }
@@ -2279,6 +2344,7 @@ export function App() {
               onRequestProperties={handleRequestProperties}
               onRequestLockNode={handleRequestLockNode}
               onRequestUnlockNode={handleRequestUnlockNode}
+              onRequestRemoveNodeLock={handleRequestRemoveNodeLock}
               onLocalMove={(names, anchor, zone, anchorLockToken, srcLockToken) =>
                 void handleLocalMove(names, anchor, zone, anchorLockToken, srcLockToken)
               }
