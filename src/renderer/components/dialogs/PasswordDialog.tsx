@@ -11,7 +11,14 @@ export type PasswordDialogMode =
   | 'changePassword'
   // v3 M8: ノードロック（既存M6暗号化ダイアログの見た目・確認再入力ルールを流用, DESIGNv3 §1.11）。
   | 'lockNode'
-  | 'unlockNode';
+  | 'unlockNode'
+  /**
+   * v3 §1.14: ロックの恒久的解除（不可逆。既存 `unlockNode`「ロックを解除」とは別操作、
+   * `docs/v3/DESIGNv3.md` §1.14）。呼び出し元（App.tsx）が事前に不可逆性の確認ダイアログ
+   * （`ConfirmDialog`）を経由済みの前提で、本モードは既存 `unlockNode` と同じパスワード入力
+   * フォーム形状（既にセッションが張られていても再入力を要求し、セッション鍵は使い回さない）。
+   */
+  | 'removeNodeLock';
 
 export interface PasswordDialogSubmitValues {
   password?: string;
@@ -35,7 +42,8 @@ const TITLES: Record<PasswordDialogMode, string> = {
   unlockToDecrypt: '暗号化を解除',
   changePassword: 'パスワードを変更',
   lockNode: 'パスワードを設定してサブツリーをロック',
-  unlockNode: 'ロックを解除'
+  unlockNode: 'ロックを解除',
+  removeNodeLock: 'ロックを完全に解除する'
 };
 
 const SUBMIT_LABELS: Record<PasswordDialogMode, string> = {
@@ -44,7 +52,8 @@ const SUBMIT_LABELS: Record<PasswordDialogMode, string> = {
   unlockToDecrypt: '解除する',
   changePassword: '変更する',
   lockNode: 'ロックする',
-  unlockNode: '解除する'
+  unlockNode: '解除する',
+  removeNodeLock: '完全に解除する'
 };
 
 /** 忘失時は復旧不能（バックドア/マスターキーは無い）ことの警告文（DESIGN §2.9）。 */
@@ -64,7 +73,7 @@ export function PasswordDialog({ mode, memoName, errorMessage, onCancel, onSubmi
   // （既存M6暗号化ダイアログの見た目・確認再入力ルールを流用, DESIGNv3 §1.11）。
   const isSetup = mode === 'setup' || mode === 'lockNode';
   const isChangePassword = mode === 'changePassword';
-  const isUnlock = mode === 'unlockToOpen' || mode === 'unlockToDecrypt' || mode === 'unlockNode';
+  const isUnlock = mode === 'unlockToOpen' || mode === 'unlockToDecrypt' || mode === 'unlockNode' || mode === 'removeNodeLock';
 
   const setupMismatch = isSetup && confirmPassword.length > 0 && password !== confirmPassword;
   const changeMismatch = isChangePassword && confirmNewPassword.length > 0 && newPassword !== confirmNewPassword;
@@ -90,11 +99,17 @@ export function PasswordDialog({ mode, memoName, errorMessage, onCancel, onSubmi
   return (
     <Modal title={TITLES[mode]} onClose={onCancel}>
       <form className="password-dialog" onSubmit={handleSubmit}>
-        {/* v3 M8: unlockNode の memoName は内部の難読化トークン（意味の無いランダム文字列）の
-            ため、ユーザーには表示しない（DESIGNv3 §1.2「🔒以外の情報を一切見せない」）。 */}
+        {/* v3 M8/§1.14: unlockNode/removeNodeLock の memoName は内部の難読化トークン
+            （意味の無いランダム文字列）のため、ユーザーには表示しない
+            （DESIGNv3 §1.2「🔒以外の情報を一切見せない」）。 */}
         <p className="password-dialog__memo-name">
-          {mode === 'unlockNode' ? '対象: 🔒 (ロック中)' : `対象メモ: ${memoName}`}
+          {mode === 'unlockNode' || mode === 'removeNodeLock' ? '対象: 🔒 (ロック中)' : `対象メモ: ${memoName}`}
         </p>
+        {mode === 'removeNodeLock' && (
+          <p className="password-dialog__warning">
+            ※ この操作は取り消せません。配下のすべてのメモが二度と保護されない通常の状態に戻ります。
+          </p>
+        )}
 
         {isUnlock && (
           <>
