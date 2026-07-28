@@ -24,7 +24,10 @@ export type ErrorCode =
   | 'LOCK_SESSION_NOT_FOUND'
   // --- v3 M9b: ロック境界を跨ぐ移動・コピー（「一方通行の金庫」、docs/v3/DESIGNv3.md §1.12、
   // docs/v3/milestones/M9b-node-lock-boundary-move.md）。
-  | 'LOCK_BOUNDARY_VIOLATION';
+  | 'LOCK_BOUNDARY_VIOLATION'
+  // --- v3 §1.15: ロック中(セッション無し)ノードの直接削除の禁止（docs/v3/DESIGNv3.md §1.15、
+  // `LOCK_BOUNDARY_VIOLATION` とは意味が異なる＝あちらは境界跨ぎの移動/コピー専用）。
+  | 'NODE_LOCKED';
 
 export type Eol = 'crlf' | 'lf' | 'cr';
 
