@@ -1052,6 +1052,19 @@ export function registerMemoHandlers(): void {
       }
 
       const loaded = await loadTabMeta(folderPath);
+
+      // 【v3 §1.15】ロック中(セッション無し)ノードの直接削除を防ぐ（防御的多層防御。UI側の
+      // ガード（Tree.tsx）が既に同じ制限を課しているが、バイパスされた場合にもここで一貫して
+      // 防ぐ, docs/v3/DESIGNv3.md §1.15）。対象のいずれかが lock フィールドを持つノードに
+      // 解決される場合、削除ループを開始する前にバッチ全体を拒否する（①ストア更新前の重複チェック
+      // 先行と同じ原則、他の構造変更操作と共通）。`lockContext` 指定時（セッション内からの削除）は
+      // 既に別チェック（deleteMemosInSession の NAME_INVALID）があるため本チェックの対象外。
+      const lockedByName = collectLockedNodesByName(loaded.metaTree);
+      const lockedTargets = args.memoNames.filter((name) => lockedByName.has(name));
+      if (lockedTargets.length > 0) {
+        return err('NODE_LOCKED', 'ロック中のノードは削除できません。先にロックを解除してください。', folderPath);
+      }
+
       const succeeded: string[] = [];
       const failed: string[] = [];
 
