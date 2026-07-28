@@ -1,7 +1,15 @@
 # 引き継ぎメモ(HANDOFF.md)
 
+> **2026-07-29時点: M10c完了以降の最新状況は [docs/v3/HANDOFFv3.md](docs/v3/HANDOFFv3.md) を参照してください。**
+> 本ファイル(HANDOFF.md)はM10c完了時点(2026-07-25/26)で更新が止まっており、それ以降の作業
+> (ノードロック設計追加検討・Markdown装飾バグ修正・ブランチ`v4`への移行・専用エージェント名の変更等)
+> は反映されていません。プロジェクト概要・v1(M0〜M7)の経緯・ドキュメント構成など背景情報は
+> 引き続き本ファイルが正本ですが、「現在の状態」「次にすべきこと」は[docs/v3/HANDOFFv3.md](docs/v3/HANDOFFv3.md)を優先してください。
+>
 > 新しいチャットを開始したら、まずこのファイルを読んで状況を把握してください。
 > ワークフロー自体は [CLAUDE.md](CLAUDE.md) に記載済み(4エージェント体制: designer/developer/reviewer/tester)。
+> **ただし2026-07-28/29時点でdesigner/developer/reviewer/tester専用エージェントは利用不可になっており、
+> 代わりにdesigner-lite/developer-lite/reviewer-liteを使う必要があります。詳細は[docs/v3/HANDOFFv3.md](docs/v3/HANDOFFv3.md)参照。**
 
 ## プロジェクト概要
 
