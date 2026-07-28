@@ -42,6 +42,7 @@ import type {
   EditorReportActiveArgs,
   ExternalChangePayload,
   LockContext,
+  MarkdownDecorationCommand,
   MemoProperties,
   MetaRecoveredPayload,
   OpErrorPayload,
@@ -2140,16 +2141,23 @@ export function App() {
     });
   }, []);
 
+  // 【post-M10 bugfix】MarkdownToolbar の装飾ボタン（文字色/太字/文字サイズ）。右クリックメニュー
+  // 経由のIPC（`kind: 'decoration'`, 廃止済み）と異なり、同一プロセス内なので editorRef を
+  // 直接呼ぶだけでよい。
+  const handleDecorate = useCallback((command: MarkdownDecorationCommand) => {
+    editorRef.current?.runDecorationCommand(command);
+  }, []);
+
   // エディタ右クリックメニューの各種コマンド（ユーザー要望）。CodeMirror 内部状態を直接触る
   // ものは editorRef 経由（textCommand）、それ以外は既存の設定変更ハンドラへ委譲する。
+  // 【post-M10 bugfix】装飾コマンド（文字色/太字/文字サイズ）は右クリックメニューから
+  // MarkdownToolbar のボタンへ移設したため、`kind: 'decoration'` はこのIPC経路には来なくなった
+  // （`handleDecorate` 経由で editorRef を直接呼ぶ、下記参照）。
   useEffect(() => {
     return ipc.onEditorMenuCommand((payload: EditorMenuCommandPayload) => {
       switch (payload.kind) {
         case 'textCommand':
           editorRef.current?.runTextCommand(payload.command);
-          return;
-        case 'decoration':
-          editorRef.current?.runDecorationCommand(payload);
           return;
         case 'setWrap':
           handleChangeEditorSettingsFromDialog({ wrap: payload.wrap });
@@ -2329,6 +2337,7 @@ export function App() {
                   onTogglePreview={() => setPreviewMode((prev) => !prev)}
                   canConvertToTxt={!openMemo.encrypted && !openMemo.lockToken}
                   onConvertToTxt={() => handleConvertFormat('txt')}
+                  onDecorate={handleDecorate}
                 />
               )}
               <CodeMirrorEditor
