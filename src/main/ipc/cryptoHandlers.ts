@@ -20,6 +20,7 @@ import {
   type CryptoOpenResult,
   type CryptoRelockAllInTabArgs,
   type CryptoRelockNodeArgs,
+  type CryptoRemoveNodeLockArgs,
   type CryptoSaveEncryptedArgs,
   type CryptoUnlockNodeArgs,
   type CryptoUnlockNodeResult,
@@ -40,7 +41,7 @@ import { decryptBuffer, deriveKey, encryptBuffer, generateIv, generateSalt } fro
 import { buildTxtEncFile, parseTxtEncFile, serializeTxtEncFile, type TxtEncFile } from '../crypto/encFormat';
 import { deleteSessionKey, getSessionKey, setSessionKey } from '../crypto/sessionKeyStore';
 import { updateMemo as updateMemoIndex } from '../search/searchIndex';
-import { lockNode, relockAllInTab, relockNode, unlockNode } from '../crypto/nodeLock';
+import { lockNode, relockAllInTab, relockNode, removeNodeLock, unlockNode } from '../crypto/nodeLock';
 
 function emitIndexUpdated(event: IpcMainInvokeEvent, tabId: string): void {
   const payload: IndexUpdatedPayload = { tabId };
@@ -416,5 +417,22 @@ export function registerCryptoHandlers(): void {
   ipcMain.handle(
     IpcChannels.crypto.relockAllInTab,
     wrapHandler((_event: IpcMainInvokeEvent, args: CryptoRelockAllInTabArgs): Result<void> => relockAllInTab(args.tabId))
+  );
+
+  // --- v3 §1.14: crypto:removeNodeLock（ロックの恒久的解除。lockNode と対称、
+  // docs/v3/DESIGNv3.md §1.14。lockContext指定時は入れ子ロック自体の恒久解除） ---
+  ipcMain.handle(
+    IpcChannels.crypto.removeNodeLock,
+    wrapHandler(async (event: IpcMainInvokeEvent, args: CryptoRemoveNodeLockArgs): Promise<Result<void>> => {
+      const result = await removeNodeLock(args.tabId, args.memoName, args.password, args.lockContext);
+      if (result.ok) {
+        // lockContext 省略時（トップレベル対象）は昇格したメンバーを全文検索インデックスへ
+        // 追加済み（nodeLock.ts 内）のため、レンダラ側の検索結果表示を最新化させる
+        // （既存 M6/lockNode パターンと同様。lockContext 指定時はインデックス変化が無いため
+        // no-op に近いが、イベント発火自体は無害なので分岐しない）。
+        emitIndexUpdated(event, args.tabId);
+      }
+      return result;
+    })
   );
 }
