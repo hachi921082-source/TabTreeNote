@@ -18,6 +18,7 @@ import {
   type CryptoOpenResult,
   type CryptoRelockAllInTabArgs,
   type CryptoRelockNodeArgs,
+  type CryptoRemoveNodeLockArgs,
   type CryptoSaveEncryptedArgs,
   type CryptoUnlockNodeArgs,
   type CryptoUnlockNodeResult,
@@ -156,7 +157,9 @@ const api: PreloadApi = {
     relockNode: (args: CryptoRelockNodeArgs): Promise<Result<void>> =>
       ipcRenderer.invoke(IpcChannels.crypto.relockNode, args),
     relockAllInTab: (args: CryptoRelockAllInTabArgs): Promise<Result<void>> =>
-      ipcRenderer.invoke(IpcChannels.crypto.relockAllInTab, args)
+      ipcRenderer.invoke(IpcChannels.crypto.relockAllInTab, args),
+    removeNodeLock: (args: CryptoRemoveNodeLockArgs): Promise<Result<void>> =>
+      ipcRenderer.invoke(IpcChannels.crypto.removeNodeLock, args)
   },
   events: {
     onMetaRecovered: (handler: (payload: MetaRecoveredPayload) => void): (() => void) => {
