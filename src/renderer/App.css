@@ -873,6 +873,27 @@
   background-color: var(--color-accent-soft, var(--color-bg-elevated));
 }
 
+/* post-M10 bugfix: 装飾ボタン（文字色/太字/文字サイズ）を右クリックメニューから移設。 */
+.app__markdown-toolbar-sep {
+  width: 1px;
+  align-self: stretch;
+  background-color: var(--color-border);
+  margin: 0 2px;
+}
+
+.app__markdown-toolbar-swatch {
+  width: 20px;
+  height: 20px;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  cursor: pointer;
+  padding: 0;
+}
+
+.app__markdown-toolbar-swatch:hover {
+  border-color: var(--color-text);
+}
+
 /* --- CodeMirror 6 エディタ本体（components/Editor/CodeMirrorEditor.tsx, M3-①） --- */
 
 .cm-editor-host {
