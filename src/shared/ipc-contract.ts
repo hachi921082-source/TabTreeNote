@@ -82,7 +82,15 @@ export const IpcChannels = {
     /** v3 M8: 単一ロックセッションの明示的破棄（ファイル操作なし）。 */
     relockNode: 'crypto:relockNode',
     /** v3 M9c: 指定タブに紐づく全ロックセッションを一括破棄（タブ切替時用, ファイル操作なし）。 */
-    relockAllInTab: 'crypto:relockAllInTab'
+    relockAllInTab: 'crypto:relockAllInTab',
+    /**
+     * v3 §1.14: ロックを恒久的に解除する（`docs/v3/DESIGNv3.md` §1.14）。`lockNode` と対称に、
+     * 起点+配下全体を復号し実名の平文ツリーへ昇格させる（`lockContext` 省略時）、または
+     * 親セッションの鍵で再暗号化して親セッションへマージする（`lockContext` 指定時、入れ子ロック
+     * 自体の恒久解除）。既存の一時セッション用「ロックを解除」（`unlockNode`）とは別の、不可逆な
+     * 別操作。
+     */
+    removeNodeLock: 'crypto:removeNodeLock'
   },
   link: {
     openExternal: 'link:openExternal',
@@ -657,6 +665,21 @@ export interface CryptoRelockNodeArgs {
 }
 
 /**
+ * v3 §1.14: `crypto:removeNodeLock`（ロックの恒久的解除, `docs/v3/DESIGNv3.md` §1.14）。
+ * `memoName` は対象ロックの難読化トークン（`lockContext` 省略時はタブ直下のメタツリー上、
+ * 指定時は親セッションの実行時構造上で解決する。`unlockNode` と同じ解決パターン）。
+ * セッションの有無を問わず常に `password` から新規に鍵を導出する（セッション鍵の使い回しはしない,
+ * M6 `crypto:decryptMemoToPlain` と同じ規律）。
+ */
+export interface CryptoRemoveNodeLockArgs {
+  tabId: string;
+  memoName: string;
+  password: string;
+  /** 指定時: 対象ロック自体が別ロックの解除セッション内にある（入れ子ロックの恒久解除）。 */
+  lockContext?: LockContext;
+}
+
+/**
  * v3 M9c: `crypto:relockAllInTab`（タブ切替時のセッション一括破棄, docs/v3/DESIGNv3.md §1.11・
  * docs/v3/PLANv3.md §5.5/§7.6、docs/v3/milestones/M9c-node-lock-tab-switch.md）。
  * 対象タブに紐づく全ロックセッション（入れ子ロックの子セッション含む）を一括破棄する。
@@ -776,6 +799,8 @@ export interface PreloadApi {
     relockNode(args: CryptoRelockNodeArgs): Promise<Result<void>>;
     /** v3 M9c: 指定タブに紐づく全ロックセッションを一括破棄（タブ切替時用、ファイル操作なし）。 */
     relockAllInTab(args: CryptoRelockAllInTabArgs): Promise<Result<void>>;
+    /** v3 §1.14: ロックを恒久的に解除する（不可逆。`lockNode` と対称、`docs/v3/DESIGNv3.md` §1.14）。 */
+    removeNodeLock(args: CryptoRemoveNodeLockArgs): Promise<Result<void>>;
   };
   events: {
     /** `evt:metaRecovered` を購読する。返り値の関数を呼ぶと購読解除する。 */
