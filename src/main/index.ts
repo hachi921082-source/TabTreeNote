@@ -252,71 +252,11 @@ function createMainWindow(windowState: WindowBounds, startHidden: boolean): Brow
           ]
         },
         { label: 'チェック', click: () => send({ kind: 'textCommand', command: 'toggleCheckbox' }) },
-        // v3 M10b: 文字色/太字/文字サイズの装飾コマンド（DESIGNv3 §2.2）。`.md`メモ編集時のみ
-        // 追加する（milestone doc「このフェーズで扱うディレクトリ/ファイル」）。判定は
-        // レンダラが `editor:reportActive` で通知した `active.format`（M10b前提の§0拡張）を使う。
-        ...(active.format === 'markdown'
-          ? [
-              {
-                label: '装飾',
-                submenu: [
-                  { label: '太字', enabled: hasSelection, click: () => send({ kind: 'decoration', command: 'bold' }) },
-                  { type: 'separator' as const },
-                  {
-                    label: '文字色: 赤',
-                    enabled: hasSelection,
-                    click: () => send({ kind: 'decoration', command: 'color', value: '#e53935' })
-                  },
-                  {
-                    label: '文字色: 青',
-                    enabled: hasSelection,
-                    click: () => send({ kind: 'decoration', command: 'color', value: '#1e88e5' })
-                  },
-                  {
-                    label: '文字色: 緑',
-                    enabled: hasSelection,
-                    click: () => send({ kind: 'decoration', command: 'color', value: '#43a047' })
-                  },
-                  {
-                    label: '文字色: オレンジ',
-                    enabled: hasSelection,
-                    click: () => send({ kind: 'decoration', command: 'color', value: '#fb8c00' })
-                  },
-                  {
-                    label: '文字色: 紫',
-                    enabled: hasSelection,
-                    click: () => send({ kind: 'decoration', command: 'color', value: '#8e24aa' })
-                  },
-                  {
-                    label: '文字色を解除',
-                    enabled: hasSelection,
-                    click: () => send({ kind: 'decoration', command: 'color', value: '' })
-                  },
-                  { type: 'separator' as const },
-                  {
-                    label: '文字サイズ: 小',
-                    enabled: hasSelection,
-                    click: () => send({ kind: 'decoration', command: 'fontSize', value: '12px' })
-                  },
-                  {
-                    label: '文字サイズ: 大',
-                    enabled: hasSelection,
-                    click: () => send({ kind: 'decoration', command: 'fontSize', value: '20px' })
-                  },
-                  {
-                    label: '文字サイズ: 特大',
-                    enabled: hasSelection,
-                    click: () => send({ kind: 'decoration', command: 'fontSize', value: '28px' })
-                  },
-                  {
-                    label: '文字サイズを解除',
-                    enabled: hasSelection,
-                    click: () => send({ kind: 'decoration', command: 'fontSize', value: '' })
-                  }
-                ]
-              } satisfies Electron.MenuItemConstructorOptions
-            ]
-          : []),
+        // 【post-M10 bugfix】文字色/太字/文字サイズの装飾コマンド（旧「装飾」サブメニュー）は
+        // ここから削除した。ユーザーがこの右クリック経路に気づけず、代わりに
+        // `MarkdownToolbar`（`.md`メモ編集中専用ツールバー）へ同等のボタンを追加したため、
+        // 重複するこちらは撤去する（docs/post-M10-changes.md「Markdown live preview decoration
+        // bugs (M10b)」参照）。
         {
           label: '書式',
           submenu: [
