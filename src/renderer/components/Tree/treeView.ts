@@ -161,6 +161,29 @@ export function findSessionRootNode(
 }
 
 /**
+ * v3 §1.14: `lockToken` のセッションの起点ノードを直接含んでいる「親スコープ」の `lockToken` を
+ * 返す（`findSessionRootNode` と対の関数。「ロックを完全に解除する」を、既にセッションが張られて
+ * いる起点ノードから呼ぶ際、`crypto:removeNodeLock` へ渡す `lockContext`（対象自身が入れ子ロックか
+ * どうか）を求めるために使う）。トップレベルのセッションなら `undefined`、入れ子ロックの内側に
+ * あるセッションならその外側セッションの `lockToken` を返す。呼び出し元は事前に
+ * `findSessionRootNode` で対象の存在を確認済みであることを前提とする（見つからない場合も
+ * `undefined` を返す。トップレベル/未検出のいずれも「呼び出し元へ渡す lockContext は無し」という
+ * 同じ結論になるため、区別しない）。
+ */
+export function findSessionParentLockToken(
+  nodes: readonly TreeNode[],
+  lockToken: string,
+  parentLockToken?: string
+): string | undefined {
+  for (const node of nodes) {
+    if (node.lockToken === lockToken && node.lockToken !== parentLockToken) return parentLockToken;
+    const found = findSessionParentLockToken(node.children, lockToken, node.lockToken);
+    if (found !== undefined) return found;
+  }
+  return undefined;
+}
+
+/**
  * v3 M9a: `lockContext` 指定の `memo:*`/`tree:updateStructure` 呼び出しが `LOCK_SESSION_NOT_FOUND`
  * で失敗した場合（対象セッションが既に破棄済み）の後始末。M9a-node-lock-session-ops.md の
  * エラーハンドリング方針「UIはツリーを再取得しロック中(🔒)表示へ戻す」を、ディスク再取得（
