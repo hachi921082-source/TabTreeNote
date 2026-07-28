@@ -23,6 +23,8 @@ import { ContextMenu, type ContextMenuItem } from './ContextMenu';
 import { TreeRow, BASE_ROW_HEIGHT } from './TreeRow';
 import {
   computeVirtualRange,
+  findSessionParentLockToken,
+  findSessionRootNode,
   findTreeNodeInScope,
   flattenVisibleTree,
   isLockBoundaryMoveAllowed,
@@ -74,6 +76,14 @@ export interface TreeProps {
   onRequestLockNode: (memoName: string) => void;
   /** v3 M8: ロック中サブツリーを解除する（`memoName` は難読化トークン）。 */
   onRequestUnlockNode: (memoName: string) => void;
+  /**
+   * v3 §1.14: ロックを恒久的に解除する（不可逆、`docs/v3/DESIGNv3.md` §1.14）。既存の
+   * 「ロックを解除」（セッション開始）とは別操作。`targetToken` は対象ロック自身のトークン
+   * （ロック中(セッション無し)プレースホルダなら自身の `memoName`、既にセッションが張られている
+   * 起点ノードなら自身の `lockToken`）。`lockContextToken` は対象自体が入れ子ロックの場合の
+   * 親セッションの `lockToken`（トップレベル対象なら `undefined`）。
+   */
+  onRequestRemoveNodeLock: (targetToken: string, lockContextToken: string | undefined) => void;
   /** 同一タブ内の並べ替え・階層変更（ファイル移動不要な場合は tree:updateStructure、ロック境界を
    * 跨ぐ「外→内」移動は実ファイルの暗号化変換を伴うため memo:move, v3 M9b）。`anchorLockToken`
    * はドロップ先アンカー行自身が保持する `lockToken`（M9a-R2-01 hint）。`srcLockToken` はドラッグ
@@ -128,6 +138,7 @@ export function Tree({
   onRequestProperties,
   onRequestLockNode,
   onRequestUnlockNode,
+  onRequestRemoveNodeLock,
   onLocalMove,
   onLocalCopy,
   uiFontScale
@@ -367,6 +378,12 @@ export function Tree({
       // lockContext を運べない、crypto:lockNode/unlockNode の入れ子ロックは別タスクの検討事項,
       // AGENT_LOG参照）。誤操作でわかりにくい NOT_FOUND 等に繋がるため導線ごと隠す。
       const rowInSession = !!row?.lockToken;
+      // v3 §1.14: この行自身が、ある解除中セッションの「起点ノード」かどうか（= row.lockToken の
+      // セッションの起点が、他ならぬこの row 自身であること）。「ロックを完全に解除する」を
+      // 既にセッションが張られている起点ノードからも呼べるようにするために必要
+      // （DESIGNv3 §1.14「トリガー」）。
+      const sessionRootOfRow = row?.lockToken ? findSessionRootNode(tree, row.lockToken) : null;
+      const isSessionOrigin = !!sessionRootOfRow && sessionRootOfRow === row;
       // ユーザー要望: 前/後/子の3項目は「メモを作成」1つに統一し、常に後ろ（'after'）に追加する。
       // v3 M10c: 「通常メモ」「Markdownメモ」を選べるサブメニューにする（DESIGNv3 §2.4）。
       const items: ContextMenuItem[] = [
@@ -381,18 +398,20 @@ export function Tree({
 
       // v3 M8: ロック中(セッション無し)ノードは「🔒(ロック中)」プレースホルダであり、実名が無い
       // ため名前変更/編集ロック/暗号化/ラベル/プロパティ等は一切意味を持たない（DESIGNv3 §1.2
-      // 「🔒以外の情報を一切見せない」）。単一選択時は「ロックを解除」のみを、複数選択が絡む
-      // 場合も削除だけを許可する（既存の削除フローがそのまま個別ファイル削除として扱える）。
+      // 「🔒以外の情報を一切見せない」）。単一選択時のみ「ロックを解除」「ロックを完全に解除する」
+      // を出す。
+      // v3 §1.15（確定・2026-07-28ユーザー指摘反映）: 「削除」はこのメニューから撤去する
+      // （旧コメントは「複数選択が絡む場合も削除だけを許可する」としていたが、実装は単一選択時も
+      // 常に削除を出しており記述と食い違っていた＝古い不正確なコメントだった。削除するには
+      // 「ロックを解除」でセッションに入ってから起点ノードごと削除する、または「ロックを完全に
+      // 解除する」してから通常のメモとして削除する、いずれかを経由することを必須にする）。
       if (rowNodeLocked) {
         if (!multi) {
-          items.push({ label: 'ロックを解除', onSelect: () => onRequestUnlockNode(memoName), separatorBefore: true });
+          items.push(
+            { label: 'ロックを解除', onSelect: () => onRequestUnlockNode(memoName), separatorBefore: true },
+            { label: 'ロックを完全に解除する', onSelect: () => onRequestRemoveNodeLock(memoName, lockToken) }
+          );
         }
-        items.push({
-          label: '削除',
-          danger: true,
-          separatorBefore: true,
-          onSelect: () => onRequestDelete(multi ? [...selection.selected] : [memoName], lockToken)
-        });
         return items;
       }
 
@@ -420,14 +439,35 @@ export function Tree({
           // v3 M8: サブツリーをロック（対象配下にM6個別暗号化メモが混在する場合はIPC側で
           // LOCK_CONTAINS_ENCRYPTED として拒否される, DESIGNv3 §1.10）。
           items.push({ label: 'サブツリーをロック', onSelect: () => onRequestLockNode(memoName) });
+        } else if (isSessionOrigin) {
+          // v3 §1.14: 既にセッションが張られている起点ノードからも「ロックを完全に解除する」に
+          // 到達できるようにする（セッションの有無を問わず常に新規パスワード入力を要求するため、
+          // 事前にセッションを開いておく必要はない, DESIGNv3 §1.14「トリガー」）。対象自身の
+          // トークンは row.lockToken（= 右クリック時に保持しておいた lockToken と同一値）。
+          // lockContext は、この起点ノードを直接含んでいる外側セッションの lockToken
+          // （トップレベルなら undefined、入れ子ロックの内側なら外側セッションの lockToken）。
+          items.push({
+            label: 'ロックを完全に解除する',
+            separatorBefore: true,
+            onSelect: () => onRequestRemoveNodeLock(lockToken as string, findSessionParentLockToken(tree, lockToken as string))
+          });
         }
       }
-      items.push({
-        label: '削除',
-        danger: true,
-        separatorBefore: true,
-        onSelect: () => onRequestDelete(multi ? [...selection.selected] : [memoName], lockToken)
-      });
+      // v3 §1.15: 選択集合(selection.selected)全体を走査し、ロック中(セッション無し)ノードが
+      // 1件でも含まれる場合は削除操作全体をブロックする（部分適用・黙ったスキップはしない）。
+      // 右クリックされた行自身は既に rowNodeLocked===false（上の早期 return を通過済み）のため、
+      // ここでは選択集合の「他の」要素だけを確認すればよい。同名ノードが複数スコープに同時存在
+      // する場合の完全なスコープ分離は未対応（既存の M9a-R2-01 残存範囲と同水準）。
+      const multiSelectionHasLockedNode =
+        multi && [...selection.selected].some((n) => flatRows.find((r) => r.memoName === n)?.nodeLocked === true);
+      if (!multiSelectionHasLockedNode) {
+        items.push({
+          label: '削除',
+          danger: true,
+          separatorBefore: true,
+          onSelect: () => onRequestDelete(multi ? [...selection.selected] : [memoName], lockToken)
+        });
+      }
       if (!multi) {
         items.push({
           label: 'アイコン',
@@ -446,6 +486,7 @@ export function Tree({
     },
     [
       tree,
+      flatRows,
       selection,
       onRequestCreate,
       onRequestRename,
@@ -457,6 +498,7 @@ export function Tree({
       onRequestToggleLock,
       onRequestLockNode,
       onRequestUnlockNode,
+      onRequestRemoveNodeLock,
       onRequestProperties
     ]
   );
