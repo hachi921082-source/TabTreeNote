@@ -58,10 +58,13 @@ including everything below, is on `v4`. Always double-check `git branch --show-c
 committing — this session had one incident where a commit landed on the wrong branch because the user
 switched branches in the IDE concurrently without telling the orchestrator.
 
-## Current state: working tree is clean, all prior work committed
+## Current state: working tree has uncommitted changes, not yet committed
 
-As of 2026-07-29, `git status --short` on `v4` is clean. The Markdown decoration bug-fix work (see below)
-was committed via `commit-with-role` (14 commits, role-described, not pushed to remote).
+As of 2026-07-29 (later in the session than the decoration-bug-fix commits), `git status --short` on `v4`
+is **not** clean — §1.14/§1.15 node-lock work and the lock-while-open UX fix (see below) are implemented
+and `reviewer-lite`-verified but sit as uncommitted working-tree changes, per this project's "only commit
+on explicit user request" convention. The Markdown decoration bug-fix work was committed earlier via
+`commit-with-role` (14 commits, role-described, not pushed to remote).
 
 ## What's done vs. not-started (full detail in `docs/post-M10-changes.md`)
 
@@ -88,19 +91,25 @@ was committed via `commit-with-role` (14 commits, role-described, not pushed to 
   first (`npx electron-vite build && npx electron-builder --win zip --publish=never`, then rename the
   output in `release/`).
 
-### Design-confirmed, NOT yet implemented — ready-to-dispatch instructions below
-- **`docs/v3/DESIGNv3.md` §1.14** — new "permanently remove node lock" operation.
-- **`docs/v3/DESIGNv3.md` §1.15** — block deletion of a still-🔒-locked (no-session) node.
-- **Lock-while-memo-is-open UX friction** (`docs/post-M10-changes.md`, same-named section) — currently
-  `handleRequestLockNode` hard-blocks locking if the target/a descendant is open in the editor; proposed
-  fix reuses the existing `handleLockMemo` pattern. Explained to and accepted by the user as safe.
-
-**As of 2026-07-29, the user has asked for prepared dispatch instructions for both of the above (§1.14+§1.15
-as one task, the UX friction fix as a separate task) to be written out here, WITHOUT actually launching
-any agent yet** — they intend to have these done, just not necessarily immediately in this session. If you
-are a future session picking this up: check with the user whether they still want these done before
-dispatching (don't assume the presence of prepared instructions here means go-ahead — it doesn't, unless
-the user explicitly says so in the current conversation).
+### Implemented, `reviewer-lite`-verified, but NOT yet committed (as of 2026-07-29, later in the session)
+- **`docs/v3/DESIGNv3.md` §1.14** — new "permanently remove node lock" operation (`crypto:removeNodeLock`
+  IPC, "ロックを完全に解除する" menu item from both the locked-placeholder row and an open session's
+  origin row, irreversibility confirm + fresh-password requirement, `NAME_DUPLICATE` collision guard,
+  nested locks promoted untouched). Full detail incl. the nested-lock re-encrypt-in-place guarantee and
+  `reviewer-lite`'s byte-level verification: `docs/post-M10-changes.md` under "Node lock (v3 M8 feature)
+  refinements".
+- **`docs/v3/DESIGNv3.md` §1.15** — block deletion of a still-🔒-locked (no-session) node, single- and
+  multi-select (incl. the "locked node hidden elsewhere in a mixed multi-select" gap), plus backend
+  `NODE_LOCKED` defense-in-depth in `memo:delete`. Same doc section as above for detail.
+- **Lock-while-memo-is-open UX friction** (`docs/post-M10-changes.md`, same-named section) —
+  `handleRequestLockNode` now auto-closes the open memo (reusing `handleLockMemo`'s pattern) instead of
+  hard-blocking, with unsaved-changes confirm/auto-save and cancel-aborts-lock handled correctly.
+- **Known pre-existing bug found (not fixed, out of scope for the above)**: unlocking a *nested* lock via
+  the existing "ロックを解除" item fails with `NOT_FOUND` — `Tree.tsx`'s locked-placeholder `onSelect`
+  never passes `lockContext`. Small standalone fix candidate for later.
+- All three items above are implemented and passed a full `reviewer-lite` runtime verification round each
+  — safe to commit whenever the user asks. Not committed yet only because this project commits on
+  explicit request only, not because anything is outstanding.
 
 ### Declined, not being pursued
 - Standalone real Markdown syntax (headings via `#`, horizontal rule via `---`, bullet lists) — user
@@ -110,6 +119,10 @@ the user explicitly says so in the current conversation).
 ---
 
 ## Prepared instruction: §1.14 + §1.15 node-lock implementation (developer-lite)
+
+**Status: already dispatched and completed, 2026-07-29 — kept below for historical reference only, not
+something to re-dispatch.** See "Implemented, `reviewer-lite`-verified, but NOT yet committed" above and
+`docs/post-M10-changes.md` for the outcome.
 
 Copy this as the `Agent` tool prompt (`subagent_type: "developer-lite"`) when the user gives the go-ahead:
 
@@ -197,6 +210,10 @@ locked node inside a mixed multi-select" correctness-gap case).
 ---
 
 ## Prepared instruction: lock-while-memo-is-open UX fix (developer-lite)
+
+**Status: already dispatched and completed, 2026-07-29 — kept below for historical reference only, not
+something to re-dispatch.** See "Implemented, `reviewer-lite`-verified, but NOT yet committed" above and
+`docs/post-M10-changes.md` for the outcome.
 
 Copy this as the `Agent` tool prompt (`subagent_type: "developer-lite"`) when the user gives the
 go-ahead:
