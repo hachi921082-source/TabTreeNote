@@ -289,10 +289,17 @@ export type EditorTextCommand =
   | 'toggleCheckbox';
 
 /**
- * v3 M10b: Markdown装飾コマンド（右クリックメニュー「文字色/太字/文字サイズ」, DESIGNv3 §2.2）。
+ * v3 M10b: Markdown装飾コマンド（文字色/太字/文字サイズ, DESIGNv3 §2.2）。
  * `src/renderer/editor/decorationCommands.ts` が `<span style="...">` のラップ/アンラップとして
- * 実行する。`value: ''`（色/文字サイズ解除の明示メニュー項目）は既存の同値トグルとは別に、常に
+ * 実行する。`value: ''`（色/文字サイズ解除の明示ボタン）は既存の同値トグルとは別に、常に
  * 対応する CSS プロパティを除去する特別値として扱う（decorationCommands.ts 参照）。
+ *
+ * 【post-M10 bugfix】元々はエディタ右クリックメニュー（`evt:editorMenuCommand` の
+ * `kind: 'decoration'`）経由でも実行できたが、ユーザーがこの経路に気づけなかったため
+ * `MarkdownToolbar` の専用ボタンへ一本化し、右クリックメニュー側の装飾サブメニュー
+ * （`src/main/index.ts`）は削除した。ボタンは同一レンダラプロセス内で
+ * `CodeMirrorEditorHandle.runDecorationCommand` を直接呼ぶため、IPC経由の `EditorMenuCommandPayload`
+ * には（`textCommand`等と異なり）対応するバリアントを持たない。
  */
 export type MarkdownDecorationCommand =
   | { command: 'color'; value: string }
@@ -305,8 +312,7 @@ export type EditorMenuCommandPayload =
   | { kind: 'setWrap'; wrap: 'none' | 'chars' | 'window' }
   | { kind: 'toggleLineNumbers' }
   | { kind: 'toggleWhitespace' }
-  | { kind: 'fontSize'; action: 'increase' | 'decrease' | 'reset' }
-  | ({ kind: 'decoration' } & MarkdownDecorationCommand);
+  | { kind: 'fontSize'; action: 'increase' | 'decrease' | 'reset' };
 
 /** `evt:metaRecovered` のペイロード（00-core-principles.md §9）。 */
 export interface MetaRecoveredPayload {
