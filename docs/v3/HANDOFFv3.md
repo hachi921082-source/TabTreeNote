@@ -127,7 +127,7 @@ something to re-dispatch.** See "Implemented, `reviewer-lite`-verified, but NOT 
 Copy this as the `Agent` tool prompt (`subagent_type: "developer-lite"`) when the user gives the go-ahead:
 
 ```
-Repository: c:\Users\m9112\vscode2\TabTreeNote (TabTreeNote, Electron + TypeScript).
+Repository: <repo root> (TabTreeNote, Electron + TypeScript).
 
 Reference priority for spec questions: `docs/v3/DESIGNv3.md` §1.14 and §1.15 are the primary source for
 this task (no dedicated milestone doc exists for these two additions — they were added directly to
@@ -219,7 +219,7 @@ Copy this as the `Agent` tool prompt (`subagent_type: "developer-lite"`) when th
 go-ahead:
 
 ```
-Repository: c:\Users\m9112\vscode2\TabTreeNote (TabTreeNote, Electron + TypeScript).
+Repository: <repo root> (TabTreeNote, Electron + TypeScript).
 
 Reference: `docs/post-M10-changes.md`, section "Lock-while-memo-is-open UX friction" — read it in full
 for complete context (it already has the proposed fix approach, confirmed safe, just needs
@@ -259,7 +259,7 @@ descendant is open and dirty, and confirming cancel-on-unsaved-prompt correctly 
   (`Runtime.evaluate`/`Input.dispatch*`) for all runtime testing on this project.
 - `ELECTRON_RUN_AS_NODE=1` is set in the ambient shell env in this environment and silently makes
   `electron.exe` run as plain Node — always `env -u ELECTRON_RUN_AS_NODE` before launching Electron.
-- Auto memory files at `C:\Users\m9112\.claude\projects\c--Users-m9112-vscode2-TabTreeNote\memory\`:
+- Auto memory files at `%USERPROFILE%\.claude\projects\<project-slug>\memory\`:
   `feedback_agent_delegation.md`, `project_tabtreenote_tester_isolation.md`,
   `project_tabtreenote_tester_context_menu_hang.md` — still relevant.
 - Don't proactively launch implementation agents without explicit user instruction. The two prepared
