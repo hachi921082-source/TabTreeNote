@@ -166,7 +166,7 @@ M8→M9a→M9bは依存があるため順序厳守(いずれも完了済み)。M
 
 ## 運用方針(利用量節約 — 重要)
 
-ユーザーから明示的な依頼あり。詳細はauto memory([feedback_agent_delegation.md](C:\Users\m9112\.claude\projects\c--Users-m9112-vscode2-TabTreeNote\memory\feedback_agent_delegation.md)相当)にも記録済み:
+ユーザーから明示的な依頼あり。詳細はauto memory([feedback_agent_delegation.md](%USERPROFILE%\.claude\projects\<project-slug>\memory\feedback_agent_delegation.md)相当)にも記録済み:
 
 - **簡単な作業は直接対応**: ファイル1つの軽微な修正・確認・簡単な調査はサブエージェントに投げずオーケストレーター自身が行う
 - **レビューサイクルは目安2回で打ち切り**: 2回で収束しない(3回目に入りそうな)場合は自律的にループを継続せず、その時点でユーザーに報告し指示を仰ぐ。強制的にパスさせない
