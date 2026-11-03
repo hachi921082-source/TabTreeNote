@@ -3,8 +3,8 @@
   "version": "0.1.0",
   "private": true,
   "description": "TabTreeNote - local tab x tree structured plain text memo editor (Electron + TypeScript)",
-  "author": "",
-  "license": "UNLICENSED",
+  "author": "hachi921082-source",
+  "license": "MIT",
   "main": "out/main/index.js",
   "scripts": {
     "dev": "electron-vite dev",
